@@ -1,0 +1,30 @@
+{
+  "version": "https://jsonfeed.org/version/1.1",
+  "title": "Example JSON Feed",
+  "home_page_url": "https://example.net/",
+  "feed_url": "https://example.net/feed.json",
+  "description": "A small example JSON Feed 1.1 document used by the rss-cli test suite.",
+  "authors": [
+    { "name": "Site Owner" }
+  ],
+  "items": [
+    {
+      "id": "https://example.net/items/1",
+      "url": "https://example.net/items/1",
+      "title": "JSON Item One",
+      "content_html": "<p>The first JSON feed item.</p>",
+      "summary": "The first JSON feed item.",
+      "date_published": "2026-06-01T10:00:00Z",
+      "authors": [{ "name": "Carol" }],
+      "tags": ["json", "example"]
+    },
+    {
+      "id": "https://example.net/items/2",
+      "url": "https://example.net/items/2",
+      "title": "JSON Item Two",
+      "content_text": "The second JSON feed item, in plain text.",
+      "date_published": "2026-05-31T10:00:00Z",
+      "authors": [{ "name": "Dave" }]
+    }
+  ]
+}

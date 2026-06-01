@@ -7,26 +7,24 @@ use chrono::{DateTime, Utc};
 use crate::model::ContentFormat;
 
 /// Default User-Agent. Polite, identifies the tool, points at the project.
-pub const DEFAULT_USER_AGENT: &str =
-    concat!("rss-cli/", env!("CARGO_PKG_VERSION"), " (+https://github.com/)");
+pub const DEFAULT_USER_AGENT: &str = concat!(
+    "rss-cli/",
+    env!("CARGO_PKG_VERSION"),
+    " (+https://github.com/)"
+);
 
 /// How the cache should be consulted for a fetch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CachePolicy {
     /// Default. Always revalidate with a conditional GET (`If-None-Match` /
     /// `If-Modified-Since`); a `304` serves the cached body.
+    #[default]
     Revalidate,
     /// Serve directly from cache without hitting the network if the cached entry is
     /// younger than this duration; otherwise behave like [`CachePolicy::Revalidate`].
     MaxAge(Duration),
     /// Ignore the cache entirely (do not read or write it).
     NoCache,
-}
-
-impl Default for CachePolicy {
-    fn default() -> Self {
-        CachePolicy::Revalidate
-    }
 }
 
 /// Parameters shared by the CLI and the MCP server for a fetch operation.

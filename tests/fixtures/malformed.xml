@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Broken Feed</title>
+    <link>https://example.com/</link>
+    <description>This document is intentionally truncated and never closes its tags
+    <item>
+      <title>Unclosed Item
+      <description>The XML below is cut off mid-element so any compliant parser

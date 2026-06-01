@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:content="http://purl.org/rss/1.0/modules/content/">
+  <channel>
+    <title>Example RSS Feed</title>
+    <link>https://example.com/</link>
+    <description>A small example RSS 2.0 feed used by the rss-cli test suite.</description>
+    <language>en-us</language>
+    <lastBuildDate>Mon, 01 Jun 2026 12:00:00 GMT</lastBuildDate>
+    <item>
+      <title>First Post</title>
+      <link>https://example.com/posts/first</link>
+      <guid isPermaLink="false">urn:example:first</guid>
+      <pubDate>Mon, 01 Jun 2026 09:00:00 GMT</pubDate>
+      <author>alice@example.com (Alice)</author>
+      <category>news</category>
+      <description>A short summary of the first post.</description>
+      <content:encoded><![CDATA[<p>The <strong>first</strong> post body with <a href="https://example.com/more">a link</a>.</p>]]></content:encoded>
+    </item>
+    <item>
+      <title>Relative Link Post</title>
+      <link>/post/1</link>
+      <guid isPermaLink="false">urn:example:relative-1</guid>
+      <pubDate>Sun, 31 May 2026 18:30:00 GMT</pubDate>
+      <category>test</category>
+      <description>This item deliberately uses a relative link that must be resolved to an absolute URL.</description>
+    </item>
+    <item>
+      <title>Third Post</title>
+      <link>https://example.com/posts/third</link>
+      <guid isPermaLink="false">urn:example:third</guid>
+      <pubDate>Sat, 30 May 2026 08:15:00 GMT</pubDate>
+      <description>A short summary of the third post.</description>
+    </item>
+  </channel>
+</rss>

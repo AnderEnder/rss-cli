@@ -130,7 +130,7 @@ impl Cache {
         let mut out = Vec::new();
         for entry in fs::read_dir(&self.root)? {
             let path = entry?.path();
-            if !path.extension().is_some_and(|e| e == "json") {
+            if path.extension().is_none_or(|e| e != "json") {
                 continue;
             }
             let meta_bytes = match fs::read(&path) {
@@ -159,10 +159,7 @@ impl Cache {
 /// Write `bytes` to `path` atomically (temp file in the same dir, then rename).
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let tmp = path.with_extension(format!(
-        "tmp.{}",
-        std::process::id() as u64 ^ rand_suffix()
-    ));
+    let tmp = path.with_extension(format!("tmp.{}", std::process::id() as u64 ^ rand_suffix()));
     fs::write(&tmp, bytes)?;
     // Rename is atomic within the same filesystem; temp lives in the same dir.
     match fs::rename(&tmp, path) {

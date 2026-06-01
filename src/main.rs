@@ -56,7 +56,10 @@ async fn run() -> i32 {
             };
             match core::discover_feeds(&args.site_url, &params).await {
                 Ok(out) => {
-                    println!("{}", output::render_discover(&out, args.format.into(), color));
+                    println!(
+                        "{}",
+                        output::render_discover(&out, args.format.into(), color)
+                    );
                     exit::OK
                 }
                 Err(e) => fail(&e),
@@ -74,7 +77,10 @@ async fn run() -> i32 {
             };
             match core::show_item(&args.feed_url, &args.id, &params, &cache).await {
                 Ok(Some(item)) => {
-                    println!("{}", serde_json::to_string_pretty(&item).unwrap_or_default());
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&item).unwrap_or_default()
+                    );
                     exit::OK
                 }
                 Ok(None) => fail(&RssError::NotFound(format!(
@@ -87,7 +93,10 @@ async fn run() -> i32 {
 
         Command::Schema(args) => {
             let schema = output::schema_for(&args.command);
-            println!("{}", serde_json::to_string_pretty(&schema).unwrap_or_default());
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&schema).unwrap_or_default()
+            );
             exit::OK
         }
 
@@ -104,7 +113,10 @@ async fn run() -> i32 {
                 CacheAction::List { format } => match cache.list() {
                     Ok(items) => {
                         let _ = format; // text rendering can be added by the cli agent
-                        println!("{}", serde_json::to_string_pretty(&items).unwrap_or_default());
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&items).unwrap_or_default()
+                        );
                         exit::OK
                     }
                     Err(e) => fail(&e),
@@ -135,7 +147,10 @@ async fn run() -> i32 {
 /// Print a structured error to stderr and return the matching exit code.
 fn fail(e: &RssError) -> i32 {
     let obj: ErrorObj = e.to_error_obj(None);
-    eprintln!("{}", serde_json::to_string(&obj).unwrap_or_else(|_| e.to_string()));
+    eprintln!(
+        "{}",
+        serde_json::to_string(&obj).unwrap_or_else(|_| e.to_string())
+    );
     match e {
         RssError::Usage(_) | RssError::InvalidUrl(_) => exit::USAGE,
         _ => exit::UNEXPECTED,

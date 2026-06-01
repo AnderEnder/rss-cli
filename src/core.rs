@@ -83,7 +83,10 @@ pub async fn fetch_one(
 }
 
 /// Discover feeds advertised on a website homepage.
-pub async fn discover_feeds(site_url: &str, params: &FetchParams) -> Result<DiscoverOutput, RssError> {
+pub async fn discover_feeds(
+    site_url: &str,
+    params: &FetchParams,
+) -> Result<DiscoverOutput, RssError> {
     let http = HttpClient::new(&params.user_agent, params.timeout)?;
     discover::discover(site_url, &http).await
 }

@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>Example Atom Feed</title>
+  <subtitle>A small example Atom 1.0 feed used by the rss-cli test suite.</subtitle>
+  <link href="https://example.org/"/>
+  <link rel="self" href="https://example.org/atom.xml"/>
+  <id>urn:uuid:60a76c80-d399-11d9-b93C-0003939e0af6</id>
+  <updated>2026-06-01T12:00:00Z</updated>
+  <author>
+    <name>Bob Author</name>
+  </author>
+  <entry>
+    <title>Atom Entry One</title>
+    <link href="https://example.org/entry/1"/>
+    <id>urn:example:atom:1</id>
+    <published>2026-06-01T10:30:00Z</published>
+    <updated>2026-06-01T11:00:00Z</updated>
+    <category term="release"/>
+    <summary>Summary of the first atom entry.</summary>
+    <content type="html">&lt;p&gt;Hello from &lt;strong&gt;entry one&lt;/strong&gt;.&lt;/p&gt;</content>
+  </entry>
+  <entry>
+    <title>Atom Entry Two</title>
+    <link href="https://example.org/entry/2"/>
+    <id>urn:example:atom:2</id>
+    <published>2026-05-31T08:00:00Z</published>
+    <updated>2026-05-31T09:00:00Z</updated>
+    <summary>Summary of the second atom entry.</summary>
+    <content type="text">Plain-text content for entry two.</content>
+  </entry>
+</feed>

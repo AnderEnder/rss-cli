@@ -316,10 +316,10 @@ pub fn parse_since(s: &str) -> Result<DateTime<Utc>, RssError> {
         return Ok(dt.with_timezone(&Utc));
     }
     // Bare date (assume midnight UTC).
-    if let Ok(date) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
-        if let Some(dt) = date.and_hms_opt(0, 0, 0) {
-            return Ok(DateTime::from_naive_utc_and_offset(dt, Utc));
-        }
+    if let Ok(date) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+        && let Some(dt) = date.and_hms_opt(0, 0, 0)
+    {
+        return Ok(DateTime::from_naive_utc_and_offset(dt, Utc));
     }
     Err(RssError::Usage(format!(
         "invalid --since value '{s}' (use e.g. '2h', '7d', or '2026-06-01')"
