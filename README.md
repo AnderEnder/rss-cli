@@ -282,3 +282,14 @@ Example MCP client configuration (e.g. Claude Desktop's `claude_desktop_config.j
 
 If `rss` is not on the client's `PATH`, use the absolute path to the binary (for
 example `/Users/you/.cargo/bin/rss` or the `target/release/rss` you built).
+
+---
+
+## Design & contributing
+
+- **Why it's built this way** — the significant decisions (stable ids, the cache,
+  the output contract, MCP-in-v1, the release profile) are recorded as
+  [Architecture Decision Records](docs/adr/). Read these before changing anything
+  load-bearing.
+- **Working in the repo** — [CLAUDE.md](CLAUDE.md) has the build/test/lint gates,
+  the module map, the invariants that must hold, and the gotchas that already bit.
