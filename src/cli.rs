@@ -122,6 +122,11 @@ pub struct FetchArgs {
     #[arg(long, value_name = "N")]
     pub limit: Option<usize>,
 
+    /// Truncate each item body to at most this many characters (flagged `content_truncated`
+    /// in the output). Useful to fetch many items while skipping giant bodies.
+    #[arg(long, value_name = "N")]
+    pub max_content_chars: Option<usize>,
+
     /// Only include items at/after this time: a duration (e.g. `2h`, `7d`) or an
     /// ISO-8601 date/datetime.
     #[arg(long, value_name = "WHEN")]
@@ -171,6 +176,7 @@ impl FetchArgs {
         Ok(FetchParams {
             content_format: self.content.into(),
             limit: self.limit,
+            max_content_chars: self.max_content_chars,
             since: self.since.as_deref().map(parse_since).transpose()?,
             concurrency: self.concurrency.max(1),
             timeout: Duration::from_secs(self.timeout),
@@ -269,6 +275,10 @@ pub struct ShowArgs {
     /// Content extraction format.
     #[arg(long, value_enum, default_value_t = ContentArg::Markdown)]
     pub content: ContentArg,
+
+    /// Truncate the item body to at most this many characters (flagged `content_truncated`).
+    #[arg(long, value_name = "N")]
+    pub max_content_chars: Option<usize>,
 
     /// Output format.
     #[arg(long, value_enum, default_value_t = FormatArg::Json)]

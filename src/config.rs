@@ -33,6 +33,9 @@ pub struct FetchParams {
     pub content_format: ContentFormat,
     /// Maximum items per feed (most recent first), or `None` for all.
     pub limit: Option<usize>,
+    /// Maximum characters of extracted `content` per item; longer bodies are truncated on a
+    /// char boundary and flagged `content_truncated`. `None` keeps full content.
+    pub max_content_chars: Option<usize>,
     /// Only include items published at or after this instant.
     pub since: Option<DateTime<Utc>>,
     /// Maximum number of feeds fetched concurrently.
@@ -47,6 +50,7 @@ impl Default for FetchParams {
         Self {
             content_format: ContentFormat::Markdown,
             limit: None,
+            max_content_chars: None,
             since: None,
             concurrency: 8,
             timeout: Duration::from_secs(30),

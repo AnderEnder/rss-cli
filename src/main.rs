@@ -40,7 +40,9 @@ async fn run() -> i32 {
                 Ok(c) => c,
                 Err(e) => return fail(&e),
             };
-            let out = core::fetch_feeds(&urls, &params, &cache).await;
+            let mut out = core::fetch_feeds(&urls, &params, &cache).await;
+            // Surface per-item content truncation (from --max-content-chars) at the top level.
+            out.truncation = core::truncation_marker(&out, None, None);
             println!("{}", output::render_fetch(&out, args.format.into(), color));
             core::exit_code_for(&out)
         }
@@ -69,6 +71,7 @@ async fn run() -> i32 {
         Command::Show(args) => {
             let params = FetchParams {
                 content_format: args.content.into(),
+                max_content_chars: args.max_content_chars,
                 ..FetchParams::default()
             };
             let cache = match Cache::open(cli.cache_dir.clone()) {

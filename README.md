@@ -78,6 +78,7 @@ Notable flags:
 | `--format <json\|ndjson\|text>` | `json` | Output format. `json` is the full document; `ndjson` is one item per line; `text` is a human summary. |
 | `--content <markdown\|text\|html\|none>` | `markdown` | How to render item bodies. `none` omits the body. |
 | `--limit <N>` | — | Max items per feed (newest first). |
+| `--max-content-chars <N>` | — | Truncate each item body to at most N characters (flagged `content_truncated`). Fetch many items while skipping giant bodies. |
 | `--since <WHEN>` | — | Only items at/after a duration (`2h`, `7d`) or ISO date (`2026-06-01`). |
 | `--concurrency <N>` | `8` | Max feeds fetched in parallel. |
 | `--timeout <SECS>` | `30` | Per-request timeout. |
@@ -166,7 +167,8 @@ authoritative schema is `rss schema --command fetch`.
           "summary": "A short summary.",
           "content": "The **first** post body.",       // in the requested format
           "content_format": "markdown",
-          "content_tokens_est": 7,           // rough token estimate for budgeting
+          "content_tokens_est": 7,           // rough token estimate (reflects truncation)
+          "content_truncated": false,        // true when the body was cut to a cap
           "categories": ["news"],
           "enclosures": [],
           "guid": "urn:example:first"        // raw feed guid/id (may not be stable)
@@ -175,7 +177,8 @@ authoritative schema is `rss schema --command fetch`.
       "error": null                          // populated when status == "error"
     }
   ],
-  "errors": []                               // feed-level errors mirrored here
+  "errors": [],                              // feed-level errors mirrored here
+  "truncation": null                         // non-null when the result was size-bounded
 }
 ```
 
@@ -262,10 +265,20 @@ Exposed tools:
 
 | Tool | Arguments | Returns |
 |------|-----------|---------|
-| `fetch_feed` | `url`, optional `content_format`, `limit`, `since` | a feed result (or full `FetchOutput` for multiple urls) |
+| `fetch_feed` | `url`; optional `content_format`, `limit` (default 25), `max_content_chars`, `max_response_tokens` | a `FetchOutput` for the feed |
 | `discover_feeds` | `site_url` | discovered feeds |
-| `get_item` | `feed_url`, `id` | a single item, resolved by its stable id |
+| `get_item` | `feed_url`, `id`; optional `max_content_chars` | a single item, resolved by its stable id |
 | `get_schema` | `command` | the JSON Schema for that command's output |
+
+**Responses are size-bounded.** AI clients reject oversized tool results, so `fetch_feed`
+caps items (default 25) and checks an estimated-token budget (`max_response_tokens`). If a
+result would overflow, the tool returns a structured **`RESPONSE_TOO_LARGE`** error whose
+`details` include `suggested_limit` and `suggested_max_content_chars` — so the agent can
+retry and self-recover instead of failing. Use `max_content_chars` to fetch many items
+while truncating long bodies (each truncated item is flagged `content_truncated`), and
+`get_item` to pull the full body of a specific item. All tool errors are structured JSON
+matching the `ErrorObj` contract (a stable `code` plus `details`). See
+[ADR-0011](docs/adr/0011-bounded-mcp-responses.md).
 
 Example MCP client configuration (e.g. Claude Desktop's `claude_desktop_config.json`):
 

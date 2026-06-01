@@ -20,6 +20,11 @@ pub struct FetchOutput {
     pub feeds: Vec<FeedResult>,
     /// Feed-level errors mirrored here for quick scanning (also present per-feed).
     pub errors: Vec<ErrorObj>,
+    /// Present (non-`null`) when this result was bounded — an item cap was applied, item
+    /// bodies were truncated, or items were omitted to fit a size budget. `null` otherwise.
+    /// Primarily populated by the MCP server, which bounds responses (see the `rss mcp`
+    /// docs); the CLI populates it only when `--max-content-chars` truncates content.
+    pub truncation: Option<TruncationInfo>,
 }
 
 impl FetchOutput {
@@ -29,8 +34,26 @@ impl FetchOutput {
             fetched_at,
             feeds: Vec::new(),
             errors: Vec::new(),
+            truncation: None,
         }
     }
+}
+
+/// Describes how a [`FetchOutput`] was bounded. A summary so an agent can tell at a glance
+/// that it is not seeing the full, untruncated result and how to adjust.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct TruncationInfo {
+    /// The item cap actually applied (e.g. the MCP default of 25), or `null` if none.
+    pub applied_limit: Option<usize>,
+    /// Number of items whose `content` was truncated (e.g. by `max_content_chars`).
+    pub items_content_truncated: usize,
+    /// Number of items dropped entirely to fit a response budget. `0` unless the server
+    /// shed items (a Tier-2 behavior; always `0` in the cap-and-error path).
+    pub items_omitted: usize,
+    /// Rough token estimate of the (possibly reduced) serialized response, if computed.
+    pub estimated_tokens: Option<usize>,
+    /// Human/agent-facing hint on how to adjust the request (e.g. which knob to pass).
+    pub suggestion: Option<String>,
 }
 
 /// Outcome of fetching a single feed.
@@ -115,8 +138,13 @@ pub struct Item {
     /// Item body in the requested `content_format` (or `null` when `--content none`).
     pub content: Option<String>,
     pub content_format: ContentFormat,
-    /// Rough token estimate for `content` (for agent budgeting).
+    /// Rough token estimate for `content` (for agent budgeting). Reflects the truncated
+    /// content when `content_truncated` is `true`.
     pub content_tokens_est: u32,
+    /// `true` when `content` was cut short (e.g. by `max_content_chars` or a response
+    /// budget). The body ends with an ellipsis marker; fetch the item via `get_item` /
+    /// `rss show` without a cap for the full text.
+    pub content_truncated: bool,
     pub categories: Vec<String>,
     pub enclosures: Vec<Enclosure>,
     /// The raw feed-provided guid/id, for reference (not necessarily stable).

@@ -34,3 +34,4 @@ where a real fork existed). Statuses: `Proposed`, `Accepted`, `Superseded by NNN
 | [0008](0008-async-runtime-and-mcp-in-v1.md) | Async runtime (tokio) and a native MCP server in v1 | Accepted |
 | [0009](0009-html-to-markdown-htmd-html2text.md) | HTML→Markdown via `htmd` + `html2text` | Accepted |
 | [0010](0010-release-profile-tuning.md) | Tuned release profile (LTO, single codegen unit, abort, strip) | Accepted |
+| [0011](0011-bounded-mcp-responses.md) | Bounded MCP responses (default cap + budget + `RESPONSE_TOO_LARGE`) | Accepted |

@@ -182,6 +182,7 @@ mod tests {
             content: Some("body".to_string()),
             content_format: ContentFormat::Markdown,
             content_tokens_est: 1,
+            content_truncated: false,
             categories: vec![],
             enclosures: vec![],
             guid: None,

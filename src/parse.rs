@@ -115,6 +115,7 @@ fn entry_to_item(entry: Entry, feed_url: &str, base: Option<&Url>, params: &Fetc
     // Content body: prefer the entry's <content>, fall back to the summary HTML when the
     // content element is absent/empty. Skipped entirely when extraction is disabled.
     let format = params.content_format;
+    let mut content_truncated = false;
     let content = if format == ContentFormat::None {
         None
     } else {
@@ -123,8 +124,21 @@ fn entry_to_item(entry: Entry, feed_url: &str, base: Option<&Url>, params: &Fetc
             .as_deref()
             .filter(|h| !h.trim().is_empty())
             .or_else(|| summary.as_deref().filter(|s| !s.trim().is_empty()));
-        source.map(|html| content::extract(html, format))
+        source.map(|html| {
+            let extracted = content::extract(html, format);
+            // Apply the per-item character cap to the *extracted* body (not source HTML).
+            match params.max_content_chars {
+                Some(max) => {
+                    let (capped, cut) = content::truncate_to_chars(&extracted, max);
+                    content_truncated = cut;
+                    capped
+                }
+                None => extracted,
+            }
+        })
     };
+    // Estimate tokens from the final (possibly truncated) content, so agents budget on what
+    // they actually receive.
     let content_tokens_est = content
         .as_deref()
         .map(content::estimate_tokens)
@@ -151,6 +165,7 @@ fn entry_to_item(entry: Entry, feed_url: &str, base: Option<&Url>, params: &Fetc
         content,
         content_format: format,
         content_tokens_est,
+        content_truncated,
         categories,
         enclosures,
         guid,
@@ -387,6 +402,28 @@ mod tests {
         let parsed = parse_feed(RSS.as_bytes(), FEED_URL, &p).unwrap();
         assert_eq!(parsed.items.len(), 1);
         assert_eq!(parsed.items[0].title.as_deref(), Some("Second Post"));
+    }
+
+    #[test]
+    fn max_content_chars_truncates_and_flags() {
+        let mut p = params();
+        p.max_content_chars = Some(4);
+        let parsed = parse_feed(ATOM.as_bytes(), FEED_URL, &p).unwrap();
+        let item = &parsed.items[0];
+        assert!(
+            item.content_truncated,
+            "content should be flagged truncated"
+        );
+        let content = item.content.as_deref().unwrap();
+        assert!(content.ends_with(content::TRUNCATION_MARKER));
+        // Token estimate reflects the truncated body, not the original.
+        assert_eq!(item.content_tokens_est, content::estimate_tokens(content));
+    }
+
+    #[test]
+    fn no_cap_leaves_content_untruncated() {
+        let parsed = parse_feed(ATOM.as_bytes(), FEED_URL, &params()).unwrap();
+        assert!(!parsed.items[0].content_truncated);
     }
 
     #[test]

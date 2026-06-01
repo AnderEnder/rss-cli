@@ -40,6 +40,17 @@ pub enum RssError {
     #[error("cache error: {0}")]
     Cache(String),
 
+    #[error(
+        "response too large: ~{estimated_tokens} tokens exceeds the {budget_tokens}-token \
+         budget; retry with limit={suggested_limit} or max_content_chars={suggested_max_content_chars}"
+    )]
+    ResponseTooLarge {
+        estimated_tokens: usize,
+        budget_tokens: usize,
+        suggested_limit: usize,
+        suggested_max_content_chars: usize,
+    },
+
     #[error(transparent)]
     Io(#[from] std::io::Error),
 
@@ -58,6 +69,7 @@ impl RssError {
             RssError::Parse(_) => "FEED_PARSE_FAILED",
             RssError::NotFound(_) => "NOT_FOUND",
             RssError::Cache(_) => "CACHE_ERROR",
+            RssError::ResponseTooLarge { .. } => "RESPONSE_TOO_LARGE",
             RssError::Io(_) => "IO_ERROR",
             RssError::Other(_) => "INTERNAL_ERROR",
         }
@@ -69,8 +81,25 @@ impl RssError {
         if let Some(u) = feed_url {
             obj.feed_url = Some(u.to_string());
         }
-        if let RssError::Http { status, .. } = self {
-            obj.details = serde_json::json!({ "http_status": status });
+        match self {
+            RssError::Http { status, .. } => {
+                obj.details = serde_json::json!({ "http_status": status });
+            }
+            RssError::ResponseTooLarge {
+                estimated_tokens,
+                budget_tokens,
+                suggested_limit,
+                suggested_max_content_chars,
+            } => {
+                // Machine-readable remediation so the agent can retry without giving up.
+                obj.details = serde_json::json!({
+                    "estimated_tokens": estimated_tokens,
+                    "budget_tokens": budget_tokens,
+                    "suggested_limit": suggested_limit,
+                    "suggested_max_content_chars": suggested_max_content_chars,
+                });
+            }
+            _ => {}
         }
         obj
     }

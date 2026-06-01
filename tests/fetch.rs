@@ -343,3 +343,71 @@ fn mixed_feeds_exit_partial() {
     assert_eq!(by_url(&good_url)["status"], "ok");
     assert_eq!(by_url(&bad_url)["status"], "error");
 }
+
+/// `--max-content-chars` truncates long item bodies, flags `content_truncated`, and
+/// surfaces a top-level `truncation` marker counting the truncated items.
+#[test]
+fn max_content_chars_truncates_and_marks() {
+    let long_body = "Lorem ipsum dolor sit amet ".repeat(40); // ~1080 chars
+    let feed = format!(
+        r#"<?xml version="1.0"?>
+<rss version="2.0"><channel>
+  <title>Long Feed</title>
+  <link>https://example.com/</link>
+  <item>
+    <title>Big Post</title>
+    <link>https://example.com/big</link>
+    <pubDate>Mon, 05 Jan 2026 10:00:00 GMT</pubDate>
+    <description><![CDATA[<p>{long_body}</p>]]></description>
+  </item>
+</channel></rss>"#
+    );
+
+    let (server, _m) = mock_server("/long.xml", RSS_CT, &feed);
+    let feed_url = format!("{}/long.xml", server.url());
+    let cache = TempCache::new("maxcontent");
+
+    let output = rss()
+        .arg("--quiet")
+        .arg("--cache-dir")
+        .arg(cache.path())
+        .arg("fetch")
+        .arg(feed_url.as_str())
+        .arg("--max-content-chars")
+        .arg("20")
+        .arg("--format")
+        .arg("json")
+        .output()
+        .expect("spawn rss");
+
+    if is_stub_panic(&output) {
+        skip_note("max_content_chars_truncates_and_marks", &output);
+        return;
+    }
+    assert!(output.status.success(), "a good feed should exit 0");
+
+    let v: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("output should be valid JSON");
+    let item = &v["feeds"][0]["items"][0];
+
+    assert_eq!(
+        item["content_truncated"].as_bool(),
+        Some(true),
+        "a body longer than the cap should be flagged content_truncated"
+    );
+    let content = item["content"].as_str().expect("content string");
+    assert!(
+        content.chars().count() <= 20 + " …[truncated]".chars().count(),
+        "content should be cut to roughly the cap plus the marker, got {} chars",
+        content.chars().count()
+    );
+
+    // Top-level marker records that the result was bounded.
+    let trunc = &v["truncation"];
+    assert!(trunc.is_object(), "truncation marker should be present");
+    assert_eq!(
+        trunc["items_content_truncated"].as_u64(),
+        Some(1),
+        "exactly one item's content was truncated"
+    );
+}

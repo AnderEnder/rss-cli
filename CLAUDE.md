@@ -79,6 +79,11 @@ A single core powers both the CLI and the MCP server, so the two front-ends cann
    all-failed. Defined in `error.rs::exit`; mapped in `main.rs`.
 6. **CLI and MCP share `core.rs`.** Add behavior in the core and expose it from both
    front-ends; don't fork logic into `mcp.rs` or `cli.rs`.
+7. **MCP responses are size-bounded.** `fetch_feed` defaults to `limit=25` and rejects
+   over-budget results with a structured `RESPONSE_TOO_LARGE` error (carrying suggested
+   `limit`/`max_content_chars`); every MCP tool error is structured `ErrorObj` JSON, never
+   a bare string. Don't return an unbounded `FetchOutput` or a plain-text tool error. See
+   [ADR-0011](docs/adr/0011-bounded-mcp-responses.md).
 
 ## Gotchas (these already bit — don't relearn them)
 
