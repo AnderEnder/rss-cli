@@ -126,12 +126,15 @@ impl RssServer {
     /// the assigned task spec supersedes that — args are `{ url, content_format?, limit? }` and
     /// we return the whole `FetchOutput`.
     #[tool(
-        description = "Fetch and parse an RSS/Atom feed by URL. Returns the FetchOutput JSON \
-        (schema: get_schema command=fetch). content_format is one of markdown|text|html|none; \
-        limit caps items, newest first (DEFAULT 25 when omitted). max_content_chars truncates \
-        each item body (flagged content_truncated). The response is size-bounded by \
-        max_response_tokens; if it would overflow, the tool returns a RESPONSE_TOO_LARGE error \
-        whose details include suggested_limit and suggested_max_content_chars to retry with."
+        description = "Fetch and parse an RSS/Atom feed by URL. Returns the FetchOutput as \
+        structured content (and a one-line text summary); schema: get_schema command=fetch. \
+        content_format is one of markdown|text|html|none; limit caps items, newest first \
+        (DEFAULT 25 when omitted). max_content_chars truncates each item body (flagged \
+        content_truncated). The response is size-bounded by max_response_tokens; if it would \
+        overflow, the tool returns a RESPONSE_TOO_LARGE error whose details include \
+        suggested_limit and suggested_max_content_chars to retry with.",
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = true),
+        output_schema = rmcp::handler::server::tool::schema_for_type::<crate::model::FetchOutput>()
     )]
     async fn fetch_feed(
         &self,
@@ -143,14 +146,23 @@ impl RssServer {
     /// Discover feeds advertised on a website's homepage.
     #[tool(
         description = "Discover RSS/Atom/JSON feeds advertised on a website. Returns the \
-        DiscoverOutput JSON (schema: get_schema command=discover)."
+        DiscoverOutput as structured content (schema: get_schema command=discover).",
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = true),
+        output_schema = rmcp::handler::server::tool::schema_for_type::<crate::model::DiscoverOutput>()
     )]
     async fn discover_feeds(
         &self,
         Parameters(args): Parameters<DiscoverFeedsArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         match core::discover_feeds(&args.site_url, &FetchParams::default()).await {
-            Ok(out) => Ok(json_result(&out)),
+            Ok(out) => {
+                let summary = format!(
+                    "Discovered {} feed(s) at {}.",
+                    out.feeds.len(),
+                    args.site_url
+                );
+                Ok(structured_result(&out, summary))
+            }
             Err(e) => Ok(tool_error_obj(&e, Some(&args.site_url))),
         }
     }
@@ -158,9 +170,11 @@ impl RssServer {
     /// Fetch a feed and return the single item whose stable id matches `id`.
     #[tool(
         description = "Fetch a feed and return the single Item matching a stable id (from \
-        fetch_feed). Returns the Item JSON, or an error if the id is not present. \
+        fetch_feed) as structured content, or an error if the id is not present. \
         max_content_chars truncates the body; a single oversized item (e.g. a hot comment \
-        thread) returns RESPONSE_TOO_LARGE with a suggested_max_content_chars to retry with."
+        thread) returns RESPONSE_TOO_LARGE with a suggested_max_content_chars to retry with.",
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = true),
+        output_schema = rmcp::handler::server::tool::schema_for_type::<crate::model::Item>()
     )]
     async fn get_item(
         &self,
@@ -172,7 +186,8 @@ impl RssServer {
     /// Return the authoritative JSON Schema for a command's output.
     #[tool(
         description = "Return the authoritative JSON Schema for a command's output. \
-        command is 'fetch' or 'discover'."
+        command is 'fetch' or 'discover'.",
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
     )]
     async fn get_schema(
         &self,
@@ -248,9 +263,40 @@ async fn fetch_feed_inner(cache: &Cache, args: FetchFeedArgs) -> CallToolResult 
                 marker.estimated_tokens = Some(estimated);
                 out.truncation = Some(marker);
             }
-            json_result(&out)
+            let summary = fetch_summary(&out, &args.url);
+            structured_result(&out, summary)
         }
         Err(e) => tool_error_obj(&e, Some(&args.url)),
+    }
+}
+
+/// A one-line, human/agent-readable summary of a `fetch_feed` result. Kept terse on purpose:
+/// it is the *unstructured* `content` companion to the full `structured_content` payload, so
+/// we don't duplicate the whole FetchOutput as text (which would ~double the response and
+/// undercut the token budget — see ADR-0011/ADR-0013).
+fn fetch_summary(out: &crate::model::FetchOutput, url: &str) -> String {
+    match out.feeds.first() {
+        Some(feed) if feed.error.is_some() => {
+            let code = feed
+                .error
+                .as_ref()
+                .map(|e| e.code.as_str())
+                .unwrap_or("ERROR");
+            format!("fetch_feed: {url} returned an error ({code}); see structuredContent.")
+        }
+        Some(feed) => {
+            let title = feed.title.as_deref().unwrap_or(url);
+            let mut s = format!(
+                "Fetched {} item(s) (~{} content tokens) from \"{title}\".",
+                out.total_items, out.total_content_tokens_est
+            );
+            if out.truncation.is_some() {
+                s.push_str(" Content truncated (see structuredContent.truncation).");
+            }
+            s.push_str(" Full data in structuredContent.");
+            s
+        }
+        None => format!("fetch_feed: no result for {url}."),
     }
 }
 
@@ -279,7 +325,12 @@ async fn get_item_inner(cache: &Cache, args: GetItemArgs) -> CallToolResult {
                 };
                 return tool_error_obj(&err, Some(&args.feed_url));
             }
-            json_result(&item)
+            let summary = format!(
+                "Item {}: \"{}\".",
+                item.id,
+                item.title.as_deref().unwrap_or("(untitled)")
+            );
+            structured_result(&item, summary)
         }
         Ok(None) => tool_error_code(
             "NOT_FOUND",
@@ -297,6 +348,27 @@ async fn get_item_inner(cache: &Cache, args: GetItemArgs) -> CallToolResult {
 fn json_result<T: Serialize>(value: &T) -> CallToolResult {
     match serde_json::to_string_pretty(value) {
         Ok(json) => CallToolResult::success(vec![Content::text(json)]),
+        Err(e) => tool_error_code(
+            "INTERNAL_ERROR",
+            format!("failed to serialize result: {e}"),
+            None,
+        ),
+    }
+}
+
+/// Wrap `value` as the tool's **structured** result: the typed data goes in
+/// `structured_content` (machine-readable, matching the tool's `output_schema`) and only a
+/// short `summary` line goes in the unstructured `content`. We deliberately do *not* also
+/// serialize the full value as text — that would double the payload and undercut the
+/// response budget (see ADR-0013). `CallToolResult` is `#[non_exhaustive]`, so we mutate the
+/// public `structured_content` field on an owned `success` result rather than struct-literal.
+fn structured_result<T: Serialize>(value: &T, summary: impl Into<String>) -> CallToolResult {
+    match serde_json::to_value(value) {
+        Ok(json) => {
+            let mut result = CallToolResult::success(vec![Content::text(summary.into())]);
+            result.structured_content = Some(json);
+            result
+        }
         Err(e) => tool_error_code(
             "INTERNAL_ERROR",
             format!("failed to serialize result: {e}"),
@@ -371,8 +443,9 @@ mod tests {
     use super::*;
 
     /// Decode a `CallToolResult` into `(is_error, inner_payload_json)`. We serialize the
-    /// whole result and read the MCP wire fields, which is robust to rmcp's internal Content
-    /// accessors; `text` carries our JSON (a `FetchOutput`/`Item` or an `ErrorObj`).
+    /// whole result and read the MCP wire fields. Success results now carry the typed data in
+    /// `structuredContent` (with only a summary in `content`); error results carry the
+    /// `ErrorObj` JSON as text. Prefer `structuredContent` when present, else parse the text.
     fn decode(result: &CallToolResult) -> (bool, serde_json::Value) {
         let v = serde_json::to_value(result).expect("serialize CallToolResult");
         let is_error = v
@@ -380,12 +453,23 @@ mod tests {
             .or_else(|| v.get("is_error"))
             .and_then(|b| b.as_bool())
             .unwrap_or(false);
+        if let Some(sc) = v.get("structuredContent")
+            && !sc.is_null()
+        {
+            return (is_error, sc.clone());
+        }
         let text = v["content"][0]["text"]
             .as_str()
             .unwrap_or_else(|| panic!("expected text content, got: {v}"));
         let payload = serde_json::from_str(text)
             .unwrap_or_else(|e| panic!("tool text should be JSON ({e}): {text}"));
         (is_error, payload)
+    }
+
+    /// Pull the unstructured `content[0].text` summary out of a result, if any.
+    fn summary_text(result: &CallToolResult) -> Option<String> {
+        let v = serde_json::to_value(result).ok()?;
+        v["content"][0]["text"].as_str().map(|s| s.to_string())
     }
 
     fn temp_cache(tag: &str) -> (Cache, std::path::PathBuf) {
@@ -451,6 +535,103 @@ mod tests {
         assert!(
             payload["truncation"].is_null(),
             "untruncated result → truncation null"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn tools_advertise_annotations_and_output_schema() {
+        let tools = RssServer::tool_router().list_all();
+
+        let fetch = tools
+            .iter()
+            .find(|t| t.name == "fetch_feed")
+            .expect("fetch_feed tool registered");
+        let ann = fetch.annotations.as_ref().expect("fetch_feed annotations");
+        assert_eq!(ann.read_only_hint, Some(true));
+        assert_eq!(ann.idempotent_hint, Some(true));
+        assert_eq!(ann.open_world_hint, Some(true), "fetch hits the network");
+        assert!(
+            fetch.output_schema.is_some(),
+            "fetch_feed should advertise its FetchOutput output_schema"
+        );
+
+        // get_schema is local-only (not open-world) and has no fixed output shape.
+        let get_schema = tools
+            .iter()
+            .find(|t| t.name == "get_schema")
+            .expect("get_schema tool registered");
+        assert_eq!(
+            get_schema
+                .annotations
+                .as_ref()
+                .and_then(|a| a.open_world_hint),
+            Some(false),
+            "get_schema does not touch the network"
+        );
+        assert!(get_schema.output_schema.is_none());
+    }
+
+    #[tokio::test]
+    async fn fetch_feed_success_uses_structured_content_with_summary_text() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/feed.xml")
+            .with_status(200)
+            .with_body(feed_with_items(3))
+            .create_async()
+            .await;
+        let (cache, dir) = temp_cache("structured");
+
+        let result =
+            fetch_feed_inner(&cache, fetch_args(format!("{}/feed.xml", server.url()))).await;
+        let wire = serde_json::to_value(&result).expect("serialize result");
+
+        // The typed FetchOutput lives in structuredContent (matching the tool output_schema).
+        assert!(
+            wire.get("structuredContent").is_some_and(|v| !v.is_null()),
+            "success result should carry structuredContent: {wire}"
+        );
+        assert_eq!(wire["structuredContent"]["total_items"], 3);
+
+        // The unstructured content is only a short summary, NOT a second full copy of the
+        // payload (that would double the response and undercut the token budget).
+        let summary = summary_text(&result).expect("a text summary");
+        assert!(
+            summary.contains("item(s)"),
+            "summary should be terse: {summary}"
+        );
+        assert!(
+            !summary.contains("\"feeds\""),
+            "text content must not duplicate the full FetchOutput JSON: {summary}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn error_result_has_no_structured_content() {
+        // An over-budget result is an error: it must stay text-only (the ErrorObj), with no
+        // structuredContent, so it never violates the success output_schema (ADR-0013).
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/feed.xml")
+            .with_status(200)
+            .with_body(feed_with_items(10))
+            .create_async()
+            .await;
+        let (cache, dir) = temp_cache("err-nostruct");
+
+        let mut args = fetch_args(format!("{}/feed.xml", server.url()));
+        args.max_response_tokens = Some(1);
+        let result = fetch_feed_inner(&cache, args).await;
+        let wire = serde_json::to_value(&result).expect("serialize result");
+
+        assert_eq!(wire["isError"], true);
+        assert!(
+            wire.get("structuredContent").is_none_or(|v| v.is_null()),
+            "error results must not carry structuredContent: {wire}"
         );
 
         std::fs::remove_dir_all(&dir).ok();

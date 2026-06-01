@@ -6,9 +6,12 @@
 //!   - `Text`: render to plain text with `html2text`.
 //!   - `Html`: return the HTML as-is (feed-rs already emits sanitized content).
 //!   - `None`: callers should not call `extract`; return an empty string defensively.
-//! - On any converter error, fall back to a naive tag strip rather than panicking.
+//! - On any converter error, fall back to a naive tag strip rather than panicking, and
+//!   report the fallback so callers can surface a `CONTENT_EXTRACTION_FALLBACK` warning.
 //! - [`estimate_tokens`] returns a cheap, dependency-free token estimate
 //!   (`ceil(chars / 4)`), used so agents can budget context.
+
+use sha2::{Digest, Sha256};
 
 use crate::model::ContentFormat;
 
@@ -17,14 +20,35 @@ use crate::model::ContentFormat;
 const TEXT_WRAP_WIDTH: usize = 80;
 
 /// Convert `html` to the requested format. **Owner: `parser` agent.**
-pub fn extract(html: &str, format: ContentFormat) -> String {
+///
+/// Returns `(content, fell_back)`. `fell_back` is `true` when the Markdown/Text converter
+/// errored and we degraded to a naive tag strip (lower fidelity) — the caller turns that
+/// into a non-fatal warning. It is always `false` for `Html`/`None` (no conversion).
+pub fn extract(html: &str, format: ContentFormat) -> (String, bool) {
     match format {
-        ContentFormat::Markdown => htmd::convert(html).unwrap_or_else(|_| strip_tags(html)),
-        ContentFormat::Text => html2text::from_read(html.as_bytes(), TEXT_WRAP_WIDTH)
-            .unwrap_or_else(|_| strip_tags(html)),
-        ContentFormat::Html => html.to_string(),
-        ContentFormat::None => String::new(),
+        ContentFormat::Markdown => match htmd::convert(html) {
+            Ok(md) => (md, false),
+            Err(_) => (strip_tags(html), true),
+        },
+        ContentFormat::Text => match html2text::from_read(html.as_bytes(), TEXT_WRAP_WIDTH) {
+            Ok(text) => (text, false),
+            Err(_) => (strip_tags(html), true),
+        },
+        ContentFormat::Html => (html.to_string(), false),
+        ContentFormat::None => (String::new(), false),
     }
+}
+
+/// Stable 16-hex (64-bit) SHA-256 prefix of already-extracted content, for cheap
+/// change-detection across runs. Mirrors the item-id construction (lowercase hex, first 8
+/// bytes); 64 bits is ample to flag "this body changed".
+pub fn content_hash(text: &str) -> String {
+    let digest = Sha256::digest(text.as_bytes());
+    let mut hex = String::with_capacity(16);
+    for byte in digest.iter().take(8) {
+        hex.push_str(&format!("{byte:02x}"));
+    }
+    hex
 }
 
 /// Rough token estimate for already-extracted text. **Owner: `parser` agent.**
@@ -76,26 +100,50 @@ mod tests {
 
     #[test]
     fn markdown_extraction_keeps_text() {
-        let md = extract("<p>Hi <a href=x>link</a></p>", ContentFormat::Markdown);
+        let (md, fell_back) = extract("<p>Hi <a href=x>link</a></p>", ContentFormat::Markdown);
         assert!(!md.is_empty());
         assert!(md.contains("Hi"), "markdown should retain text: {md:?}");
+        assert!(!fell_back, "a well-formed fragment should not fall back");
     }
 
     #[test]
     fn text_extraction_keeps_text() {
-        let text = extract("<p>Hi <a href=x>link</a></p>", ContentFormat::Text);
+        let (text, fell_back) = extract("<p>Hi <a href=x>link</a></p>", ContentFormat::Text);
         assert!(text.contains("Hi"), "text should retain content: {text:?}");
+        assert!(!fell_back);
     }
 
     #[test]
     fn html_format_is_passthrough() {
         let html = "<p>raw <b>html</b></p>";
-        assert_eq!(extract(html, ContentFormat::Html), html);
+        assert_eq!(
+            extract(html, ContentFormat::Html),
+            (html.to_string(), false)
+        );
     }
 
     #[test]
     fn none_format_is_empty() {
-        assert_eq!(extract("<p>anything</p>", ContentFormat::None), "");
+        assert_eq!(
+            extract("<p>anything</p>", ContentFormat::None),
+            (String::new(), false)
+        );
+    }
+
+    #[test]
+    fn content_hash_is_stable_16_hex_and_change_sensitive() {
+        let a = content_hash("the body");
+        assert_eq!(a, content_hash("the body"), "hash is deterministic");
+        assert_eq!(a.len(), 16);
+        assert!(
+            a.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        );
+        assert_ne!(
+            a,
+            content_hash("the body changed"),
+            "different content → different hash"
+        );
     }
 
     #[test]

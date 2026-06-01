@@ -114,6 +114,12 @@ pub struct FetchArgs {
     #[arg(long, value_enum, default_value_t = FormatArg::Json)]
     pub format: FormatArg,
 
+    /// With `--format ndjson`, emit one tagged record per line
+    /// (`{"type":"item"|"error"|"summary", …}`) instead of bare items, so feed-level errors
+    /// and aggregate totals stay in the stdout stream. No effect on other formats.
+    #[arg(long)]
+    pub ndjson_records: bool,
+
     /// Content extraction format for item bodies.
     #[arg(long, value_enum, default_value_t = ContentArg::Markdown)]
     pub content: ContentArg,

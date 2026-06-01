@@ -84,6 +84,16 @@ A single core powers both the CLI and the MCP server, so the two front-ends cann
    `limit`/`max_content_chars`); every MCP tool error is structured `ErrorObj` JSON, never
    a bare string. Don't return an unbounded `FetchOutput` or a plain-text tool error. See
    [ADR-0011](docs/adr/0011-bounded-mcp-responses.md).
+8. **MCP data tools return structured content, not duplicated text.** `fetch_feed` /
+   `get_item` / `discover_feeds` put the payload in `structuredContent` (matching the tool's
+   generated `outputSchema`) with only a one-line summary in text — never the full payload as
+   text too (that doubles tokens and breaks the budget). Errors stay text-only `ErrorObj`
+   with no `structuredContent`. See [ADR-0013](docs/adr/0013-structured-mcp-tool-results.md).
+9. **`feeds[]`/`errors[]` are in request order** (deterministic *within a run* — not
+   byte-reproducible, since `fetched_at`/`status`/`from_cache` vary). `total_items`,
+   `total_content_tokens_est`, per-feed counts, `content_hash`, and `warnings` are **additive**
+   contract fields computed in `core` (so CLI and MCP stay in sync); `warnings` is kept rare
+   on purpose. See [ADR-0012](docs/adr/0012-deterministic-ordering-and-output-enrichments.md).
 
 ## Gotchas (these already bit — don't relearn them)
 

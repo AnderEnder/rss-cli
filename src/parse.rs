@@ -21,7 +21,7 @@ use crate::config::FetchParams;
 use crate::content;
 use crate::error::RssError;
 use crate::identity;
-use crate::model::{ContentFormat, Enclosure, Item};
+use crate::model::{ContentFormat, Enclosure, Item, Warning};
 
 /// Parsed feed metadata plus its items, ready to drop into a [`crate::model::FeedResult`].
 #[derive(Debug, Clone)]
@@ -31,6 +31,8 @@ pub struct ParsedFeed {
     /// Feed-level updated timestamp, RFC-3339 UTC.
     pub updated: Option<String>,
     pub items: Vec<Item>,
+    /// Non-fatal data-quality warnings about this feed (already carry `feed_url`).
+    pub warnings: Vec<Warning>,
 }
 
 /// Parse raw feed bytes into a [`ParsedFeed`]. `feed_url` is the (post-redirect) URL the
@@ -50,19 +52,20 @@ pub fn parse_feed(
     // simply keep raw hrefs rather than failing the whole parse.
     let base = Url::parse(feed_url).ok();
 
-    // Build (item, sort-key) pairs so we can filter/sort by the underlying instant before
-    // discarding it. The sort key is `published` falling back to `updated`.
-    let mut rows: Vec<(Item, Option<DateTime<Utc>>)> = Vec::with_capacity(feed.entries.len());
+    // Build (item, sort-key, content_fell_back) triples so we can filter/sort by the
+    // underlying instant before discarding it. The sort key is `published` falling back to
+    // `updated`; `fell_back` records a lower-fidelity content extraction for warnings.
+    let mut rows: Vec<(Item, Option<DateTime<Utc>>, bool)> = Vec::with_capacity(feed.entries.len());
     for entry in feed.entries {
         let sort_key = entry.published.or(entry.updated);
-        let item = entry_to_item(entry, feed_url, base.as_ref(), params);
-        rows.push((item, sort_key));
+        let (item, fell_back) = entry_to_item(entry, feed_url, base.as_ref(), params);
+        rows.push((item, sort_key, fell_back));
     }
 
     // `--since`: drop items whose known instant is older than the cutoff. Items with no
     // date are retained (we cannot prove they are older).
     if let Some(since) = params.since {
-        rows.retain(|(_, key)| match key {
+        rows.retain(|(_, key, _)| match key {
             Some(dt) => *dt >= since,
             None => true,
         });
@@ -78,18 +81,62 @@ pub fn parse_feed(
         rows.truncate(limit);
     }
 
-    let items = rows.into_iter().map(|(item, _)| item).collect();
+    // Derive non-fatal warnings from the *surviving* rows (so a dropped item never warns).
+    let warnings = collect_warnings(feed_url, &rows);
+
+    let items = rows.into_iter().map(|(item, _, _)| item).collect();
 
     Ok(ParsedFeed {
         title,
         site_url,
         updated,
         items,
+        warnings,
     })
 }
 
-/// Convert a single `feed-rs` [`Entry`] into our serialized [`Item`].
-fn entry_to_item(entry: Entry, feed_url: &str, base: Option<&Url>, params: &FetchParams) -> Item {
+/// Build the non-fatal [`Warning`]s for a feed from its returned rows. Kept deliberately
+/// rare so the channel stays meaningful: a single aggregated warning when content
+/// extraction degraded, and an ordering caveat only when *every* returned item is undated.
+fn collect_warnings(feed_url: &str, rows: &[(Item, Option<DateTime<Utc>>, bool)]) -> Vec<Warning> {
+    let mut warnings = Vec::new();
+
+    let fell_back = rows.iter().filter(|(_, _, fb)| *fb).count();
+    if fell_back > 0 {
+        warnings.push(Warning {
+            feed_url: Some(feed_url.to_string()),
+            code: "CONTENT_EXTRACTION_FALLBACK".to_string(),
+            message: format!(
+                "HTML conversion failed for {fell_back} item(s); fell back to a plain tag \
+                 strip (content may be lower fidelity)"
+            ),
+        });
+    }
+
+    if !rows.is_empty() && rows.iter().all(|(_, key, _)| key.is_none()) {
+        warnings.push(Warning {
+            feed_url: Some(feed_url.to_string()),
+            code: "UNDATED_ITEMS".to_string(),
+            message: format!(
+                "all {} returned item(s) lack a published/updated date; newest-first ordering \
+                 falls back to the feed's original order",
+                rows.len()
+            ),
+        });
+    }
+
+    warnings
+}
+
+/// Convert a single `feed-rs` [`Entry`] into our serialized [`Item`], returning
+/// `(item, content_fell_back)` — the flag is `true` when content extraction degraded to a
+/// tag strip (see [`content::extract`]) so the caller can warn.
+fn entry_to_item(
+    entry: Entry,
+    feed_url: &str,
+    base: Option<&Url>,
+    params: &FetchParams,
+) -> (Item, bool) {
     // Collect attachments while `entry` is still fully owned (borrows `media`/`links`).
     let enclosures = collect_enclosures(&entry);
 
@@ -116,6 +163,10 @@ fn entry_to_item(entry: Entry, feed_url: &str, base: Option<&Url>, params: &Fetc
     // content element is absent/empty. Skipped entirely when extraction is disabled.
     let format = params.content_format;
     let mut content_truncated = false;
+    let mut content_fell_back = false;
+    // SHA-256 of the *pre-truncation* extracted body, so the hash reflects the real content
+    // regardless of `max_content_chars`. `None` when there is no content.
+    let mut content_hash = None;
     let content = if format == ContentFormat::None {
         None
     } else {
@@ -125,7 +176,9 @@ fn entry_to_item(entry: Entry, feed_url: &str, base: Option<&Url>, params: &Fetc
             .filter(|h| !h.trim().is_empty())
             .or_else(|| summary.as_deref().filter(|s| !s.trim().is_empty()));
         source.map(|html| {
-            let extracted = content::extract(html, format);
+            let (extracted, fell_back) = content::extract(html, format);
+            content_fell_back = fell_back;
+            content_hash = Some(content::content_hash(&extracted));
             // Apply the per-item character cap to the *extracted* body (not source HTML).
             match params.max_content_chars {
                 Some(max) => {
@@ -152,7 +205,7 @@ fn entry_to_item(entry: Entry, feed_url: &str, base: Option<&Url>, params: &Fetc
         published.as_deref(),
     );
 
-    Item {
+    let item = Item {
         id,
         id_source,
         feed_url: feed_url.to_string(),
@@ -166,10 +219,12 @@ fn entry_to_item(entry: Entry, feed_url: &str, base: Option<&Url>, params: &Fetc
         content_format: format,
         content_tokens_est,
         content_truncated,
+        content_hash,
         categories,
         enclosures,
         guid,
-    }
+    };
+    (item, content_fell_back)
 }
 
 /// Gather media attachments from both `media:content` blocks and `rel="enclosure"` links.
@@ -433,6 +488,63 @@ mod tests {
         let parsed = parse_feed(ATOM.as_bytes(), FEED_URL, &p).unwrap();
         assert!(parsed.items[0].content.is_none());
         assert_eq!(parsed.items[0].content_tokens_est, 0);
+        // No content → no hash.
+        assert!(parsed.items[0].content_hash.is_none());
+    }
+
+    #[test]
+    fn content_hash_present_stable_and_truncation_independent() {
+        let full = parse_feed(ATOM.as_bytes(), FEED_URL, &params()).unwrap();
+        let hash = full.items[0]
+            .content_hash
+            .clone()
+            .expect("content present → hash present");
+        assert_eq!(hash.len(), 16);
+
+        // Re-parsing yields the same hash (deterministic).
+        let again = parse_feed(ATOM.as_bytes(), FEED_URL, &params()).unwrap();
+        assert_eq!(again.items[0].content_hash.as_deref(), Some(hash.as_str()));
+
+        // The hash is over the *pre-truncation* body, so a cap does not change it.
+        let mut p = params();
+        p.max_content_chars = Some(4);
+        let capped = parse_feed(ATOM.as_bytes(), FEED_URL, &p).unwrap();
+        assert!(capped.items[0].content_truncated);
+        assert_eq!(
+            capped.items[0].content_hash.as_deref(),
+            Some(hash.as_str()),
+            "truncating the served body must not change the content hash"
+        );
+    }
+
+    const UNDATED_RSS: &str = r#"<?xml version="1.0"?>
+<rss version="2.0">
+  <channel>
+    <title>Undated Feed</title>
+    <link>https://example.com/</link>
+    <item><title>A</title><link>https://example.com/a</link></item>
+    <item><title>B</title><link>https://example.com/b</link></item>
+  </channel>
+</rss>"#;
+
+    #[test]
+    fn all_undated_items_emit_single_warning() {
+        let parsed = parse_feed(UNDATED_RSS.as_bytes(), FEED_URL, &params()).unwrap();
+        assert_eq!(parsed.items.len(), 2);
+        let undated: Vec<_> = parsed
+            .warnings
+            .iter()
+            .filter(|w| w.code == "UNDATED_ITEMS")
+            .collect();
+        assert_eq!(undated.len(), 1, "exactly one aggregated undated warning");
+        assert_eq!(undated[0].feed_url.as_deref(), Some(FEED_URL));
+    }
+
+    #[test]
+    fn dated_feed_has_no_undated_warning() {
+        // RSS has pubDates, so ordering is reliable and no warning should fire.
+        let parsed = parse_feed(RSS.as_bytes(), FEED_URL, &params()).unwrap();
+        assert!(parsed.warnings.iter().all(|w| w.code != "UNDATED_ITEMS"));
     }
 
     #[test]

@@ -66,11 +66,19 @@ pub fn schema_for(command: &str) -> serde_json::Value {
 ///
 /// - `Json`: `serde_json::to_string_pretty(out)`.
 /// - `Ndjson`: one line per `Item` across all feeds; feed-level errors go to stderr (the
-///   caller handles that) — this function returns only the stdout payload.
+///   caller handles that) — this function returns only the stdout payload. When
+///   `ndjson_records` is set, emit self-contained tagged records instead (see
+///   [`render_fetch_ndjson_records`]).
 /// - `Text`: a compact human summary; use `color` to decide on ANSI styling.
-pub fn render_fetch(out: &FetchOutput, format: OutputFormat, color: bool) -> String {
+pub fn render_fetch(
+    out: &FetchOutput,
+    format: OutputFormat,
+    color: bool,
+    ndjson_records: bool,
+) -> String {
     match format {
         OutputFormat::Json => serde_json::to_string_pretty(out).unwrap_or_default(),
+        OutputFormat::Ndjson if ndjson_records => render_fetch_ndjson_records(out),
         OutputFormat::Ndjson => out
             .feeds
             .iter()
@@ -80,6 +88,52 @@ pub fn render_fetch(out: &FetchOutput, format: OutputFormat, color: bool) -> Str
             .join("\n"),
         OutputFormat::Text => render_fetch_text(out, color),
     }
+}
+
+/// Self-contained NDJSON: every line is a record tagged with a `type` discriminator
+/// (`"item"`, `"error"`, or a final `"summary"`), so a consumer reading only stdout never
+/// loses feed-level errors or the aggregate counts (which the bare-item stream drops to
+/// stderr). Opt-in via `--ndjson-records`; the default stream stays pure `Item` lines for
+/// back-compatibility. See ADR-0012.
+fn render_fetch_ndjson_records(out: &FetchOutput) -> String {
+    let mut lines: Vec<String> = Vec::new();
+
+    let tagged = |value: serde_json::Value, kind: &str| -> String {
+        let mut value = value;
+        if let Some(obj) = value.as_object_mut() {
+            obj.insert(
+                "type".to_string(),
+                serde_json::Value::String(kind.to_string()),
+            );
+        }
+        value.to_string()
+    };
+
+    for item in out.feeds.iter().flat_map(|f| f.items.iter()) {
+        if let Ok(v) = serde_json::to_value(item) {
+            lines.push(tagged(v, "item"));
+        }
+    }
+    for err in &out.errors {
+        if let Ok(v) = serde_json::to_value(err) {
+            lines.push(tagged(v, "error"));
+        }
+    }
+    // A trailing summary record so the stream is self-describing about totals and bounding.
+    let summary = serde_json::json!({
+        "type": "summary",
+        "schema_version": out.schema_version,
+        "fetched_at": out.fetched_at,
+        "feeds": out.feeds.len(),
+        "errors": out.errors.len(),
+        "total_items": out.total_items,
+        "total_content_tokens_est": out.total_content_tokens_est,
+        "warnings": out.warnings,
+        "truncation": out.truncation,
+    });
+    lines.push(summary.to_string());
+
+    lines.join("\n")
 }
 
 /// Concise, deterministic human summary of a [`FetchOutput`].
@@ -183,6 +237,7 @@ mod tests {
             content_format: ContentFormat::Markdown,
             content_tokens_est: 1,
             content_truncated: false,
+            content_hash: Some("00112233aabbccdd".to_string()),
             categories: vec![],
             enclosures: vec![],
             guid: None,
@@ -191,6 +246,11 @@ mod tests {
 
     fn sample_output() -> FetchOutput {
         let mut out = FetchOutput::new("2026-06-01T00:00:00Z".to_string());
+        let items = vec![
+            sample_item("1", "First Post", "https://example.com/1"),
+            sample_item("2", "Second Post", "https://example.com/2"),
+        ];
+        let content_tokens_est_total = items.iter().map(|i| u64::from(i.content_tokens_est)).sum();
         out.feeds.push(FeedResult {
             feed_url: "https://example.com/feed.xml".to_string(),
             status: FeedStatus::Ok,
@@ -198,28 +258,35 @@ mod tests {
             title: Some("Example Feed".to_string()),
             site_url: Some("https://example.com".to_string()),
             updated: None,
-            items: vec![
-                sample_item("1", "First Post", "https://example.com/1"),
-                sample_item("2", "Second Post", "https://example.com/2"),
-            ],
+            item_count: items.len(),
+            content_tokens_est_total,
+            items,
             error: None,
         });
+        out.total_items = out.feeds.iter().map(|f| f.items.len()).sum();
+        out.total_content_tokens_est = out
+            .feeds
+            .iter()
+            .flat_map(|f| &f.items)
+            .map(|i| u64::from(i.content_tokens_est))
+            .sum();
         out
     }
 
     #[test]
     fn fetch_json_roundtrips() {
         let out = sample_output();
-        let json = render_fetch(&out, OutputFormat::Json, false);
+        let json = render_fetch(&out, OutputFormat::Json, false, false);
         let parsed: FetchOutput = serde_json::from_str(&json).expect("valid json roundtrip");
         assert_eq!(parsed.feeds.len(), 1);
         assert_eq!(parsed.feeds[0].items.len(), 2);
+        assert_eq!(parsed.total_items, 2);
     }
 
     #[test]
     fn fetch_ndjson_one_line_per_item() {
         let out = sample_output();
-        let ndjson = render_fetch(&out, OutputFormat::Ndjson, false);
+        let ndjson = render_fetch(&out, OutputFormat::Ndjson, false, false);
         assert_eq!(ndjson.lines().count(), 2);
         // Each line is independently parseable as an Item.
         for line in ndjson.lines() {
@@ -228,9 +295,34 @@ mod tests {
     }
 
     #[test]
+    fn fetch_ndjson_records_are_tagged_and_self_contained() {
+        use crate::model::ErrorObj;
+        let mut out = sample_output();
+        out.errors
+            .push(ErrorObj::new("FEED_FETCH_FAILED", "boom").with_feed("https://bad.example/x"));
+
+        let ndjson = render_fetch(&out, OutputFormat::Ndjson, false, true);
+        let records: Vec<serde_json::Value> = ndjson
+            .lines()
+            .map(|l| serde_json::from_str(l).expect("each record line is JSON"))
+            .collect();
+
+        // 2 items + 1 error + 1 summary.
+        assert_eq!(records.len(), 4);
+        assert_eq!(records[0]["type"], "item");
+        assert_eq!(records[0]["id"], "1");
+        assert_eq!(records[2]["type"], "error");
+        assert_eq!(records[2]["code"], "FEED_FETCH_FAILED");
+        let summary = records.last().unwrap();
+        assert_eq!(summary["type"], "summary");
+        assert_eq!(summary["total_items"], 2);
+        assert_eq!(summary["errors"], 1);
+    }
+
+    #[test]
     fn fetch_text_contains_titles() {
         let out = sample_output();
-        let text = render_fetch(&out, OutputFormat::Text, false);
+        let text = render_fetch(&out, OutputFormat::Text, false, false);
         assert!(text.contains("Example Feed"));
         assert!(text.contains("First Post"));
         assert!(text.contains("Second Post"));
@@ -240,7 +332,7 @@ mod tests {
     #[test]
     fn fetch_text_color_wraps_but_preserves_titles() {
         let out = sample_output();
-        let text = render_fetch(&out, OutputFormat::Text, true);
+        let text = render_fetch(&out, OutputFormat::Text, true, false);
         // The bare title is still present even with ANSI wrapping.
         assert!(text.contains("Example Feed"));
         assert!(text.contains(BOLD));
@@ -255,7 +347,7 @@ mod tests {
             .push(FeedResult::error("https://bad.example/x", err.clone()));
         out.errors.push(err);
 
-        let text = render_fetch(&out, OutputFormat::Text, false);
+        let text = render_fetch(&out, OutputFormat::Text, false, false);
         assert!(text.contains("[error]")); // status label for FeedStatus::Error
         assert!(text.contains("FEED_FETCH_FAILED"));
         assert!(text.contains("boom"));

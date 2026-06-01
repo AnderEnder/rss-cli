@@ -11,7 +11,7 @@ use crate::cache::Cache;
 use crate::config::FetchParams;
 use crate::error::RssError;
 use crate::fetch::HttpClient;
-use crate::model::{DiscoverOutput, FeedResult, FeedStatus, FetchOutput, TruncationInfo};
+use crate::model::{DiscoverOutput, FeedResult, FeedStatus, FetchOutput, TruncationInfo, Warning};
 use crate::{discover, parse};
 
 /// Fetch and parse many feeds concurrently, returning the full structured output.
@@ -24,49 +24,82 @@ pub async fn fetch_feeds(urls: &[String], params: &FetchParams, cache: &Cache) -
     let http = match HttpClient::new(&params.user_agent, params.timeout) {
         Ok(c) => c,
         Err(e) => {
-            // Cannot build the client: every feed fails identically.
+            // Cannot build the client: every feed fails identically (already in url order).
             for url in urls {
                 let obj = e.to_error_obj(Some(url));
                 output.errors.push(obj.clone());
                 output.feeds.push(FeedResult::error(url.clone(), obj));
             }
+            populate_totals(&mut output);
             return output;
         }
     };
 
-    let results: Vec<FeedResult> = stream::iter(urls.iter().cloned())
-        .map(|url| {
-            let http = &http;
-            async move {
-                match fetch_one(&url, http, params, cache).await {
-                    Ok(fr) => fr,
-                    Err(e) => FeedResult::error(url.clone(), e.to_error_obj(Some(&url))),
+    // Tag each task with its input index so we can restore request order after the
+    // completion-ordered `buffer_unordered` stream — `feeds[]`/`errors[]` are then
+    // deterministic within a run (an agent can address feeds by position). See ADR-0012.
+    let mut results: Vec<(usize, FeedResult, Vec<Warning>)> =
+        stream::iter(urls.iter().cloned().enumerate())
+            .map(|(idx, url)| {
+                let http = &http;
+                async move {
+                    match fetch_one(&url, http, params, cache).await {
+                        Ok((fr, warnings)) => (idx, fr, warnings),
+                        Err(e) => (
+                            idx,
+                            FeedResult::error(url.clone(), e.to_error_obj(Some(&url))),
+                            Vec::new(),
+                        ),
+                    }
                 }
-            }
-        })
-        .buffer_unordered(params.concurrency.max(1))
-        .collect()
-        .await;
+            })
+            .buffer_unordered(params.concurrency.max(1))
+            .collect()
+            .await;
 
-    for fr in results {
+    results.sort_by_key(|(idx, _, _)| *idx);
+
+    for (_, fr, warnings) in results {
         if let Some(err) = &fr.error {
             output.errors.push(err.clone());
         }
+        output.warnings.extend(warnings);
         output.feeds.push(fr);
     }
+    populate_totals(&mut output);
     output
 }
 
-/// Fetch and parse a single feed.
+/// Fill the top-level aggregate counts from the assembled feeds. Called once both feeds and
+/// per-feed counts are final (post-`limit`/`--since`/truncation).
+fn populate_totals(output: &mut FetchOutput) {
+    output.total_items = output.feeds.iter().map(|f| f.items.len()).sum();
+    output.total_content_tokens_est = output
+        .feeds
+        .iter()
+        .flat_map(|f| &f.items)
+        .map(|i| u64::from(i.content_tokens_est))
+        .sum();
+}
+
+/// Fetch and parse a single feed, returning the [`FeedResult`] plus any non-fatal
+/// [`Warning`]s the parse surfaced (e.g. a content-extraction fallback). Callers aggregate
+/// the warnings into [`FetchOutput::warnings`].
 pub async fn fetch_one(
     url: &str,
     http: &HttpClient,
     params: &FetchParams,
     cache: &Cache,
-) -> Result<FeedResult, RssError> {
+) -> Result<(FeedResult, Vec<Warning>), RssError> {
     let raw = http.fetch(url, cache, params.cache_policy).await?;
     let parsed = parse::parse_feed(&raw.body, url, params)?;
-    Ok(FeedResult {
+    let item_count = parsed.items.len();
+    let content_tokens_est_total = parsed
+        .items
+        .iter()
+        .map(|i| u64::from(i.content_tokens_est))
+        .sum();
+    let fr = FeedResult {
         feed_url: url.to_string(),
         status: if raw.not_modified {
             FeedStatus::NotModified
@@ -77,9 +110,12 @@ pub async fn fetch_one(
         title: parsed.title,
         site_url: parsed.site_url,
         updated: parsed.updated,
+        item_count,
+        content_tokens_est_total,
         items: parsed.items,
         error: None,
-    })
+    };
+    Ok((fr, parsed.warnings))
 }
 
 /// Discover feeds advertised on a website homepage.
@@ -102,7 +138,7 @@ pub async fn show_item(
     cache: &Cache,
 ) -> Result<Option<crate::model::Item>, RssError> {
     let http = HttpClient::new(&params.user_agent, params.timeout)?;
-    let fr = fetch_one(feed_url, &http, params, cache).await?;
+    let (fr, _warnings) = fetch_one(feed_url, &http, params, cache).await?;
     Ok(fr.items.into_iter().find(|it| it.id == id))
 }
 
@@ -228,6 +264,7 @@ mod tests {
             content_format: ContentFormat::Markdown,
             content_tokens_est: 1,
             content_truncated,
+            content_hash: Some("00112233aabbccdd".to_string()),
             categories: vec![],
             enclosures: vec![],
             guid: None,
@@ -236,6 +273,8 @@ mod tests {
 
     fn output_with(items: Vec<Item>) -> FetchOutput {
         let mut out = FetchOutput::new("2026-06-01T00:00:00Z".to_string());
+        let item_count = items.len();
+        let content_tokens_est_total = items.iter().map(|i| u64::from(i.content_tokens_est)).sum();
         out.feeds.push(FeedResult {
             feed_url: "https://example.com/feed.xml".to_string(),
             status: FeedStatus::Ok,
@@ -243,9 +282,12 @@ mod tests {
             title: Some("Feed".to_string()),
             site_url: None,
             updated: None,
+            item_count,
+            content_tokens_est_total,
             items,
             error: None,
         });
+        populate_totals(&mut out);
         out
     }
 
@@ -275,6 +317,17 @@ mod tests {
             }
             other => panic!("expected ResponseTooLarge, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn populate_totals_sums_items_and_tokens() {
+        // item() has content_tokens_est = 1.
+        let out = output_with(vec![item(false), item(false), item(true)]);
+        assert_eq!(out.total_items, 3);
+        assert_eq!(out.total_content_tokens_est, 3);
+        // Per-feed counts mirror the aggregate for a single feed.
+        assert_eq!(out.feeds[0].item_count, 3);
+        assert_eq!(out.feeds[0].content_tokens_est_total, 3);
     }
 
     #[test]

@@ -17,9 +17,19 @@ pub struct FetchOutput {
     pub schema_version: String,
     /// RFC-3339 / ISO-8601 UTC timestamp of when this invocation ran.
     pub fetched_at: String,
+    /// Total number of items returned across every feed (after `limit`/`--since`). Lets an
+    /// agent budget before walking the `feeds` array.
+    pub total_items: usize,
+    /// Sum of every item's `content_tokens_est` (reflects truncation). The number to budget
+    /// a response against.
+    pub total_content_tokens_est: u64,
     pub feeds: Vec<FeedResult>,
     /// Feed-level errors mirrored here for quick scanning (also present per-feed).
     pub errors: Vec<ErrorObj>,
+    /// Non-fatal data-quality warnings (e.g. a content converter fell back to a tag strip,
+    /// or a feed's items are entirely undated). Empty `[]` normally; each carries its
+    /// `feed_url`. Distinct from `errors`, which mean a feed failed outright.
+    pub warnings: Vec<Warning>,
     /// Present (non-`null`) when this result was bounded — an item cap was applied, item
     /// bodies were truncated, or items were omitted to fit a size budget. `null` otherwise.
     /// Primarily populated by the MCP server, which bounds responses (see the `rss mcp`
@@ -32,11 +42,26 @@ impl FetchOutput {
         Self {
             schema_version: SCHEMA_VERSION.to_string(),
             fetched_at,
+            total_items: 0,
+            total_content_tokens_est: 0,
             feeds: Vec::new(),
             errors: Vec::new(),
+            warnings: Vec::new(),
             truncation: None,
         }
     }
+}
+
+/// A non-fatal data-quality note about a feed (the feed still parsed and produced items).
+/// Surfaces silent fallbacks an agent should know about — e.g. lower-fidelity content
+/// extraction, or items it cannot order by time.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct Warning {
+    /// The feed this warning pertains to, if applicable.
+    pub feed_url: Option<String>,
+    /// Stable, machine-readable code (e.g. `CONTENT_EXTRACTION_FALLBACK`, `UNDATED_ITEMS`).
+    pub code: String,
+    pub message: String,
 }
 
 /// Describes how a [`FetchOutput`] was bounded. A summary so an agent can tell at a glance
@@ -78,6 +103,11 @@ pub struct FeedResult {
     pub site_url: Option<String>,
     /// Feed-level last-updated timestamp (RFC-3339 UTC), if the feed provides one.
     pub updated: Option<String>,
+    /// Number of items returned for this feed (equals `items.len()`; surfaced as an explicit
+    /// budgeting count).
+    pub item_count: usize,
+    /// Sum of this feed's items' `content_tokens_est` (reflects truncation).
+    pub content_tokens_est_total: u64,
     pub items: Vec<Item>,
     pub error: Option<ErrorObj>,
 }
@@ -92,6 +122,8 @@ impl FeedResult {
             title: None,
             site_url: None,
             updated: None,
+            item_count: 0,
+            content_tokens_est_total: 0,
             items: Vec::new(),
             error: Some(error),
         }
@@ -145,6 +177,10 @@ pub struct Item {
     /// budget). The body ends with an ellipsis marker; fetch the item via `get_item` /
     /// `rss show` without a cap for the full text.
     pub content_truncated: bool,
+    /// 16-hex SHA-256 of the *full, pre-truncation* extracted content in the requested
+    /// `content_format`. Stable across runs, so an agent can detect when an item's body
+    /// changed without diffing text. `null` when `content` is `null` (`--content none`).
+    pub content_hash: Option<String>,
     pub categories: Vec<String>,
     pub enclosures: Vec<Enclosure>,
     /// The raw feed-provided guid/id, for reference (not necessarily stable).

@@ -35,3 +35,5 @@ where a real fork existed). Statuses: `Proposed`, `Accepted`, `Superseded by NNN
 | [0009](0009-html-to-markdown-htmd-html2text.md) | HTML→Markdown via `htmd` + `html2text` | Accepted |
 | [0010](0010-release-profile-tuning.md) | Tuned release profile (LTO, single codegen unit, abort, strip) | Accepted |
 | [0011](0011-bounded-mcp-responses.md) | Bounded MCP responses (default cap + budget + `RESPONSE_TOO_LARGE`) | Accepted |
+| [0012](0012-deterministic-ordering-and-output-enrichments.md) | Deterministic ordering + output enrichments (aggregates, `content_hash`, `warnings`, NDJSON records) | Accepted |
+| [0013](0013-structured-mcp-tool-results.md) | Structured MCP tool results (`structuredContent` + `outputSchema` + annotations) | Accepted |

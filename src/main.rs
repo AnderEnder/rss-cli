@@ -43,7 +43,10 @@ async fn run() -> i32 {
             let mut out = core::fetch_feeds(&urls, &params, &cache).await;
             // Surface per-item content truncation (from --max-content-chars) at the top level.
             out.truncation = core::truncation_marker(&out, None, None);
-            println!("{}", output::render_fetch(&out, args.format.into(), color));
+            println!(
+                "{}",
+                output::render_fetch(&out, args.format.into(), color, args.ndjson_records)
+            );
             core::exit_code_for(&out)
         }
 

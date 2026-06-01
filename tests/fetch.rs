@@ -284,8 +284,9 @@ fn malformed_feed_alone_exits_all_failed() {
     );
 }
 
-/// A good feed + a malformed feed → exit 3 (partial). `feeds[]` is in completion
-/// order (`buffer_unordered`), so results are matched by `feed_url`, never index.
+/// A good feed + a malformed feed → exit 3 (partial). `feeds[]` is emitted in
+/// **request order** (deterministic within a run, see ADR-0012), so we can assert
+/// positions as well as match by `feed_url`.
 #[test]
 fn mixed_feeds_exit_partial() {
     let mut server = mockito::Server::new();
@@ -342,6 +343,31 @@ fn mixed_feeds_exit_partial() {
     };
     assert_eq!(by_url(&good_url)["status"], "ok");
     assert_eq!(by_url(&bad_url)["status"], "error");
+
+    // Deterministic ordering: feeds come back in the order they were requested
+    // (good_url first, bad_url second), regardless of which completed first.
+    assert_eq!(
+        feeds[0]["feed_url"].as_str(),
+        Some(good_url.as_str()),
+        "feeds[] must be in request order (good first)"
+    );
+    assert_eq!(
+        feeds[1]["feed_url"].as_str(),
+        Some(bad_url.as_str()),
+        "feeds[] must be in request order (bad second)"
+    );
+
+    // Aggregate counts are present and consistent with the per-feed items.
+    let good = by_url(&good_url);
+    assert_eq!(
+        good["item_count"].as_u64(),
+        good["items"].as_array().map(|a| a.len() as u64),
+        "per-feed item_count mirrors items.len()"
+    );
+    assert!(
+        v["total_items"].as_u64().is_some(),
+        "top-level total_items should be present"
+    );
 }
 
 /// `--max-content-chars` truncates long item bodies, flags `content_truncated`, and

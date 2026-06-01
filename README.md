@@ -76,6 +76,7 @@ Notable flags:
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--format <json\|ndjson\|text>` | `json` | Output format. `json` is the full document; `ndjson` is one item per line; `text` is a human summary. |
+| `--ndjson-records` | — | With `--format ndjson`, emit tagged `{type:item\|error\|summary}` records (keeps errors + totals in the stream) instead of bare items. |
 | `--content <markdown\|text\|html\|none>` | `markdown` | How to render item bodies. `none` omits the body. |
 | `--limit <N>` | — | Max items per feed (newest first). |
 | `--max-content-chars <N>` | — | Truncate each item body to at most N characters (flagged `content_truncated`). Fetch many items while skipping giant bodies. |
@@ -146,6 +147,8 @@ authoritative schema is `rss schema --command fetch`.
 {
   "schema_version": "1",
   "fetched_at": "2026-06-01T12:00:00Z",   // when this invocation ran (RFC-3339 UTC)
+  "total_items": 1,                        // items across all feeds (after limit/--since)
+  "total_content_tokens_est": 7,           // sum of items' content_tokens_est (budget against this)
   "feeds": [
     {
       "feed_url": "https://example.com/feed.xml",
@@ -154,6 +157,8 @@ authoritative schema is `rss schema --command fetch`.
       "title": "Example Feed",
       "site_url": "https://example.com/",
       "updated": "2026-06-01T12:00:00Z",
+      "item_count": 1,                      // == items.length (explicit budgeting count)
+      "content_tokens_est_total": 7,        // sum of this feed's items' content_tokens_est
       "items": [
         {
           "id": "1a2b3c4d5e6f7a8b",         // stable, deterministic id
@@ -169,6 +174,7 @@ authoritative schema is `rss schema --command fetch`.
           "content_format": "markdown",
           "content_tokens_est": 7,           // rough token estimate (reflects truncation)
           "content_truncated": false,        // true when the body was cut to a cap
+          "content_hash": "5777e294c43119b6", // 16-hex SHA-256 of full body; null if no content
           "categories": ["news"],
           "enclosures": [],
           "guid": "urn:example:first"        // raw feed guid/id (may not be stable)
@@ -178,12 +184,27 @@ authoritative schema is `rss schema --command fetch`.
     }
   ],
   "errors": [],                              // feed-level errors mirrored here
+  "warnings": [],                            // non-fatal data-quality notes (see below)
   "truncation": null                         // non-null when the result was size-bounded
 }
 ```
 
-With `--format ndjson`, each line of stdout is a single `Item` object (each carries
-its own `feed_url`); feed-level errors are reported on stderr.
+`feeds[]` (and the mirrored `errors[]`) are emitted in **request order** — deterministic
+within a run, so you can address a feed by position. (Output is not byte-identical across
+runs: `fetched_at` and the cache status fields vary by design.) `content_hash` is a stable
+hash of the full (pre-truncation) body, so an agent can tell whether an item's content
+changed between fetches without diffing text.
+
+**Warnings** are non-fatal notes, distinct from `errors` (which mean a feed failed). They are
+kept rare so they stay meaningful — e.g. `CONTENT_EXTRACTION_FALLBACK` (HTML→Markdown
+conversion failed and fell back to a tag strip) or `UNDATED_ITEMS` (every returned item lacks
+a date, so newest-first ordering is best-effort). Each carries `{feed_url, code, message}`.
+
+With `--format ndjson`, each line of stdout is a single `Item` object (each carries its own
+`feed_url`); feed-level errors are reported on stderr. Pass `--ndjson-records` to instead emit
+one **tagged** record per line — `{"type":"item", …}`, `{"type":"error", …}`, and a final
+`{"type":"summary", total_items, total_content_tokens_est, warnings, truncation, …}` — so a
+consumer reading only stdout keeps the errors and totals.
 
 Errors are structured objects:
 
@@ -269,6 +290,13 @@ Exposed tools:
 | `discover_feeds` | `site_url` | discovered feeds |
 | `get_item` | `feed_url`, `id`; optional `max_content_chars` | a single item, resolved by its stable id |
 | `get_schema` | `command` | the JSON Schema for that command's output |
+
+**Results are structured.** The data tools (`fetch_feed`, `get_item`, `discover_feeds`)
+return their payload as MCP `structuredContent` matching an advertised `outputSchema`, with a
+one-line text summary alongside (the full payload is *not* duplicated as text, which would
+double the response). Every tool advertises annotations (`readOnlyHint`, `idempotentHint`,
+and `openWorldHint` for the network-touching tools). See
+[ADR-0013](docs/adr/0013-structured-mcp-tool-results.md).
 
 **Responses are size-bounded.** AI clients reject oversized tool results, so `fetch_feed`
 caps items (default 25) and checks an estimated-token budget (`max_response_tokens`). If a
