@@ -12,9 +12,10 @@ Key properties:
 - **Data on request.** Every command reads inputs you pass and prints results to
   stdout. All logs and diagnostics go to stderr, so stdout is always clean,
   machine-parseable data.
-- **Stable item ids.** Each item gets a deterministic id derived from its content,
-  identical across runs and machines — so an agent can reference an item today and
-  resolve the same item tomorrow (see [Stable item ids](#stable-item-ids)).
+- **Stable item ids.** Each item gets a deterministic id derived from its content
+  and feed URL — identical across runs and machines when fetched via the same feed
+  URL — so an agent can reference an item today and resolve the same item tomorrow
+  (see [Stable item ids](#stable-item-ids)).
 - **Cache-backed & polite.** A small file cache stores HTTP validators so repeat
   fetches use conditional GETs (`If-None-Match` / `If-Modified-Since`) and a `304`
   serves the cached body — saving bandwidth and being kind to servers.
@@ -229,7 +230,9 @@ id  = lowercase_hex( sha256( feed_url + "\n" + key ) )[..16]
 `id_source` records which field supplied the key (`link`, `guid`, or `hash` for the
 degenerate fallback). Because the id is derived purely from feed content — never
 from the cache — the same item produces the same id across runs, machines, and
-fresh caches. This is what lets an agent capture an id now and resolve it later via
+fresh caches, as long as the feed is fetched via the same `feed_url` (the id is
+namespaced by it, so a mirror or an `http`/`https` variant produces different ids).
+This is what lets an agent capture an id now and resolve it later via
 `rss show … --id <id>`.
 
 ---
