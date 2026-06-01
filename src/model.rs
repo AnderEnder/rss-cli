@@ -162,9 +162,13 @@ pub struct Item {
     /// Resolved, absolute permalink for the item.
     pub url: Option<String>,
     pub authors: Vec<String>,
-    /// RFC-3339 UTC publication timestamp.
+    /// RFC-3339 UTC publication timestamp. **May be `null` even for a normal item** — some
+    /// feeds (e.g. Reddit comment `.rss`) populate only `updated`. A consumer that
+    /// time-filters items should fall back to `updated` when this is `null`; rss-cli's own
+    /// `--since` and newest-first ordering already key on `published` then `updated`.
     pub published: Option<String>,
-    /// RFC-3339 UTC last-updated timestamp.
+    /// RFC-3339 UTC last-updated timestamp. The reliable timestamp for feeds that omit
+    /// `published` (see `published`).
     pub updated: Option<String>,
     pub summary: Option<String>,
     /// Item body in the requested `content_format` (or `null` when `--content none`).

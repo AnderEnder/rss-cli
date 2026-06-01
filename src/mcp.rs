@@ -20,7 +20,7 @@ use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, Content, Implementation, ServerCapabilities, ServerInfo};
 use rmcp::{ErrorData, ServerHandler, ServiceExt, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::cache::Cache;
 use crate::config::FetchParams;
@@ -44,8 +44,65 @@ const MCP_DEFAULT_LIMIT: usize = 25;
 
 /// Default response budget (estimated tokens) when the caller passes no `max_response_tokens`.
 /// Conservative headroom under typical MCP client tool-result limits; the `ceil(chars/4)`
-/// estimate errs toward over-counting. Overridable per call.
-const MCP_DEFAULT_MAX_RESPONSE_TOKENS: usize = 20_000;
+/// estimate (over *pretty* JSON) errs toward over-counting. Overridable per call.
+///
+/// Calibrated down from an initial 20k after a field report: a full-content 25-item feed
+/// (~50–60 KB) slipped under the 20k budget yet still tripped the client's own tool-result
+/// limit, which then dumped the payload to a temp file. 10k (~40 KB) keeps the structured
+/// `RESPONSE_TOO_LARGE` self-recovery path (ADR-0011) firing *before* the client truncates,
+/// while staying generous for ordinary feeds. This is a heuristic, not a measured universal
+/// client limit — callers with a different limit pass `max_response_tokens` explicitly.
+const MCP_DEFAULT_MAX_RESPONSE_TOKENS: usize = 10_000;
+
+/// Deserialize an optional `usize` that may arrive as a JSON **number** *or* a JSON
+/// **string** (`25` or `"25"`); `null`/absent both map to `None`. Many MCP clients serialize
+/// every tool-call argument as a string, so a plain `Option<usize>` rejects `"25"` with
+/// `invalid type: string "25", expected usize` and makes `limit` / `max_content_chars` /
+/// `max_response_tokens` unusable from those clients. We still advertise `integer` in the
+/// tool schema (schemars reads the field *type*, not this attribute) but accept either form —
+/// liberal in what we accept, strict in what we advertise.
+///
+/// Do **not** "simplify" the annotated fields back to a bare `Option<usize>`: that
+/// reintroduces the string-rejection bug for every client that stringifies arguments.
+fn de_lenient_opt_usize<'de, D>(deserializer: D) -> Result<Option<usize>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    use serde::de::Error;
+    match Option::<serde_json::Value>::deserialize(deserializer)? {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::Number(n)) => {
+            if let Some(u) = n.as_u64() {
+                usize::try_from(u)
+                    .map(Some)
+                    .map_err(|_| Error::custom(format!("integer {u} is out of range")))
+            } else if let Some(f) = n
+                .as_f64()
+                .filter(|f| f.is_finite() && *f >= 0.0 && f.fract() == 0.0)
+            {
+                Ok(Some(f as usize))
+            } else {
+                Err(Error::custom(format!(
+                    "expected a non-negative integer, got {n}"
+                )))
+            }
+        }
+        Some(serde_json::Value::String(s)) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                return Ok(None);
+            }
+            trimmed.parse::<usize>().map(Some).map_err(|_| {
+                Error::custom(format!(
+                    "expected a non-negative integer (or its string form), got {s:?}"
+                ))
+            })
+        }
+        Some(other) => Err(Error::custom(format!(
+            "expected an integer or numeric string, got {other}"
+        ))),
+    }
+}
 
 // === Tool argument structs (deserialized from MCP `arguments`; schema'd for clients) ===
 
@@ -59,16 +116,16 @@ struct FetchFeedArgs {
     content_format: Option<String>,
     /// Maximum number of items to return (most recent first). Omit to use the default cap
     /// of 25; pass a larger number to fetch more (subject to the response budget).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_lenient_opt_usize")]
     limit: Option<usize>,
     /// Maximum characters of extracted content per item; longer bodies are truncated on a
     /// char boundary and flagged `content_truncated`. Omit to keep full content.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_lenient_opt_usize")]
     max_content_chars: Option<usize>,
     /// Soft cap on response size in estimated tokens. If the result would exceed it, the
     /// tool returns a RESPONSE_TOO_LARGE error with suggested `limit`/`max_content_chars`
     /// instead of an oversized payload. Omit to use the default budget.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_lenient_opt_usize")]
     max_response_tokens: Option<usize>,
 }
 
@@ -88,7 +145,7 @@ struct GetItemArgs {
     id: String,
     /// Maximum characters of extracted content; a longer body is truncated and flagged.
     /// Omit for full content (use this if a single large item is rejected as too large).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_lenient_opt_usize")]
     max_content_chars: Option<usize>,
 }
 
@@ -744,5 +801,75 @@ mod tests {
         assert_eq!(payload["code"], "NOT_FOUND");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn fetch_args_coerce_stringified_integers() {
+        // Many MCP clients serialize numeric tool arguments as JSON strings; the tool must
+        // accept "25" exactly as it accepts 25 (see `de_lenient_opt_usize`). Before this fix
+        // every such call failed with `invalid type: string "25", expected usize`.
+        let args: FetchFeedArgs = serde_json::from_str(
+            r#"{"url":"https://e.com/f","limit":"25","max_content_chars":"500","max_response_tokens":"8000"}"#,
+        )
+        .expect("stringified integers should deserialize");
+        assert_eq!(args.limit, Some(25));
+        assert_eq!(args.max_content_chars, Some(500));
+        assert_eq!(args.max_response_tokens, Some(8000));
+    }
+
+    #[test]
+    fn fetch_args_accept_native_integers() {
+        let args: FetchFeedArgs =
+            serde_json::from_str(r#"{"url":"https://e.com/f","limit":25,"max_content_chars":500}"#)
+                .expect("native integers should still deserialize");
+        assert_eq!(args.limit, Some(25));
+        assert_eq!(args.max_content_chars, Some(500));
+        assert_eq!(args.max_response_tokens, None);
+    }
+
+    #[test]
+    fn fetch_args_absent_null_and_empty_string_are_none() {
+        let absent: FetchFeedArgs =
+            serde_json::from_str(r#"{"url":"https://e.com/f"}"#).expect("absent fields ok");
+        assert_eq!(absent.limit, None);
+        assert_eq!(absent.max_content_chars, None);
+
+        let null: FetchFeedArgs = serde_json::from_str(
+            r#"{"url":"https://e.com/f","limit":null,"max_content_chars":null}"#,
+        )
+        .expect("explicit null ok");
+        assert_eq!(null.limit, None);
+        assert_eq!(null.max_content_chars, None);
+
+        // An empty string is treated as "unset" rather than a parse error — some clients send
+        // "" for a cleared optional field.
+        let empty: FetchFeedArgs = serde_json::from_str(r#"{"url":"https://e.com/f","limit":""}"#)
+            .expect("empty string ok");
+        assert_eq!(empty.limit, None);
+    }
+
+    #[test]
+    fn fetch_args_reject_non_numeric_and_negative() {
+        assert!(
+            serde_json::from_str::<FetchFeedArgs>(r#"{"url":"u","limit":"twenty"}"#).is_err(),
+            "a non-numeric string must not silently parse"
+        );
+        assert!(
+            serde_json::from_str::<FetchFeedArgs>(r#"{"url":"u","limit":-5}"#).is_err(),
+            "a negative number is not a valid usize"
+        );
+        assert!(
+            serde_json::from_str::<FetchFeedArgs>(r#"{"url":"u","limit":"-5"}"#).is_err(),
+            "a negative numeric string is not a valid usize"
+        );
+    }
+
+    #[test]
+    fn get_item_args_coerce_stringified_max_content_chars() {
+        let args: GetItemArgs = serde_json::from_str(
+            r#"{"feed_url":"https://e.com/f","id":"abc","max_content_chars":"1000"}"#,
+        )
+        .expect("stringified max_content_chars should deserialize");
+        assert_eq!(args.max_content_chars, Some(1000));
     }
 }

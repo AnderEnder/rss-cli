@@ -112,6 +112,13 @@ A single core powers both the CLI and the MCP server, so the two front-ends cann
   disjoint files over frozen `model.rs`/`error.rs` interfaces; a typo in one module breaks
   the whole-crate build for everyone. If you fan out work, freeze the shared types first
   and keep ownership by file.
+- **MCP clients stringify numeric tool args.** Many MCP clients serialize *every* tool
+  argument as a JSON string, so a bare `Option<usize>` field rejects `"25"` with
+  `invalid type: string "25", expected usize` — which makes `limit` / `max_content_chars` /
+  `max_response_tokens` unusable from those clients. `mcp.rs` deserializes those fields with
+  `de_lenient_opt_usize` (accepts number **or** numeric string; advertises `integer` in the
+  schema regardless). Don't "simplify" them back to `Option<usize>` — that reintroduces the
+  bug. The `fetch_args_coerce_stringified_integers` test pins it.
 
 ## Non-goals (v1)
 
