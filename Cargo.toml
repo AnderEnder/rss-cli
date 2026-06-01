@@ -42,3 +42,12 @@ assert_cmd = "2.2.2"
 insta = "1.47.2"
 mockito = "1.7.2"
 predicates = "3.1.4"
+
+# Optimized release binary. This CLI is I/O-bound (network fetches), so these flags
+# mainly shrink the binary and trim startup/parse overhead rather than boost throughput.
+[profile.release]
+opt-level = 3        # full optimization (also the default; explicit for clarity)
+lto = "fat"          # whole-program link-time optimization across all crates
+codegen-units = 1    # maximize cross-function optimization (slower compile, faster code)
+panic = "abort"      # no unwinding tables -> smaller, faster binary (CLI aborts on panic)
+strip = true         # strip symbols/debuginfo from the shipped binary
