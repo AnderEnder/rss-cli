@@ -99,14 +99,25 @@ Scans a homepage's `<link rel="alternate">` tags for advertised feeds.
 rss discover https://example.com
 ```
 
-### `rss show` — show a single item by its stable id
+### `rss show` — show a single item (by id, guid, or URL)
 
 ```sh
 rss show https://example.com/feed.xml --id 1a2b3c4d5e6f7a8b
 ```
 
-Because ids are deterministic, an id captured from an earlier `fetch` resolves to
-the same item later.
+The `--id` value may be the item's stable **id**, its raw **guid**, or its
+permalink **URL** — `show` matches any of the three. Because ids are deterministic,
+an id captured from an earlier `fetch` resolves to the same item later. The `id` is
+namespaced by feed URL, so if you fetch the same post from two different feed URLs
+(e.g. Reddit `?t=day` vs `?t=week`) the ids differ — use the **guid** (e.g. Reddit
+`t3_…`) as the portable key across feed URLs.
+
+Retrieval is **cache-first**: `show` serves the matching item from the cached feed
+body without revalidating, so an item from a prior `fetch` survives a rolled feed
+window — but **not** a later refetch that overwrote the cache with a newer window.
+Pass `--refresh` to bypass the cache-first read and fetch the live feed instead
+(which may miss items that have since rolled out of the feed window). See
+[ADR-0014](docs/adr/0014-get-item-cache-first-multi-key-lookup.md).
 
 ### `rss schema` — emit the output JSON Schema
 
@@ -239,6 +250,28 @@ The cache exists only for conditional GETs and for resolving `show` lookups — 
 
 ---
 
+## Provider notes (Reddit)
+
+Reddit's feeds have a few quirks worth knowing when consuming them:
+
+- **Comment feeds return one more item than `--limit`.** A subreddit comment `.rss`
+  appends the original post (OP) to the comment listing, so a request for `N`
+  comments can come back with `N + 1` items (the OP being the extra one).
+- **Comment items have `published: null`.** They populate only `updated`, not
+  `published`, so when time-filtering (e.g. `--since`) fall back to `updated` for
+  these items.
+- **`search.rss` is best-effort.** Results from Reddit's search feed are sparse and
+  noisy by nature (Reddit-side), so treat a thin or empty result as expected rather
+  than an error.
+- **Transient `403`/`429` are retried once automatically.** Reddit intermittently
+  rate-limits mid-batch; `rss` retries a `403`/`429` exactly once (honoring
+  `Retry-After`, capped) before giving up. On persistent failure the
+  `FEED_FETCH_FAILED` error surfaces `http_status` and (when sent) `retry_after` in
+  its `details`. See
+  [ADR-0015](docs/adr/0015-bounded-retry-on-transient-429-403.md).
+
+---
+
 ## Stable item ids
 
 GUIDs are unreliable in the wild (a large fraction of feeds regenerate them on
@@ -288,7 +321,7 @@ Exposed tools:
 |------|-----------|---------|
 | `fetch_feed` | `url`; optional `content_format`, `limit` (default 25), `max_content_chars`, `max_response_tokens` | a `FetchOutput` for the feed |
 | `discover_feeds` | `site_url` | discovered feeds |
-| `get_item` | `feed_url`, `id`; optional `max_content_chars` | a single item, resolved by its stable id |
+| `get_item` | `feed_url`, `id`; optional `max_content_chars` | a single item, resolved cache-first by its `id`, raw `guid`, or permalink URL |
 | `get_schema` | `command` | the JSON Schema for that command's output |
 
 **Results are structured.** The data tools (`fetch_feed`, `get_item`, `discover_feeds`)

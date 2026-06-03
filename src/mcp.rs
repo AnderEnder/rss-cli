@@ -192,7 +192,10 @@ impl RssServer {
         (DEFAULT 25 when omitted). max_content_chars truncates each item body (flagged \
         content_truncated). The response is size-bounded by max_response_tokens; if it would \
         overflow, the tool returns a RESPONSE_TOO_LARGE error whose details include \
-        suggested_limit and suggested_max_content_chars to retry with.",
+        suggested_limit and suggested_max_content_chars to retry with. Provider notes: some \
+        feeds (e.g. Reddit comment .rss) populate only updated, not published, and append the \
+        original post to a comment listing (so a comment feed can return one more item than \
+        limit); search.rss results are best-effort and may be sparse.",
         annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = true),
         output_schema = rmcp::handler::server::tool::schema_for_type::<crate::model::FetchOutput>()
     )]

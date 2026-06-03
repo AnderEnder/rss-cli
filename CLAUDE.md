@@ -94,6 +94,14 @@ A single core powers both the CLI and the MCP server, so the two front-ends cann
    `total_content_tokens_est`, per-feed counts, `content_hash`, and `warnings` are **additive**
    contract fields computed in `core` (so CLI and MCP stay in sync); `warnings` is kept rare
    on purpose. See [ADR-0012](docs/adr/0012-deterministic-ordering-and-output-enrichments.md).
+10. **Item lookup is multi-key and cache-first.** `core::show_item` (`rss show` / MCP
+    `get_item`) matches an item by `id` **or** `guid` **or** resolved `url`, and reads
+    cache-first by default so an item the caller already saw survives a rolled feed window
+    ([ADR-0014](docs/adr/0014-get-item-cache-first-multi-key-lookup.md)); `rss show --refresh`
+    opts back into a live revalidate. The transient `403`/`429` single retry surfaces
+    `retry_after` in the error `details`
+    ([ADR-0015](docs/adr/0015-bounded-retry-on-transient-429-403.md)). Both are **additive** —
+    `SCHEMA_VERSION` stays `"1"`.
 
 ## Gotchas (these already bit — don't relearn them)
 
@@ -119,6 +127,16 @@ A single core powers both the CLI and the MCP server, so the two front-ends cann
   `de_lenient_opt_usize` (accepts number **or** numeric string; advertises `integer` in the
   schema regardless). Don't "simplify" them back to `Option<usize>` — that reintroduces the
   bug. The `fetch_args_coerce_stringified_integers` test pins it.
+- **`CachePolicy::CacheFirst` exists specifically for item lookup** (`rss show` / MCP
+  `get_item`); do not "simplify" it back to `Revalidate` — that reintroduces the rolled-window
+  `NOT_FOUND` the policy was added to fix ([ADR-0014](docs/adr/0014-get-item-cache-first-multi-key-lookup.md)).
+  Pinned by `tests/get_item_window_roll.rs` and
+  `fetch::tests::cache_first_serves_stale_cache_without_network`.
+- **The 403/429 retry is single and bounded** (one retry, capped wait); do not turn it into an
+  unbounded loop — that would be impolite and could mask a persistent outage
+  ([ADR-0015](docs/adr/0015-bounded-retry-on-transient-429-403.md)). Pinned by
+  `fetch::tests::retries_once_on_403_then_succeeds` /
+  `fetch::tests::persistent_403_surfaces_status_in_error`.
 
 ## Non-goals (v1)
 
