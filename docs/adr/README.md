@@ -37,3 +37,5 @@ where a real fork existed). Statuses: `Proposed`, `Accepted`, `Superseded by NNN
 | [0011](0011-bounded-mcp-responses.md) | Bounded MCP responses (default cap + budget + `RESPONSE_TOO_LARGE`) | Accepted |
 | [0012](0012-deterministic-ordering-and-output-enrichments.md) | Deterministic ordering + output enrichments (aggregates, `content_hash`, `warnings`, NDJSON records) | Accepted |
 | [0013](0013-structured-mcp-tool-results.md) | Structured MCP tool results (`structuredContent` + `outputSchema` + annotations) | Accepted |
+| [0014](0014-get-item-cache-first-multi-key-lookup.md) | get_item cache-first read + multi-key (id/guid/url) lookup | Accepted |
+| [0015](0015-bounded-retry-on-transient-429-403.md) | Bounded single retry on transient 429/403 (honor Retry-After) | Accepted |
