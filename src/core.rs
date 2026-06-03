@@ -127,19 +127,24 @@ pub async fn discover_feeds(
     discover::discover(site_url, &http).await
 }
 
-/// Fetch a feed and return the single item matching the stable `id`, if present.
+/// Fetch a feed (cache-first) and return the single item whose `id`, raw `guid`, or resolved
+/// `url` equals `key`, if present.
 ///
-/// Used by `rss show` and the MCP `get_item` tool. Because item ids are deterministic,
-/// the lookup is stable across runs.
+/// Used by `rss show` and the MCP `get_item` tool. `id` is namespaced by `feed_url` (see
+/// ADR-0003); a `guid` (e.g. Reddit `t3_…`) is feed-window-independent and is the reliable
+/// key across different feed URLs. The lookup is cache-first (ADR-0014): an item the caller
+/// already saw survives a rolled feed window, but not a later cache-overwriting refetch.
 pub async fn show_item(
     feed_url: &str,
-    id: &str,
+    key: &str,
     params: &FetchParams,
     cache: &Cache,
 ) -> Result<Option<crate::model::Item>, RssError> {
     let http = HttpClient::new(&params.user_agent, params.timeout)?;
     let (fr, _warnings) = fetch_one(feed_url, &http, params, cache).await?;
-    Ok(fr.items.into_iter().find(|it| it.id == id))
+    Ok(fr.items.into_iter().find(|it| {
+        it.id == key || it.guid.as_deref() == Some(key) || it.url.as_deref() == Some(key)
+    }))
 }
 
 /// Total number of items across every feed in `output`.
@@ -247,7 +252,66 @@ fn now_rfc3339() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cache::{Cache, CacheMeta};
+    use crate::config::CachePolicy;
     use crate::model::{ContentFormat, IdSource, Item};
+
+    fn seed(cache: &Cache, url: &str, body: &[u8]) {
+        let meta = CacheMeta {
+            feed_url: url.to_string(),
+            etag: None,
+            last_modified: None,
+            fetched_at: "2020-01-01T00:00:00Z".to_string(),
+            content_type: Some("application/rss+xml".to_string()),
+        };
+        cache.put(&meta, body).expect("seed");
+    }
+
+    // A minimal RSS item with a distinct link and guid so we can match on each key.
+    const FEED: &str = "https://t.example/r/x/.rss";
+    const BODY: &str = r#"<rss version="2.0"><channel><title>x</title>
+        <item><title>Post</title>
+              <link>https://t.example/r/x/comments/abc/post/</link>
+              <guid>t3_abc</guid>
+              <pubDate>Mon, 02 Jun 2026 00:00:00 GMT</pubDate>
+              <description>full body here</description></item>
+        </channel></rss>"#;
+
+    #[tokio::test]
+    async fn show_item_matches_by_guid_and_url_cache_first() {
+        let dir = std::env::temp_dir().join(format!("rss-core-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache = Cache::open(Some(dir.clone())).unwrap();
+        seed(&cache, FEED, BODY.as_bytes());
+
+        // CacheFirst means show_item never touches the network in this test.
+        let params = FetchParams {
+            cache_policy: CachePolicy::CacheFirst,
+            ..Default::default()
+        };
+
+        // First fetch the id the same way fetch_feed would compute it, then prove guid + url
+        // resolve to the same item.
+        let by_guid = show_item(FEED, "t3_abc", &params, &cache).await.unwrap();
+        assert!(by_guid.is_some(), "guid lookup should resolve");
+        let item = by_guid.unwrap();
+        assert_eq!(item.guid.as_deref(), Some("t3_abc"));
+
+        let by_url = show_item(
+            FEED,
+            "https://t.example/r/x/comments/abc/post/",
+            &params,
+            &cache,
+        )
+        .await
+        .unwrap();
+        assert_eq!(by_url.map(|i| i.id), Some(item.id.clone()));
+
+        let by_id = show_item(FEED, &item.id, &params, &cache).await.unwrap();
+        assert_eq!(by_id.map(|i| i.id), Some(item.id));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     fn item(content_truncated: bool) -> Item {
         Item {

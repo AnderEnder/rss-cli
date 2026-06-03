@@ -23,7 +23,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::cache::Cache;
-use crate::config::FetchParams;
+use crate::config::{CachePolicy, FetchParams};
 use crate::core;
 use crate::error::RssError;
 use crate::model::{ContentFormat, ErrorObj};
@@ -141,7 +141,10 @@ struct DiscoverFeedsArgs {
 struct GetItemArgs {
     /// The feed URL that contains the item.
     feed_url: String,
-    /// The stable item id, as returned by `fetch_feed`.
+    /// The item key: its stable `id`, raw `guid` (e.g. Reddit `t3_…`/`t1_…`), or permalink
+    /// URL. A guid is the reliable key across different feed URLs, since `id` is namespaced
+    /// by `feed_url`. Served cache-first: an item from a prior `fetch_feed` survives a rolled
+    /// feed window, but not a later refetch that overwrote the cache.
     id: String,
     /// Maximum characters of extracted content; a longer body is truncated and flagged.
     /// Omit for full content (use this if a single large item is rejected as too large).
@@ -363,6 +366,7 @@ fn fetch_summary(out: &crate::model::FetchOutput, url: &str) -> String {
 async fn get_item_inner(cache: &Cache, args: GetItemArgs) -> CallToolResult {
     let params = FetchParams {
         max_content_chars: args.max_content_chars,
+        cache_policy: CachePolicy::CacheFirst,
         ..FetchParams::default()
     };
     match core::show_item(&args.feed_url, &args.id, &params, cache).await {

@@ -274,9 +274,15 @@ pub struct ShowArgs {
     #[arg(value_name = "FEED_URL")]
     pub feed_url: String,
 
-    /// Stable item id (from a prior `fetch`).
-    #[arg(long, value_name = "ITEM_ID")]
+    /// Stable item id, raw guid, or item permalink URL (from a prior `fetch`). A guid is the
+    /// reliable key across different feed URLs (the id is namespaced by feed URL).
+    #[arg(long, value_name = "ITEM_KEY")]
     pub id: String,
+
+    /// Bypass the cache-first read and revalidate the live feed (may miss items that have
+    /// rolled out of the feed window).
+    #[arg(long)]
+    pub refresh: bool,
 
     /// Content extraction format.
     #[arg(long, value_enum, default_value_t = ContentArg::Markdown)]

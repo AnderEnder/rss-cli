@@ -8,7 +8,7 @@ use clap::Parser;
 
 use rss_cli::cache::Cache;
 use rss_cli::cli::{CacheAction, Cli, Command};
-use rss_cli::config::FetchParams;
+use rss_cli::config::{CachePolicy, FetchParams};
 use rss_cli::core;
 use rss_cli::error::{RssError, exit};
 use rss_cli::model::ErrorObj;
@@ -75,6 +75,11 @@ async fn run() -> i32 {
             let params = FetchParams {
                 content_format: args.content.into(),
                 max_content_chars: args.max_content_chars,
+                cache_policy: if args.refresh {
+                    CachePolicy::Revalidate
+                } else {
+                    CachePolicy::CacheFirst
+                },
                 ..FetchParams::default()
             };
             let cache = match Cache::open(cli.cache_dir.clone()) {
