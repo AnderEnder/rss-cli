@@ -10,6 +10,10 @@
 //!   - `NoCache`: plain GET, never read or write the cache.
 //!   - `MaxAge(d)`: if a cache entry exists and is younger than `d`, return it without any
 //!     network call (`from_cache = true`, `not_modified = true`). Otherwise revalidate.
+//!   - `CacheFirst`: if a cache entry exists, return it without any network call regardless
+//!     of age (`from_cache = true`, `not_modified = true`); only a cache miss falls through
+//!     to a conditional GET. Used by item lookup so a rolled feed window cannot evict an item
+//!     the caller already saw (ADR-0014).
 //!   - `Revalidate` (default): send `If-None-Match` (etag) / `If-Modified-Since`
 //!     (last_modified) from the cache entry if present. On `304`, return the cached body
 //!     with `not_modified = true`, `from_cache = true`. On `200`, store the new body +
@@ -37,7 +41,7 @@ pub struct RawFeed {
     pub final_url: String,
     pub content_type: Option<String>,
     pub status: u16,
-    /// True when served from cache via a `304` (or a fresh `MaxAge` hit).
+    /// True when served from cache via a `304` (or a `MaxAge`/`CacheFirst` hit).
     pub not_modified: bool,
     /// True when the returned body came from the cache rather than a fresh `200` body.
     pub from_cache: bool,
@@ -107,6 +111,22 @@ impl HttpClient {
                 if let Some(entry) = cache.get(url)?
                     && is_fresh(&entry.meta.fetched_at, max_age)
                 {
+                    return Ok(RawFeed {
+                        body: entry.body,
+                        final_url: url.to_string(),
+                        content_type: entry.meta.content_type,
+                        status: 200,
+                        not_modified: true,
+                        from_cache: true,
+                    });
+                }
+                self.revalidate(url, cache).await
+            }
+
+            // Serve the cached body if present, regardless of age — never revalidate.
+            // Only a cache miss falls through to a normal conditional GET. See ADR-0014.
+            CachePolicy::CacheFirst => {
+                if let Some(entry) = cache.get(url)? {
                     return Ok(RawFeed {
                         body: entry.body,
                         final_url: url.to_string(),
@@ -398,6 +418,69 @@ mod tests {
         assert_eq!(raw.content_type.as_deref(), Some("application/atom+xml"));
 
         mock.assert_async().await; // expect(0): fails if the network was hit.
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn cache_first_serves_stale_cache_without_network() {
+        let mut server = mockito::Server::new_async().await;
+        let dir = temp_cache_dir("cachefirst");
+        let cache = Cache::open(Some(dir.clone())).expect("open cache");
+        let url = format!("{}/feed.xml", server.url());
+
+        // Deliberately STALE timestamp: CacheFirst must ignore age entirely.
+        let meta = CacheMeta {
+            feed_url: url.clone(),
+            etag: Some("\"v1\"".to_string()),
+            last_modified: None,
+            fetched_at: "2020-01-01T00:00:00Z".to_string(),
+            content_type: Some("application/rss+xml".to_string()),
+        };
+        cache.put(&meta, b"<rss>cached</rss>").expect("seed cache");
+
+        // Any network hit is a bug.
+        let mock = server
+            .mock("GET", "/feed.xml")
+            .with_status(200)
+            .with_body("<rss>network</rss>")
+            .expect(0)
+            .create_async()
+            .await;
+
+        let raw = client()
+            .fetch(&url, &cache, CachePolicy::CacheFirst)
+            .await
+            .expect("fetch ok");
+
+        assert!(raw.from_cache);
+        assert!(raw.not_modified);
+        assert_eq!(raw.body, b"<rss>cached</rss>".to_vec());
+
+        mock.assert_async().await; // expect(0): fails if the network was hit.
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn cache_first_fetches_on_miss() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/feed.xml")
+            .with_status(200)
+            .with_body("<rss>fresh</rss>")
+            .create_async()
+            .await;
+        let dir = temp_cache_dir("cachefirst-miss");
+        let cache = Cache::open(Some(dir.clone())).expect("open cache");
+        let url = format!("{}/feed.xml", server.url());
+
+        let raw = client()
+            .fetch(&url, &cache, CachePolicy::CacheFirst)
+            .await
+            .expect("fetch ok");
+
+        assert!(!raw.from_cache);
+        assert_eq!(raw.body, b"<rss>fresh</rss>".to_vec());
+        mock.assert_async().await;
         std::fs::remove_dir_all(&dir).ok();
     }
 }

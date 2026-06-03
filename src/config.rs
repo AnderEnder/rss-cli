@@ -23,6 +23,12 @@ pub enum CachePolicy {
     /// Serve directly from cache without hitting the network if the cached entry is
     /// younger than this duration; otherwise behave like [`CachePolicy::Revalidate`].
     MaxAge(Duration),
+    /// Serve the cached entry **without any network call, regardless of age**, if one
+    /// exists; only on a cache miss does it fetch (then behave like [`CachePolicy::Revalidate`]).
+    /// Used by item lookup (`rss show` / MCP `get_item`) so a rolled feed window cannot evict
+    /// an item the caller already saw. Exception to the always-revalidate default — see
+    /// ADR-0014.
+    CacheFirst,
     /// Ignore the cache entirely (do not read or write it).
     NoCache,
 }
