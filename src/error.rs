@@ -29,7 +29,12 @@ pub enum RssError {
     Network(String),
 
     #[error("HTTP status {status}: {url}")]
-    Http { status: u16, url: String },
+    Http {
+        status: u16,
+        url: String,
+        /// Raw `Retry-After` header value when the server sent one (delta-seconds form).
+        retry_after: Option<String>,
+    },
 
     #[error("feed parse error: {0}")]
     Parse(String),
@@ -82,8 +87,15 @@ impl RssError {
             obj.feed_url = Some(u.to_string());
         }
         match self {
-            RssError::Http { status, .. } => {
-                obj.details = serde_json::json!({ "http_status": status });
+            RssError::Http {
+                status,
+                retry_after,
+                ..
+            } => {
+                obj.details = serde_json::json!({
+                    "http_status": status,
+                    "retry_after": retry_after,
+                });
             }
             RssError::ResponseTooLarge {
                 estimated_tokens,
@@ -102,5 +114,23 @@ impl RssError {
             _ => {}
         }
         obj
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn http_error_surfaces_retry_after_when_present() {
+        let e = RssError::Http {
+            status: 429,
+            url: "https://x".into(),
+            retry_after: Some("2".into()),
+        };
+        let obj = e.to_error_obj(None);
+        assert_eq!(obj.code, "FEED_FETCH_FAILED");
+        assert_eq!(obj.details["http_status"], 429);
+        assert_eq!(obj.details["retry_after"], "2");
     }
 }

@@ -28,6 +28,7 @@ use reqwest::StatusCode;
 use reqwest::header::{
     CONTENT_TYPE, ETAG, HeaderMap, HeaderName, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED,
 };
+use tokio::time::sleep;
 
 use crate::cache::{Cache, CacheMeta};
 use crate::config::CachePolicy;
@@ -76,18 +77,14 @@ impl HttpClient {
         match policy {
             // Never touch the cache: a plain GET returning whatever the server sends.
             CachePolicy::NoCache => {
-                let resp = self
-                    .inner
-                    .get(url)
-                    .send()
-                    .await
-                    .map_err(|e| RssError::Network(e.to_string()))?;
+                let resp = send_with_retry(|| self.inner.get(url)).await?;
                 let status = resp.status();
                 let final_url = resp.url().to_string();
                 if !status.is_success() {
                     return Err(RssError::Http {
                         status: status.as_u16(),
                         url: url.to_string(),
+                        retry_after: retry_after_raw(resp.headers()),
                     });
                 }
                 let content_type = header_string(resp.headers(), &CONTENT_TYPE);
@@ -149,20 +146,20 @@ impl HttpClient {
     async fn revalidate(&self, url: &str, cache: &Cache) -> Result<RawFeed, RssError> {
         let cached = cache.get(url)?;
 
-        let mut req = self.inner.get(url);
-        if let Some(entry) = &cached {
-            if let Some(etag) = &entry.meta.etag {
-                req = req.header(IF_NONE_MATCH, etag.as_str());
+        let build = || {
+            let mut req = self.inner.get(url);
+            if let Some(entry) = &cached {
+                if let Some(etag) = &entry.meta.etag {
+                    req = req.header(IF_NONE_MATCH, etag.as_str());
+                }
+                if let Some(last_modified) = &entry.meta.last_modified {
+                    req = req.header(IF_MODIFIED_SINCE, last_modified.as_str());
+                }
             }
-            if let Some(last_modified) = &entry.meta.last_modified {
-                req = req.header(IF_MODIFIED_SINCE, last_modified.as_str());
-            }
-        }
+            req
+        };
 
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| RssError::Network(e.to_string()))?;
+        let resp = send_with_retry(build).await?;
         let status = resp.status();
         let final_url = resp.url().to_string();
 
@@ -195,6 +192,7 @@ impl HttpClient {
             return Err(RssError::Http {
                 status: status.as_u16(),
                 url: url.to_string(),
+                retry_after: retry_after_raw(resp.headers()),
             });
         }
 
@@ -229,18 +227,14 @@ impl HttpClient {
 
     /// Plain GET returning the raw body (used by `discover` for the homepage HTML).
     pub async fn get_bytes(&self, url: &str) -> Result<(Vec<u8>, String), RssError> {
-        let resp = self
-            .inner
-            .get(url)
-            .send()
-            .await
-            .map_err(|e| RssError::Network(e.to_string()))?;
+        let resp = send_with_retry(|| self.inner.get(url)).await?;
         let status = resp.status();
         let final_url = resp.url().to_string();
         if !status.is_success() {
             return Err(RssError::Http {
                 status: status.as_u16(),
                 url: url.to_string(),
+                retry_after: retry_after_raw(resp.headers()),
             });
         }
         let body = resp
@@ -250,6 +244,51 @@ impl HttpClient {
             .to_vec();
         Ok((body, final_url))
     }
+}
+
+/// Statuses we retry exactly once — transient provider rate-limiting.
+fn is_retryable(status: StatusCode) -> bool {
+    status == StatusCode::FORBIDDEN || status == StatusCode::TOO_MANY_REQUESTS
+}
+
+/// Parse the delta-seconds form of `Retry-After`, bounded to `max`. The HTTP-date form is
+/// intentionally ignored (Reddit sends delta-seconds) rather than risk a wrong sleep.
+fn retry_after(headers: &HeaderMap, max: Duration) -> Option<Duration> {
+    let raw = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
+    let secs: u64 = raw.trim().parse().ok()?;
+    Some(Duration::from_secs(secs).min(max))
+}
+
+/// Raw `Retry-After` header value, for surfacing in the error detail.
+fn retry_after_raw(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned)
+}
+
+const RETRY_BASE_DELAY: Duration = Duration::from_millis(500);
+const RETRY_MAX_DELAY: Duration = Duration::from_secs(5);
+
+/// Send a freshly-built request, retrying once on a transient 403/429. `build` is called
+/// again for the retry so headers/validators are re-attached cleanly.
+async fn send_with_retry<F>(build: F) -> Result<reqwest::Response, RssError>
+where
+    F: Fn() -> reqwest::RequestBuilder,
+{
+    let resp = build()
+        .send()
+        .await
+        .map_err(|e| RssError::Network(e.to_string()))?;
+    if !is_retryable(resp.status()) {
+        return Ok(resp);
+    }
+    let wait = retry_after(resp.headers(), RETRY_MAX_DELAY).unwrap_or(RETRY_BASE_DELAY);
+    sleep(wait).await;
+    build()
+        .send()
+        .await
+        .map_err(|e| RssError::Network(e.to_string()))
 }
 
 /// `true` if a cache entry written at `fetched_at` (RFC-3339) is younger than `max_age`.
@@ -481,6 +520,65 @@ mod tests {
         assert!(!raw.from_cache);
         assert_eq!(raw.body, b"<rss>fresh</rss>".to_vec());
         mock.assert_async().await;
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn retries_once_on_403_then_succeeds() {
+        let mut server = mockito::Server::new_async().await;
+        let dir = temp_cache_dir("retry-ok");
+        let cache = Cache::open(Some(dir.clone())).expect("open cache");
+        let url = format!("{}/feed.xml", server.url());
+
+        let m403 = server
+            .mock("GET", "/feed.xml")
+            .with_status(403)
+            .expect(1)
+            .create_async()
+            .await;
+        let m200 = server
+            .mock("GET", "/feed.xml")
+            .with_status(200)
+            .with_body("<rss>ok</rss>")
+            .expect(1)
+            .create_async()
+            .await;
+
+        let raw = client()
+            .fetch(&url, &cache, CachePolicy::NoCache)
+            .await
+            .expect("retry should succeed");
+        assert_eq!(raw.body, b"<rss>ok</rss>".to_vec());
+
+        m403.assert_async().await;
+        m200.assert_async().await;
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn persistent_403_surfaces_status_in_error() {
+        let mut server = mockito::Server::new_async().await;
+        let dir = temp_cache_dir("retry-fail");
+        let cache = Cache::open(Some(dir.clone())).expect("open cache");
+        let url = format!("{}/feed.xml", server.url());
+
+        // Two 403s (original + one retry), then assert we still error out.
+        let m = server
+            .mock("GET", "/feed.xml")
+            .with_status(403)
+            .expect(2)
+            .create_async()
+            .await;
+
+        let err = client()
+            .fetch(&url, &cache, CachePolicy::NoCache)
+            .await
+            .unwrap_err();
+        match err {
+            RssError::Http { status, .. } => assert_eq!(status, 403),
+            other => panic!("expected Http error, got {other:?}"),
+        }
+        m.assert_async().await; // exactly 2 attempts: one retry, no more.
         std::fs::remove_dir_all(&dir).ok();
     }
 }
