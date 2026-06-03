@@ -42,6 +42,7 @@ assert_cmd = "2.2.2"
 insta = "1.47.2"
 mockito = "1.7.2"
 predicates = "3.1.4"
+tempfile = "3"
 
 # Optimized release binary. This CLI is I/O-bound (network fetches), so these flags
 # mainly shrink the binary and trim startup/parse overhead rather than boost throughput.
