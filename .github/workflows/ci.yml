@@ -14,8 +14,9 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  test:
-    name: fmt · clippy · build · test (stable)
+  # fmt and clippy are OS-independent, so run them once rather than across the matrix.
+  lint:
+    name: fmt + clippy (stable)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -35,8 +36,31 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 
+  # Build and test on every supported OS/arch. The integration tests are self-contained
+  # (mockito + assert_cmd, no external services), so the full suite runs on each target.
+  test:
+    name: build + test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest, macos-15-intel, ubuntu-24.04-arm]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ${{ matrix.os }}
+
       - name: Build
         run: cargo build --verbose
 
       - name: Test
         run: cargo test --verbose
+        env:
+          RUST_BACKTRACE: 1
