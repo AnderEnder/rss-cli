@@ -32,13 +32,23 @@ Key properties:
 
 ## Install / build
 
-Requires a stable Rust toolchain (edition 2024).
+**From crates.io** (recommended) — needs a stable Rust toolchain (edition 2024):
 
 ```sh
-# Build a release binary at target/release/rss
+cargo install rss-cli      # builds and installs the `rss` binary onto your PATH
+```
+
+**Prebuilt binaries** — no toolchain required. Download the tarball for your platform from
+the [latest release](https://github.com/AnderEnder/rss-cli/releases/latest), then put the
+extracted `rss` binary on your `PATH`.
+
+**From source:**
+
+```sh
+# build a release binary at target/release/rss
 cargo build --release
 
-# …or install it onto your PATH
+# …or install onto your PATH from a local checkout
 cargo install --path .
 ```
 
