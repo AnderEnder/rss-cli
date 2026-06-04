@@ -1,0 +1,25 @@
+# Dependabot — https://docs.github.com/code-security/dependabot/dependabot-version-updates
+# Opens automated PRs to keep dependencies current. `include: scope` makes Dependabot tag
+# the commit type automatically: build(deps) / build(deps-dev) for crates, ci(deps) for
+# GitHub Actions.
+version: 2
+updates:
+  # Rust crate dependencies (Cargo.toml / Cargo.lock).
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: build
+      include: scope
+
+  # Action versions used by the Build and Release workflows.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: ci
+      include: scope
