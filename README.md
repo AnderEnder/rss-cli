@@ -1,5 +1,9 @@
 # rss-cli
 
+[![build status](https://github.com/AnderEnder/rss-cli/workflows/Build/badge.svg)](https://github.com/AnderEnder/rss-cli/actions)
+[![release status](https://github.com/AnderEnder/rss-cli/workflows/Release/badge.svg)](https://github.com/AnderEnder/rss-cli/actions)
+[![crates.io](https://img.shields.io/crates/v/rss-cli.svg)](https://crates.io/crates/rss-cli)
+
 A lightweight, cache-backed, **AI-friendly RSS / Atom / JSON Feed CLI**.
 
 `rss` fetches and parses feeds on demand and emits clean, predictable **structured
