@@ -1,4 +1,4 @@
-# rss
+# rss-cli
 
 A lightweight, cache-backed, **AI-friendly RSS / Atom / JSON Feed CLI**.
 
@@ -341,21 +341,62 @@ while truncating long bodies (each truncated item is flagged `content_truncated`
 matching the `ErrorObj` contract (a stable `code` plus `details`). See
 [ADR-0011](docs/adr/0011-bounded-mcp-responses.md).
 
-Example MCP client configuration (e.g. Claude Desktop's `claude_desktop_config.json`):
+### Connecting a client
+
+Most MCP clients share the same `mcpServers` JSON shape — only the file location
+differs — so the snippet below is reusable. The command is always `rss mcp` with no
+extra arguments. (Two clients use a different top-level key: VS Code and Zed, noted
+below.)
+
+**Claude Desktop** — edit `claude_desktop_config.json` (macOS:
+`~/Library/Application Support/Claude/`, Windows: `%APPDATA%\Claude\`):
 
 ```json
 {
   "mcpServers": {
-    "rss": {
-      "command": "rss",
-      "args": ["mcp"]
-    }
+    "rss": { "command": "rss", "args": ["mcp"] }
   }
 }
 ```
 
-If `rss` is not on the client's `PATH`, use the absolute path to the binary (for
-example `/Users/you/.cargo/bin/rss` or the `target/release/rss` you built).
+**Claude Code** — add it from the CLI (no file editing):
+
+```sh
+claude mcp add rss -- rss mcp
+# share it with a repo instead (writes .mcp.json):
+claude mcp add --scope project rss -- rss mcp
+```
+
+**Cursor** — `~/.cursor/mcp.json` (global) or `.cursor/mcp.json` (per project). Same
+`mcpServers` shape as the Claude Desktop snippet above.
+
+**Windsurf** — `~/.codeium/windsurf/mcp_config.json`. Same `mcpServers` shape.
+
+**VS Code** (Copilot agent mode) — `.vscode/mcp.json`, which uses a `servers` key
+(not `mcpServers`):
+
+```json
+{
+  "servers": {
+    "rss": { "command": "rss", "args": ["mcp"] }
+  }
+}
+```
+
+**Zed** — `settings.json`, under a `context_servers` key:
+
+```json
+{
+  "context_servers": {
+    "rss": { "command": "rss", "args": ["mcp"], "env": {} }
+  }
+}
+```
+
+> **`PATH` note.** If `rss` isn't on the client's `PATH`, use the absolute path to the
+> binary as `command` (for example `/Users/you/.cargo/bin/rss`, or the
+> `target/release/rss` you built). GUI apps in particular often don't inherit your
+> shell's `PATH`.
 
 ---
 
@@ -367,3 +408,21 @@ example `/Users/you/.cargo/bin/rss` or the `target/release/rss` you built).
   load-bearing.
 - **Working in the repo** — [CLAUDE.md](CLAUDE.md) has the build/test/lint gates,
   the module map, the invariants that must hold, and the gotchas that already bit.
+
+---
+
+## License
+
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or
+  <http://www.apache.org/licenses/LICENSE-2.0>)
+- MIT license ([LICENSE-MIT](LICENSE-MIT) or <http://opensource.org/licenses/MIT>)
+
+at your option.
+
+### Contribution
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for
+inclusion in the work by you, as defined in the Apache-2.0 license, shall be dual
+licensed as above, without any additional terms or conditions.

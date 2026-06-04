@@ -3,6 +3,7 @@ name = "rss-cli"
 version = "0.1.0"
 edition = "2024"
 description = "An AI-friendly RSS/Atom feed CLI"
+license = "MIT OR Apache-2.0"
 
 [[bin]]
 name = "rss"
@@ -44,11 +45,25 @@ mockito = "1.7.2"
 predicates = "3.1.4"
 tempfile = "3"
 
-# Optimized release binary. This CLI is I/O-bound (network fetches), so these flags
-# mainly shrink the binary and trim startup/parse overhead rather than boost throughput.
+# Optimized release binary. This CLI is I/O-bound (network fetches), so we optimize for a
+# small binary rather than raw throughput, and keep full debuginfo in a sidecar file
+# (*.dSYM on macOS, *.dwp on Linux) so the shipped binary can be stripped yet stay
+# debuggable from a crash dump.
 [profile.release]
-opt-level = 3        # full optimization (also the default; explicit for clarity)
-lto = "fat"          # whole-program link-time optimization across all crates
-codegen-units = 1    # maximize cross-function optimization (slower compile, faster code)
-panic = "abort"      # no unwinding tables -> smaller, faster binary (CLI aborts on panic)
-strip = true         # strip symbols/debuginfo from the shipped binary
+codegen-units = 1           # one codegen unit: better cross-function opt, smaller binary
+debug = "full"              # full debuginfo — emitted to a sidecar (see split-debuginfo)
+lto = true                  # fat LTO across all crates (≡ lto = "fat")
+opt-level = "s"             # optimize for size (this binary is I/O-bound, not CPU-bound)
+panic = "abort"             # no unwinding tables; CLI aborts on panic (bigger win on nightly
+                            # with -Zbuild-std-features=panic_immediate_abort)
+split-debuginfo = "packed"  # debuginfo -> separate *.dwp/*.dSYM so the binary can be stripped
+strip = "symbols"           # strip the shipped binary (debuginfo already lives in the sidecar)
+
+# Fast local iteration on a release-like binary: same size/opt knobs, but incremental
+# compilation, no LTO, and many codegen units so rebuilds are quick. NOT for distribution —
+# CI ships the `release` profile above. Build with: cargo build --profile release-fast
+[profile.release-fast]
+inherits = "release"
+incremental = true          # reuse prior codegen across rebuilds
+lto = false                 # skip the slow whole-program link step
+codegen-units = 256         # many units so incremental actually has granularity to reuse

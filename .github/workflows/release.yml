@@ -1,0 +1,192 @@
+# Release pipeline — modeled on AnderEnder/s3find-rs.
+#
+# Fires when you push a SemVer tag (e.g. `git tag v0.2.0 && git push origin v0.2.0`):
+#   - publishes the crate to crates.io, and
+#   - cross-compiles the `rss` binary for 5 targets and attaches the tarballs to a
+#     GitHub Release for the tag.
+#
+# The release profile keeps full debuginfo in a sidecar (*.dSYM / *.dwp / *.pdb) and ships a
+# stripped binary, so each target also uploads its sidecar archive for offline crash
+# symbolication. Those sidecar steps are `continue-on-error` because the exact sidecar path
+# under musl (.dwp) and MSVC (.pdb) is unverified — a missing sidecar must never fail the
+# binary release.
+#
+# Prerequisites / gotchas:
+#   - `cargo publish` ships the version in Cargo.toml, NOT the tag. Bump
+#     `version` in Cargo.toml to match before tagging, or you republish the old one.
+#   - Requires repo secret `CARGO_TOKEN` (crates.io API token) for the publish job.
+#     `GITHUB_TOKEN` is provided automatically for the release uploads.
+#   - The two static-musl jobs build reqwest+rustls under `clux/muslrust`; that is the
+#     most likely first-tag failure point (the rustls crypto backend on musl). If they
+#     fail, look there — the native macOS/Windows jobs are unaffected.
+
+name: Release
+
+permissions:
+  contents: write
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release-crates:
+    name: Publish to crates.io
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ubuntu-x86_64
+      - name: Publish package to crates.io
+        run: |
+          cargo package
+          cargo publish --token ${{ secrets.CARGO_TOKEN }} || true
+
+  release-linux:
+    name: Linux x86_64 (static musl)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Static release build
+        run: |
+          docker run --rm -t \
+            -v "$(pwd)":/volume \
+            clux/muslrust:stable cargo build --release
+      - name: Archive binary
+        run: |
+          sudo strip target/x86_64-unknown-linux-musl/release/rss
+          sudo tar -C target/x86_64-unknown-linux-musl/release -czf "$(pwd)/rss-x86_64-linux.tar.gz" rss
+      - name: Archive debuginfo (.dwp)
+        continue-on-error: true
+        run: sudo tar -C target/x86_64-unknown-linux-musl/release -czf "$(pwd)/rss-x86_64-linux.dwp.tar.gz" rss.dwp
+      - name: Publish release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            rss-x86_64-linux.tar.gz
+            rss-x86_64-linux.dwp.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  release-linux-arm:
+    name: Linux aarch64 (static musl)
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Static release build
+        run: |
+          docker run --rm -t \
+            -v "$(pwd)":/volume \
+            clux/muslrust:stable cargo build --release
+      - name: Archive binary
+        run: |
+          sudo strip target/aarch64-unknown-linux-musl/release/rss
+          sudo tar -C target/aarch64-unknown-linux-musl/release -czf "$(pwd)/rss-aarch64-linux.tar.gz" rss
+      - name: Archive debuginfo (.dwp)
+        continue-on-error: true
+        run: sudo tar -C target/aarch64-unknown-linux-musl/release -czf "$(pwd)/rss-aarch64-linux.dwp.tar.gz" rss.dwp
+      - name: Publish release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            rss-aarch64-linux.tar.gz
+            rss-aarch64-linux.dwp.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  release-osx:
+    name: macOS aarch64
+    runs-on: macOS-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: macos-aarch64
+      - name: Build release
+        run: cargo build --release --verbose
+      - name: Archive binary
+        run: tar -C target/release -czf "$(pwd)/rss-aarch64-osx.tar.gz" rss
+      - name: Archive debuginfo (.dSYM)
+        continue-on-error: true
+        run: tar -C target/release -czhf "$(pwd)/rss-aarch64-osx.dSYM.tar.gz" rss.dSYM
+      - name: Publish release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            rss-aarch64-osx.tar.gz
+            rss-aarch64-osx.dSYM.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  release-osx-x86_64:
+    name: macOS x86_64
+    runs-on: macos-15-intel
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: macos-x86_64
+      - name: Build release
+        run: cargo build --release --verbose
+      - name: Archive binary
+        run: tar -C target/release -czf "$(pwd)/rss-x86_64-osx.tar.gz" rss
+      - name: Archive debuginfo (.dSYM)
+        continue-on-error: true
+        run: tar -C target/release -czhf "$(pwd)/rss-x86_64-osx.dSYM.tar.gz" rss.dSYM
+      - name: Publish release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            rss-x86_64-osx.tar.gz
+            rss-x86_64-osx.dSYM.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  release-windows:
+    name: Windows x86_64
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: windows-x86_64
+      - name: Build release
+        run: cargo build --release --verbose
+      - name: Archive binary
+        run: tar -C target/release -czf "$(pwd)/rss-x86_64-windows.tar.gz" rss.exe
+        shell: bash
+      - name: Archive debuginfo (.pdb)
+        continue-on-error: true
+        run: tar -C target/release -czf "$(pwd)/rss-x86_64-windows.pdb.tar.gz" rss.pdb
+        shell: bash
+      - name: Publish release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            rss-x86_64-windows.tar.gz
+            rss-x86_64-windows.pdb.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
