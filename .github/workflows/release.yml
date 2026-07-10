@@ -14,8 +14,13 @@
 # Prerequisites / gotchas:
 #   - `cargo publish` ships the version in Cargo.toml, NOT the tag. Bump
 #     `version` in Cargo.toml to match before tagging, or you republish the old one.
-#   - Requires repo secret `CARGO_TOKEN` (crates.io API token) for the publish job.
-#     `GITHUB_TOKEN` is provided automatically for the release uploads.
+#   - The crates.io publish uses Trusted Publishing (OIDC) — no long-lived token.
+#     ONE-TIME SETUP on crates.io: crate Settings → Trusted Publishing → add a GitHub
+#     publisher for owner `AnderEnder`, repo `rss-cli`, workflow `release.yml`. Until that
+#     exists, the `release-crates` job fails auth (the binary jobs are independent and still
+#     run). The job mints a short-lived token per run via `rust-lang/crates-io-auth-action`
+#     and needs `id-token: write`. `GITHUB_TOKEN` is still provided automatically for the
+#     release uploads.
 #   - The two static-musl jobs build reqwest+rustls under `clux/muslrust`; that is the
 #     most likely first-tag failure point (the rustls crypto backend on musl). If they
 #     fail, look there — the native macOS/Windows jobs are unaffected.
@@ -37,6 +42,9 @@ jobs:
   release-crates:
     name: Publish to crates.io
     runs-on: ubuntu-latest
+    permissions:
+      id-token: write   # mint the short-lived OIDC token for Trusted Publishing
+      contents: read
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -46,10 +54,13 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: ubuntu-x86_64
+      - name: Authenticate to crates.io (Trusted Publishing / OIDC)
+        uses: rust-lang/crates-io-auth-action@v1
+        id: auth
       - name: Publish package to crates.io
-        run: |
-          cargo package
-          cargo publish --token ${{ secrets.CARGO_TOKEN }} || true
+        run: cargo publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 
   release-linux:
     name: Linux x86_64 (static musl)
