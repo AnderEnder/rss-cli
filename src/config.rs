@@ -10,7 +10,7 @@ use crate::model::ContentFormat;
 pub const DEFAULT_USER_AGENT: &str = concat!(
     "rss-cli/",
     env!("CARGO_PKG_VERSION"),
-    " (+https://github.com/)"
+    " (+https://github.com/AnderEnder/rss-cli)"
 );
 
 /// How the cache should be consulted for a fetch.

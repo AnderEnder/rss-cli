@@ -50,7 +50,8 @@ A single core powers both the CLI and the MCP server, so the two front-ends cann
 | `src/error.rs` | `RssError`, stable `code()` strings, and the `exit` code constants. |
 | `src/config.rs` | `FetchParams` + `CachePolicy` (the *runtime* params, not serialized). |
 | `src/core.rs` | Orchestration: concurrent fetch (`buffer_unordered`), `fetch_one`, `discover_feeds`, `show_item`, `exit_code_for`. **CLI and MCP both call into here.** |
-| `src/fetch.rs` | `HttpClient`: reqwest + conditional GET, the `CachePolicy` state machine ([ADR-0005](./docs/adr/0005-conditional-get-always-revalidate-default.md)). |
+| `src/fetch.rs` | `HttpClient`: reqwest + conditional GET, the `CachePolicy` state machine ([ADR-0005](./docs/adr/0005-conditional-get-always-revalidate-default.md)); routes every send through the per-host gate ([ADR-0016](./docs/adr/0016-per-host-request-gate.md)). |
+| `src/ratelimit.rs` | `HostGate`: shared per-host (authority) concurrency cap + adaptive cooldown for concurrent fetches ([ADR-0016](./docs/adr/0016-per-host-request-gate.md)). Lives inside a *reused* `HttpClient`. |
 | `src/cache.rs` | Atomic file cache (`<hash>.json` + `<hash>.body`) ([ADR-0004](./docs/adr/0004-file-based-atomic-cache.md)). |
 | `src/parse.rs` | `feed-rs` → `model` types; date normalize to UTC; relative→absolute URL resolution; `--since`/`--limit`; newest-first sort. |
 | `src/identity.rs` | **The keystone:** deterministic stable item ids ([ADR-0003](./docs/adr/0003-deterministic-content-hash-item-ids.md)). Pinned by a known-answer test. |
@@ -137,6 +138,20 @@ A single core powers both the CLI and the MCP server, so the two front-ends cann
   ([ADR-0015](docs/adr/0015-bounded-retry-on-transient-429-403.md)). Pinned by
   `fetch::tests::retries_once_on_403_then_succeeds` /
   `fetch::tests::persistent_403_surfaces_status_in_error`.
+- **The MCP server reuses ONE `HttpClient` across tool calls** — do not "simplify" it back to
+  a per-call `HttpClient::new`. The shared client is what lets concurrent `fetch_feed` calls
+  coordinate their per-host pacing (and share the connection pool); a fresh client per call
+  reintroduces the concurrent-call 429 burst ([ADR-0016](docs/adr/0016-per-host-request-gate.md)).
+  Pinned by `mcp::tests::concurrent_fetches_share_one_client_and_gate`.
+- **The rate-limit gate has TWO distinct caps — don't merge them.** `RETRY_MAX_DELAY` (5 s)
+  bounds the ADR-0015 *in-flight* retry (which holds its host permit); `HOST_MAX_COOLDOWN` /
+  `MAX_GATE_WAIT` (60 s) bound the *sibling-facing* gate wait (ADR-0016). Raising
+  `RETRY_MAX_DELAY` to match would block siblings for 60 s behind a retrying request — the very
+  thing the split avoids.
+- **Never hold the `HostGate` slot-map lock across an `.await`.** `slot_for` locks only to
+  insert-and-clone the `Arc<HostSlot>`, then drops the guard; all waiting uses the per-slot
+  semaphore + atomic deadlines. Holding the `std::sync::Mutex` across a sleep would stall the
+  runtime. (Also: `tokio` needs the `"sync"` feature for `Semaphore`.)
 
 ## Non-goals (v1)
 

@@ -1,5 +1,7 @@
 //! Error type, stable error codes, and process exit codes.
 
+use std::time::Duration;
+
 use crate::model::ErrorObj;
 
 /// Process exit codes (stable contract for scripts and agents).
@@ -34,6 +36,13 @@ pub enum RssError {
         url: String,
         /// Raw `Retry-After` header value when the server sent one (delta-seconds form).
         retry_after: Option<String>,
+    },
+
+    #[error("rate limited: {url} (retry after ~{}s)", retry_after.as_secs())]
+    RateLimited {
+        url: String,
+        /// How long the caller should wait before retrying, per the per-host gate (ADR-0016).
+        retry_after: Duration,
     },
 
     #[error("feed parse error: {0}")]
@@ -71,6 +80,7 @@ impl RssError {
             RssError::InvalidUrl(_) => "INVALID_URL",
             RssError::Network(_) => "NETWORK_ERROR",
             RssError::Http { .. } => "FEED_FETCH_FAILED",
+            RssError::RateLimited { .. } => "RATE_LIMITED",
             RssError::Parse(_) => "FEED_PARSE_FAILED",
             RssError::NotFound(_) => "NOT_FOUND",
             RssError::Cache(_) => "CACHE_ERROR",
@@ -95,6 +105,13 @@ impl RssError {
                 obj.details = serde_json::json!({
                     "http_status": status,
                     "retry_after": retry_after,
+                });
+            }
+            RssError::RateLimited { retry_after, .. } => {
+                // Machine-readable pacing hint so the agent can wait, not give up.
+                obj.details = serde_json::json!({
+                    "retry_after_seconds": retry_after.as_secs(),
+                    "retry_after_ms": u64::try_from(retry_after.as_millis()).unwrap_or(u64::MAX),
                 });
             }
             RssError::ResponseTooLarge {
@@ -132,5 +149,20 @@ mod tests {
         assert_eq!(obj.code, "FEED_FETCH_FAILED");
         assert_eq!(obj.details["http_status"], 429);
         assert_eq!(obj.details["retry_after"], "2");
+    }
+
+    #[test]
+    fn rate_limited_surfaces_code_and_retry_after_details() {
+        // Pins the AI-facing contract for the gate's fail-fast error (ADR-0016): stable code
+        // plus machine-readable pacing hints in the free-form details.
+        let e = RssError::RateLimited {
+            url: "https://x/feed".into(),
+            retry_after: Duration::from_secs(12),
+        };
+        let obj = e.to_error_obj(Some("https://x/feed"));
+        assert_eq!(obj.code, "RATE_LIMITED");
+        assert_eq!(obj.feed_url.as_deref(), Some("https://x/feed"));
+        assert_eq!(obj.details["retry_after_seconds"], 12);
+        assert_eq!(obj.details["retry_after_ms"], 12_000);
     }
 }
