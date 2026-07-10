@@ -1,6 +1,6 @@
 [package]
 name = "rss-cli"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 description = "An AI-friendly, cache-backed RSS / Atom / JSON Feed CLI that also runs as an MCP server"
 license = "MIT OR Apache-2.0"
