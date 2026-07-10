@@ -1,7 +1,7 @@
 //! Model Context Protocol server (stdio transport). **Owner: `mcp` agent.**
 //!
 //! Runs `rss mcp`: exposes the same core operations as MCP tools so agents can call the
-//! tool directly. Implement with `rmcp` 1.7 (`#[tool]` / `#[tool_router]` macros,
+//! tool directly. Implemented with `rmcp` 2.x (`#[tool]` / `#[tool_router]` macros,
 //! `serve(stdio())`).
 //!
 //! ## Requirements
@@ -17,7 +17,7 @@
 
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, Content, Implementation, ServerCapabilities, ServerInfo};
+use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerInfo};
 use rmcp::{ErrorData, ServerHandler, ServiceExt, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -417,7 +417,7 @@ async fn get_item_inner(cache: &Cache, args: GetItemArgs) -> CallToolResult {
 /// surface it as a tool error rather than panicking the server.
 fn json_result<T: Serialize>(value: &T) -> CallToolResult {
     match serde_json::to_string_pretty(value) {
-        Ok(json) => CallToolResult::success(vec![Content::text(json)]),
+        Ok(json) => CallToolResult::success(vec![ContentBlock::text(json)]),
         Err(e) => tool_error_code(
             "INTERNAL_ERROR",
             format!("failed to serialize result: {e}"),
@@ -435,7 +435,7 @@ fn json_result<T: Serialize>(value: &T) -> CallToolResult {
 fn structured_result<T: Serialize>(value: &T, summary: impl Into<String>) -> CallToolResult {
     match serde_json::to_value(value) {
         Ok(json) => {
-            let mut result = CallToolResult::success(vec![Content::text(summary.into())]);
+            let mut result = CallToolResult::success(vec![ContentBlock::text(summary.into())]);
             result.structured_content = Some(json);
             result
         }
@@ -476,7 +476,7 @@ fn error_result(obj: ErrorObj) -> CallToolResult {
             obj.code, obj.message
         )
     });
-    CallToolResult::error(vec![Content::text(json)])
+    CallToolResult::error(vec![ContentBlock::text(json)])
 }
 
 /// Parse a user-supplied content-format string into a [`ContentFormat`]. Case-insensitive.
