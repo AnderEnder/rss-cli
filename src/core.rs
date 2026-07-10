@@ -19,12 +19,11 @@ use crate::{discover, parse};
 /// Partial failure is the norm: a feed that errors becomes a [`FeedStatus::Error`] entry
 /// (and is mirrored into [`FetchOutput::errors`]); successful feeds are unaffected.
 pub async fn fetch_feeds(urls: &[String], params: &FetchParams, cache: &Cache) -> FetchOutput {
-    let mut output = FetchOutput::new(now_rfc3339());
-
     let http = match HttpClient::new(&params.user_agent, params.timeout) {
         Ok(c) => c,
         Err(e) => {
             // Cannot build the client: every feed fails identically (already in url order).
+            let mut output = FetchOutput::new(now_rfc3339());
             for url in urls {
                 let obj = e.to_error_obj(Some(url));
                 output.errors.push(obj.clone());
@@ -34,23 +33,33 @@ pub async fn fetch_feeds(urls: &[String], params: &FetchParams, cache: &Cache) -
             return output;
         }
     };
+    fetch_feeds_with(urls, params, cache, &http).await
+}
+
+/// Fetch many feeds concurrently through a **caller-provided** [`HttpClient`]. The MCP server
+/// builds the client once and shares it across tool calls so their per-host pacing coordinates
+/// (ADR-0016); [`fetch_feeds`] is the thin wrapper that builds a client per call for the CLI.
+pub async fn fetch_feeds_with(
+    urls: &[String],
+    params: &FetchParams,
+    cache: &Cache,
+    http: &HttpClient,
+) -> FetchOutput {
+    let mut output = FetchOutput::new(now_rfc3339());
 
     // Tag each task with its input index so we can restore request order after the
     // completion-ordered `buffer_unordered` stream — `feeds[]`/`errors[]` are then
     // deterministic within a run (an agent can address feeds by position). See ADR-0012.
     let mut results: Vec<(usize, FeedResult, Vec<Warning>)> =
         stream::iter(urls.iter().cloned().enumerate())
-            .map(|(idx, url)| {
-                let http = &http;
-                async move {
-                    match fetch_one(&url, http, params, cache).await {
-                        Ok((fr, warnings)) => (idx, fr, warnings),
-                        Err(e) => (
-                            idx,
-                            FeedResult::error(url.clone(), e.to_error_obj(Some(&url))),
-                            Vec::new(),
-                        ),
-                    }
+            .map(|(idx, url)| async move {
+                match fetch_one(&url, http, params, cache).await {
+                    Ok((fr, warnings)) => (idx, fr, warnings),
+                    Err(e) => (
+                        idx,
+                        FeedResult::error(url.clone(), e.to_error_obj(Some(&url))),
+                        Vec::new(),
+                    ),
                 }
             })
             .buffer_unordered(params.concurrency.max(1))

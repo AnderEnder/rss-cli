@@ -26,6 +26,7 @@ use crate::cache::Cache;
 use crate::config::{CachePolicy, FetchParams};
 use crate::core;
 use crate::error::RssError;
+use crate::fetch::HttpClient;
 use crate::model::{ContentFormat, ErrorObj};
 use crate::output;
 
@@ -159,18 +160,22 @@ struct GetSchemaArgs {
     command: String,
 }
 
-/// MCP server state: the shared, cheaply-cloneable HTTP cache plus the generated
-/// tool router. Built once in [`serve_stdio`] and shared across all tool calls.
+/// MCP server state: the shared, cheaply-cloneable HTTP cache and HTTP client plus the
+/// generated tool router. Built once in [`serve_stdio`] and shared across all tool calls —
+/// sharing the client is what lets concurrent `fetch_feed` calls coordinate their per-host
+/// pacing (ADR-0016); a fresh client per call could not.
 #[derive(Clone)]
 struct RssServer {
     cache: Cache,
+    http: HttpClient,
     tool_router: ToolRouter<Self>,
 }
 
 impl RssServer {
-    fn new(cache: Cache) -> Self {
+    fn new(cache: Cache, http: HttpClient) -> Self {
         Self {
             cache,
+            http,
             tool_router: Self::tool_router(),
         }
     }
@@ -203,7 +208,7 @@ impl RssServer {
         &self,
         Parameters(args): Parameters<FetchFeedArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        Ok(fetch_feed_inner(&self.cache, args).await)
+        Ok(fetch_feed_inner(&self.http, &self.cache, args).await)
     }
 
     /// Discover feeds advertised on a website's homepage.
@@ -286,7 +291,7 @@ impl ServerHandler for RssServer {
 /// Core of the `fetch_feed` tool, free of the `#[tool]` macro plumbing so it is directly
 /// unit-testable. Applies the default item cap, the per-item content cap, and the response
 /// budget, attaching a [`crate::model::TruncationInfo`] marker when content was truncated.
-async fn fetch_feed_inner(cache: &Cache, args: FetchFeedArgs) -> CallToolResult {
+async fn fetch_feed_inner(http: &HttpClient, cache: &Cache, args: FetchFeedArgs) -> CallToolResult {
     let mut params = FetchParams::default();
     if let Some(cf) = args.content_format.as_deref() {
         match parse_content_format(cf) {
@@ -304,7 +309,8 @@ async fn fetch_feed_inner(cache: &Cache, args: FetchFeedArgs) -> CallToolResult 
     params.limit = Some(args.limit.unwrap_or(MCP_DEFAULT_LIMIT));
     params.max_content_chars = args.max_content_chars;
 
-    let mut out = core::fetch_feeds(std::slice::from_ref(&args.url), &params, cache).await;
+    let mut out =
+        core::fetch_feeds_with(std::slice::from_ref(&args.url), &params, cache, http).await;
 
     // Reject oversized results with an actionable error rather than letting the client trip
     // its own tool-result-too-large limit on an opaque failure.
@@ -486,7 +492,10 @@ fn parse_content_format(s: &str) -> Option<ContentFormat> {
 
 /// Run the MCP server over stdio until the client disconnects. **Owner: `mcp` agent.**
 pub async fn serve_stdio(cache: Cache) -> Result<(), RssError> {
-    let server = RssServer::new(cache);
+    // One shared HTTP client (and its per-host gate + connection pool) for every tool call.
+    let params = FetchParams::default();
+    let http = HttpClient::new(&params.user_agent, params.timeout)?;
+    let server = RssServer::new(cache, http);
     tracing::info!("starting MCP server on stdio");
 
     let service = server
@@ -534,6 +543,11 @@ mod tests {
     fn summary_text(result: &CallToolResult) -> Option<String> {
         let v = serde_json::to_value(result).ok()?;
         v["content"][0]["text"].as_str().map(|s| s.to_string())
+    }
+
+    /// A fresh HTTP client for a test (its own per-host gate, so tests never couple).
+    fn test_http() -> HttpClient {
+        HttpClient::new("rss-cli-test", std::time::Duration::from_secs(10)).expect("build client")
     }
 
     fn temp_cache(tag: &str) -> (Cache, std::path::PathBuf) {
@@ -584,8 +598,12 @@ mod tests {
             .await;
         let (cache, dir) = temp_cache("cap");
 
-        let result =
-            fetch_feed_inner(&cache, fetch_args(format!("{}/feed.xml", server.url()))).await;
+        let result = fetch_feed_inner(
+            &test_http(),
+            &cache,
+            fetch_args(format!("{}/feed.xml", server.url())),
+        )
+        .await;
         let (is_error, payload) = decode(&result);
 
         assert!(!is_error, "a normal feed should succeed: {payload}");
@@ -600,6 +618,38 @@ mod tests {
             payload["truncation"].is_null(),
             "untruncated result → truncation null"
         );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn concurrent_fetches_share_one_client_and_gate() {
+        // Pins the reported bug: two concurrent fetch_feed calls go through ONE shared
+        // HttpClient (hence one per-host gate), the way RssServer wires them — not a fresh
+        // client per call. Both succeed here; the gate's serialize/cooldown behavior is
+        // unit-tested in `ratelimit`.
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/feed.xml")
+            .with_status(200)
+            .with_body(feed_with_items(2))
+            .create_async()
+            .await;
+        let (cache, dir) = temp_cache("shared-client");
+        let http = test_http();
+        let url = format!("{}/feed.xml", server.url());
+
+        let (r1, r2) = tokio::join!(
+            fetch_feed_inner(&http, &cache, fetch_args(url.clone())),
+            fetch_feed_inner(&http, &cache, fetch_args(url.clone())),
+        );
+        for r in [&r1, &r2] {
+            let (is_error, payload) = decode(r);
+            assert!(
+                !is_error,
+                "shared-client concurrent fetch should succeed: {payload}"
+            );
+        }
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -648,8 +698,12 @@ mod tests {
             .await;
         let (cache, dir) = temp_cache("structured");
 
-        let result =
-            fetch_feed_inner(&cache, fetch_args(format!("{}/feed.xml", server.url()))).await;
+        let result = fetch_feed_inner(
+            &test_http(),
+            &cache,
+            fetch_args(format!("{}/feed.xml", server.url())),
+        )
+        .await;
         let wire = serde_json::to_value(&result).expect("serialize result");
 
         // The typed FetchOutput lives in structuredContent (matching the tool output_schema).
@@ -689,7 +743,7 @@ mod tests {
 
         let mut args = fetch_args(format!("{}/feed.xml", server.url()));
         args.max_response_tokens = Some(1);
-        let result = fetch_feed_inner(&cache, args).await;
+        let result = fetch_feed_inner(&test_http(), &cache, args).await;
         let wire = serde_json::to_value(&result).expect("serialize result");
 
         assert_eq!(wire["isError"], true);
@@ -715,7 +769,7 @@ mod tests {
         let mut args = fetch_args(format!("{}/feed.xml", server.url()));
         args.max_response_tokens = Some(1); // force overflow
 
-        let result = fetch_feed_inner(&cache, args).await;
+        let result = fetch_feed_inner(&test_http(), &cache, args).await;
         let (is_error, payload) = decode(&result);
 
         assert!(is_error, "an over-budget result must be an error");
@@ -756,7 +810,7 @@ mod tests {
         let mut args = fetch_args(format!("{}/feed.xml", server.url()));
         args.max_content_chars = Some(15);
 
-        let (is_error, payload) = decode(&fetch_feed_inner(&cache, args).await);
+        let (is_error, payload) = decode(&fetch_feed_inner(&test_http(), &cache, args).await);
         assert!(
             !is_error,
             "truncated-but-fitting result should succeed: {payload}"
@@ -780,7 +834,7 @@ mod tests {
         let mut args = fetch_args("https://example.com/feed.xml".to_string());
         args.content_format = Some("yaml".to_string());
 
-        let (is_error, payload) = decode(&fetch_feed_inner(&cache, args).await);
+        let (is_error, payload) = decode(&fetch_feed_inner(&test_http(), &cache, args).await);
         assert!(is_error);
         assert_eq!(payload["code"], "USAGE_ERROR");
 

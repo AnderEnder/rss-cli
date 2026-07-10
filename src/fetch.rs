@@ -21,6 +21,7 @@
 //! - On a non-success, non-304 status, return [`RssError::Http`].
 //! - `final_url` is the URL after following redirects (used to resolve relative links).
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -33,6 +34,7 @@ use tokio::time::sleep;
 use crate::cache::{Cache, CacheMeta};
 use crate::config::CachePolicy;
 use crate::error::RssError;
+use crate::ratelimit::HostGate;
 
 /// Raw bytes of a fetched (or cached) feed, plus the metadata `parse`/`core` need.
 #[derive(Debug, Clone)]
@@ -49,10 +51,15 @@ pub struct RawFeed {
 }
 
 /// Reusable HTTP client.
+///
+/// Reuse it: cloning is cheap (both fields are `Arc`-backed) and a clone **shares the same
+/// per-host gate and connection pool**. The MCP server builds one and shares it across tool
+/// calls so concurrent calls coordinate their pacing (ADR-0016); the CLI builds one per run.
 #[derive(Clone)]
 pub struct HttpClient {
-    #[allow(dead_code)]
     inner: reqwest::Client,
+    /// Shared per-host request gate (ADR-0016).
+    gate: Arc<HostGate>,
 }
 
 impl HttpClient {
@@ -64,7 +71,10 @@ impl HttpClient {
             .gzip(true)
             .build()
             .map_err(|e| RssError::Network(e.to_string()))?;
-        Ok(Self { inner })
+        Ok(Self {
+            inner,
+            gate: Arc::new(HostGate::from_env()),
+        })
     }
 
     /// Fetch `url`, applying the cache `policy`. See module docs for the contract.
@@ -77,7 +87,7 @@ impl HttpClient {
         match policy {
             // Never touch the cache: a plain GET returning whatever the server sends.
             CachePolicy::NoCache => {
-                let resp = send_with_retry(|| self.inner.get(url)).await?;
+                let resp = self.gated_send(url, || self.inner.get(url)).await?;
                 let status = resp.status();
                 let final_url = resp.url().to_string();
                 if !status.is_success() {
@@ -159,7 +169,7 @@ impl HttpClient {
             req
         };
 
-        let resp = send_with_retry(build).await?;
+        let resp = self.gated_send(url, build).await?;
         let status = resp.status();
         let final_url = resp.url().to_string();
 
@@ -227,7 +237,7 @@ impl HttpClient {
 
     /// Plain GET returning the raw body (used by `discover` for the homepage HTML).
     pub async fn get_bytes(&self, url: &str) -> Result<(Vec<u8>, String), RssError> {
-        let resp = send_with_retry(|| self.inner.get(url)).await?;
+        let resp = self.gated_send(url, || self.inner.get(url)).await?;
         let status = resp.status();
         let final_url = resp.url().to_string();
         if !status.is_success() {
@@ -270,25 +280,65 @@ fn retry_after_raw(headers: &HeaderMap) -> Option<String> {
 const RETRY_BASE_DELAY: Duration = Duration::from_millis(500);
 const RETRY_MAX_DELAY: Duration = Duration::from_secs(5);
 
-/// Send a freshly-built request, retrying once on a transient 403/429. `build` is called
-/// again for the retry so headers/validators are re-attached cleanly.
-async fn send_with_retry<F>(build: F) -> Result<reqwest::Response, RssError>
-where
-    F: Fn() -> reqwest::RequestBuilder,
-{
-    let resp = build()
-        .send()
-        .await
-        .map_err(|e| RssError::Network(e.to_string()))?;
-    if !is_retryable(resp.status()) {
-        return Ok(resp);
+impl HttpClient {
+    /// Gate-aware send: acquire the per-host permit (waiting out any active cooldown / sticky
+    /// spacing), then send with the single bounded ADR-0015 retry on a transient `403`/`429`.
+    /// `build` is called again for the retry so headers/validators are re-attached cleanly.
+    ///
+    /// The permit is held across the retry, so a request never blocks on the cooldown it
+    /// itself just set (the two waits are one budget — ADR-0016). Acquiring may instead return
+    /// [`RssError::RateLimited`] when a sibling's cooldown would make this request wait past
+    /// the gate ceiling.
+    async fn gated_send<F>(&self, url: &str, build: F) -> Result<reqwest::Response, RssError>
+    where
+        F: Fn() -> reqwest::RequestBuilder,
+    {
+        // The gate keys on the *request* URL's host. reqwest follows redirects internally, so
+        // a cross-host redirect's throttle is attributed to the origin host, not the final
+        // one — acceptable (callers hit one host consistently) and unavoidable pre-send.
+        let _permit = self.gate.acquire(url).await?;
+
+        let resp = build()
+            .send()
+            .await
+            .map_err(|e| RssError::Network(e.to_string()))?;
+        if !is_retryable(resp.status()) {
+            self.gate.note_success(url);
+            return Ok(resp);
+        }
+
+        // Transient 403/429: extend the sibling cooldown, then spend the single retry.
+        self.gate
+            .note_throttled(url, retry_after_duration(resp.headers()));
+        let wait = retry_after(resp.headers(), RETRY_MAX_DELAY).unwrap_or(RETRY_BASE_DELAY);
+        sleep(wait).await;
+        let resp = build()
+            .send()
+            .await
+            .map_err(|e| RssError::Network(e.to_string()))?;
+        if is_retryable(resp.status()) {
+            self.gate
+                .note_throttled(url, retry_after_duration(resp.headers()));
+        } else {
+            self.gate.note_success(url);
+        }
+        Ok(resp)
     }
-    let wait = retry_after(resp.headers(), RETRY_MAX_DELAY).unwrap_or(RETRY_BASE_DELAY);
-    sleep(wait).await;
-    build()
-        .send()
-        .await
-        .map_err(|e| RssError::Network(e.to_string()))
+}
+
+/// Parse `Retry-After` into a `Duration` from now, accepting **both** the delta-seconds and
+/// the HTTP-date forms. ADR-0015 deferred the date form; ADR-0016 consumes it (the gate clamps
+/// the result), so a skewed or already-past date is harmless. `None` when absent, unparseable,
+/// or already in the past.
+fn retry_after_duration(headers: &HeaderMap) -> Option<Duration> {
+    let raw = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
+    let raw = raw.trim();
+    if let Ok(secs) = raw.parse::<u64>() {
+        return Some(Duration::from_secs(secs));
+    }
+    // HTTP-date form (RFC 1123, an RFC 2822 date).
+    let when = DateTime::parse_from_rfc2822(raw).ok()?;
+    (when.with_timezone(&Utc) - Utc::now()).to_std().ok()
 }
 
 /// `true` if a cache entry written at `fetched_at` (RFC-3339) is younger than `max_age`.
@@ -325,6 +375,52 @@ mod tests {
     /// Build a client with a short timeout for tests.
     fn client() -> HttpClient {
         HttpClient::new("rss-cli-test", Duration::from_secs(10)).expect("build client")
+    }
+
+    fn headers_with_retry_after(value: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(reqwest::header::RETRY_AFTER, value.parse().unwrap());
+        h
+    }
+
+    #[test]
+    fn retry_after_parses_delta_seconds_and_caps_to_max() {
+        // The in-flight ADR-0015 retry wait: delta-seconds, clamped to `max`.
+        assert_eq!(
+            retry_after(&headers_with_retry_after("2"), RETRY_MAX_DELAY),
+            Some(Duration::from_secs(2))
+        );
+        assert_eq!(
+            retry_after(&headers_with_retry_after("30"), RETRY_MAX_DELAY),
+            Some(RETRY_MAX_DELAY),
+            "a value above the cap must clamp to RETRY_MAX_DELAY"
+        );
+        assert_eq!(retry_after(&HeaderMap::new(), RETRY_MAX_DELAY), None);
+    }
+
+    #[test]
+    fn retry_after_duration_parses_delta_seconds_and_http_date() {
+        // Delta-seconds (uncapped here — the gate clamps).
+        assert_eq!(
+            retry_after_duration(&headers_with_retry_after("45")),
+            Some(Duration::from_secs(45))
+        );
+        // A future HTTP-date yields a positive duration...
+        let future =
+            retry_after_duration(&headers_with_retry_after("Wed, 21 Oct 2099 07:28:00 GMT"))
+                .expect("a future HTTP-date should parse to a positive duration");
+        assert!(future > Duration::from_secs(0));
+        // ...a past date yields None (never a wrong/negative sleep)...
+        assert_eq!(
+            retry_after_duration(&headers_with_retry_after("Wed, 21 Oct 2015 07:28:00 GMT")),
+            None
+        );
+        // ...and garbage / absent yield None.
+        assert_eq!(
+            retry_after_duration(&headers_with_retry_after("soon")),
+            None
+        );
+        assert_eq!(retry_after_duration(&HeaderMap::new()), None);
     }
 
     /// A per-test temp cache dir (tag keeps parallel tests from colliding).
