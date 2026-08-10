@@ -8,10 +8,9 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
-use crate::config::{CachePolicy, DEFAULT_USER_AGENT, FetchParams};
+use crate::config::{CachePolicy, DEFAULT_USER_AGENT, FetchParams, parse_duration, parse_since};
 use crate::error::RssError;
 use crate::model::ContentFormat;
 use crate::output::OutputFormat;
@@ -322,49 +321,4 @@ pub enum CacheAction {
     },
     /// Remove all cache entries.
     Clear,
-}
-
-/// Parse a `--since` value: a relative duration (`2h`, `7d`) or an ISO-8601 instant.
-pub fn parse_since(s: &str) -> Result<DateTime<Utc>, RssError> {
-    let s = s.trim();
-    // Try a relative duration first.
-    if let Ok(d) = parse_duration(s) {
-        let d = chrono::Duration::from_std(d)
-            .map_err(|e| RssError::Usage(format!("duration too large: {e}")))?;
-        return Ok(Utc::now() - d);
-    }
-    // Full RFC-3339 datetime.
-    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
-        return Ok(dt.with_timezone(&Utc));
-    }
-    // Bare date (assume midnight UTC).
-    if let Ok(date) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
-        && let Some(dt) = date.and_hms_opt(0, 0, 0)
-    {
-        return Ok(DateTime::from_naive_utc_and_offset(dt, Utc));
-    }
-    Err(RssError::Usage(format!(
-        "invalid --since value '{s}' (use e.g. '2h', '7d', or '2026-06-01')"
-    )))
-}
-
-/// Parse a simple duration like `30s`, `15m`, `2h`, `7d`, `1w`.
-pub fn parse_duration(s: &str) -> Result<Duration, RssError> {
-    let s = s.trim();
-    let (num, unit) = s.split_at(
-        s.find(|c: char| !c.is_ascii_digit())
-            .ok_or_else(|| RssError::Usage(format!("invalid duration '{s}'")))?,
-    );
-    let n: u64 = num
-        .parse()
-        .map_err(|_| RssError::Usage(format!("invalid duration '{s}'")))?;
-    let secs = match unit {
-        "s" => n,
-        "m" => n * 60,
-        "h" => n * 3600,
-        "d" => n * 86400,
-        "w" => n * 604800,
-        other => return Err(RssError::Usage(format!("unknown duration unit '{other}'"))),
-    };
-    Ok(Duration::from_secs(secs))
 }

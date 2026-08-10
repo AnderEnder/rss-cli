@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 
+use crate::error::RssError;
 use crate::model::ContentFormat;
 
 /// Default User-Agent. Polite, identifies the tool, points at the project.
@@ -63,5 +64,86 @@ impl Default for FetchParams {
             user_agent: DEFAULT_USER_AGENT.to_string(),
             cache_policy: CachePolicy::Revalidate,
         }
+    }
+}
+
+/// Parse a `--since` / `since` value: a relative duration (`2h`, `7d`) or an ISO-8601
+/// instant. Shared by the CLI and the MCP server so both front-ends accept the same forms.
+pub fn parse_since(s: &str) -> Result<DateTime<Utc>, RssError> {
+    let s = s.trim();
+    // Try a relative duration first.
+    if let Ok(d) = parse_duration(s) {
+        let d = chrono::Duration::from_std(d)
+            .map_err(|e| RssError::Usage(format!("duration too large: {e}")))?;
+        return Ok(Utc::now() - d);
+    }
+    // Full RFC-3339 datetime.
+    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+        return Ok(dt.with_timezone(&Utc));
+    }
+    // Bare date (assume midnight UTC).
+    if let Ok(date) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+        && let Some(dt) = date.and_hms_opt(0, 0, 0)
+    {
+        return Ok(DateTime::from_naive_utc_and_offset(dt, Utc));
+    }
+    Err(RssError::Usage(format!(
+        "invalid since value '{s}' (use e.g. '2h', '7d', or '2026-06-01')"
+    )))
+}
+
+/// Parse a simple duration like `30s`, `15m`, `2h`, `7d`, `1w`.
+pub fn parse_duration(s: &str) -> Result<Duration, RssError> {
+    let s = s.trim();
+    let (num, unit) = s.split_at(
+        s.find(|c: char| !c.is_ascii_digit())
+            .ok_or_else(|| RssError::Usage(format!("invalid duration '{s}'")))?,
+    );
+    let n: u64 = num
+        .parse()
+        .map_err(|_| RssError::Usage(format!("invalid duration '{s}'")))?;
+    let secs = match unit {
+        "s" => n,
+        "m" => n * 60,
+        "h" => n * 3600,
+        "d" => n * 86400,
+        "w" => n * 604800,
+        other => return Err(RssError::Usage(format!("unknown duration unit '{other}'"))),
+    };
+    Ok(Duration::from_secs(secs))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_duration_handles_every_unit() {
+        assert_eq!(parse_duration("30s").unwrap(), Duration::from_secs(30));
+        assert_eq!(parse_duration("15m").unwrap(), Duration::from_secs(900));
+        assert_eq!(parse_duration("2h").unwrap(), Duration::from_secs(7200));
+        assert_eq!(parse_duration("7d").unwrap(), Duration::from_secs(604_800));
+        assert_eq!(parse_duration("1w").unwrap(), Duration::from_secs(604_800));
+        assert!(parse_duration("2y").is_err(), "unknown unit must error");
+        assert!(parse_duration("abc").is_err());
+    }
+
+    #[test]
+    fn parse_since_accepts_duration_rfc3339_and_bare_date() {
+        // A relative duration resolves to a past instant.
+        assert!(parse_since("2h").unwrap() < Utc::now());
+        // RFC-3339 round-trips exactly.
+        let dt = parse_since("2026-06-01T12:00:00Z").unwrap();
+        assert_eq!(
+            dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            "2026-06-01T12:00:00Z"
+        );
+        // A bare date is midnight UTC.
+        let d = parse_since("2026-06-01").unwrap();
+        assert_eq!(
+            d.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            "2026-06-01T00:00:00Z"
+        );
+        assert!(parse_since("not-a-date").is_err());
     }
 }
