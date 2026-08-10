@@ -32,14 +32,40 @@ use crate::output;
 
 /// Human-readable guidance surfaced to MCP clients during `initialize`.
 const SERVER_INSTRUCTIONS: &str = "\
-AI-friendly RSS/Atom tools. All tools return JSON text matching the rss-cli output \
-contract (use get_schema for the authoritative shapes). fetch_feed retrieves and parses a \
-feed; discover_feeds finds feeds advertised on a website; get_item returns a single item by \
-its stable id; get_schema returns the JSON Schema for the 'fetch' or 'discover' output. \
-Responses are size-bounded: fetch_feed caps items (default 25) and pages an over-budget \
-result, returning what fits plus truncation.next_cursor to pass back as 'cursor'. \
-RESPONSE_TOO_LARGE (carrying suggested limit/max_content_chars) is reserved for the case \
-where not even one item fits.";
+AI-friendly RSS/Atom tools. Every tool returns JSON matching the rss-cli output contract \
+(use get_schema for authoritative shapes). fetch_feed retrieves and parses feeds; \
+discover_feeds finds feeds advertised on a website; get_item returns a single item by its \
+stable id, guid, or permalink; get_schema returns the JSON Schema for 'fetch' or 'discover'.\n\
+\n\
+BATCHING AND PACING. Pass several feeds at once via fetch_feed's `urls` array (max 50) \
+rather than making one call per feed with your own delays -- the server serializes requests \
+to the same host and applies an adaptive cooldown that honors the origin's Retry-After, so \
+it paces on your behalf. Do NOT hand-roll sleeps between calls. If pacing would exceed the \
+server's wait ceiling, or the origin itself sends a 429/403, that feed gets a RATE_LIMITED \
+or FEED_FETCH_FAILED entry (details.retry_after_seconds / details.http_status+retry_after) \
+in ITS OWN feeds[].error -- the fetch_feed call still succeeds overall, so check each feed's \
+status, not just whether the call errored; wait the given amount and retry that feed. \
+get_item and discover_feeds report the same codes as an actual tool failure instead, since \
+each targets a single feed or site. A batch that cannot finish inside the server's \
+wall-clock deadline returns the feeds it completed plus truncation.feeds_omitted for the \
+rest -- follow truncation.next_cursor when present, or request the omitted feeds separately.\n\
+\n\
+CACHING. Every fetch already performs a conditional GET (If-None-Match / \
+If-Modified-Since); an unchanged feed comes back as status 'not_modified' with from_cache \
+true, at almost no bandwidth cost -- you do not need to implement this yourself. `since` (a \
+duration like 2h/7d, or an ISO-8601 date) filters items before `limit` is applied. Judge \
+staleness via each feed's cached_at and cache_age_seconds -- note that a feed which \
+revalidates cleanly on every call holds cache_age_seconds near its polling interval, not the \
+body's true age. Control freshness with cache_policy: revalidate (default), no-cache, \
+cache-first, or max-age:<duration> such as max-age:15m.\n\
+\n\
+SIZE LIMITS AND PAGING. Responses are size-bounded. fetch_feed caps items per feed (default \
+25) and fills up to max_response_tokens; whatever did not fit is reported in truncation \
+(items_omitted, feeds_omitted -- both PER PAGE, not cumulative: do not sum them across \
+pages) with truncation.next_cursor. Pass that token back as `cursor` WITH THE SAME \
+ARGUMENTS for the next page: a feed already fetched costs nothing, but one the batch \
+deadline never reached still needs a live fetch. A single item too large on its own still \
+returns RESPONSE_TOO_LARGE with suggested_limit / suggested_max_content_chars.";
 
 /// Default item cap `fetch_feed` applies when the caller passes no `limit`. Bounds the common
 /// "too many items" blow-up (e.g. a hot post's comment feed) without the caller opting in.
@@ -394,8 +420,9 @@ struct FetchFeedArgs {
     #[serde(default)]
     cache_policy: Option<String>,
     /// Opaque continuation token from a prior response's `truncation.next_cursor`. Pass it
-    /// back with the SAME arguments to get the next page. Continuation pages are served from
-    /// cache, so they cost no rate-limit budget.
+    /// back with the SAME arguments to get the next page. Continuation pages resume
+    /// cache-first: a feed already fetched in a prior page costs nothing, but a feed the
+    /// batch deadline never reached still needs a live fetch.
     #[serde(default)]
     cursor: Option<String>,
 }
@@ -453,27 +480,35 @@ impl RssServer {
 
 #[tool_router]
 impl RssServer {
-    /// Fetch and parse a single RSS/Atom feed. Returns the full `FetchOutput` (one entry in
-    /// `feeds`), so feed-level errors surface as a `FeedStatus::Error` entry rather than a
-    /// tool failure.
-    ///
-    /// Note: the frozen module doc sketches `{ ..., since? }` returning a single `FeedResult`;
-    /// the assigned task spec supersedes that — args are `{ url, content_format?, limit? }` and
-    /// we return the whole `FetchOutput`.
+    /// Fetch and parse RSS/Atom feeds. Returns the full `FetchOutput` (one entry per URL in
+    /// `feeds`), so feed-level errors (including a rate-limit or HTTP failure on one feed of
+    /// a batch) surface as a `FeedStatus::Error` entry in `feeds[]`/`errors[]` rather than a
+    /// tool failure — args are `{ url | urls[], content_format?, since?, limit?, \
+    /// max_content_chars?, max_response_tokens?, cache_policy?, cursor? }`.
     #[tool(
-        description = "Fetch and parse an RSS/Atom feed by URL. Returns the FetchOutput as \
-        structured content (and a one-line text summary); schema: get_schema command=fetch. \
-        content_format is one of markdown|text|html|none; limit caps items, newest first \
-        (DEFAULT 25 when omitted). max_content_chars truncates each item body (flagged \
-        content_truncated). The response is size-bounded by max_response_tokens: an \
-        over-budget result returns the items that fit plus truncation.next_cursor — pass that \
-        token back as `cursor` with the SAME arguments for the next page, which is served \
-        from cache and costs no rate-limit budget. RESPONSE_TOO_LARGE (whose details include \
-        suggested_limit and suggested_max_content_chars to retry with) is returned only when \
-        not even one item fits. Provider notes: some \
-        feeds (e.g. Reddit comment .rss) populate only updated, not published, and append the \
-        original post to a comment listing (so a comment feed can return one more item than \
-        limit); search.rss results are best-effort and may be sparse.",
+        description = "Fetch and parse RSS/Atom feeds. Pass one `url` OR a `urls` array (max \
+        50) -- batch rather than looping, because the server paces per host for you. Returns \
+        FetchOutput as structured content plus a one-line summary; schema: get_schema \
+        command=fetch. content_format is markdown|text|html|none. `limit` caps items PER \
+        FEED, newest first (DEFAULT 25); `since` accepts a duration (2h, 7d) or an ISO-8601 \
+        date and is applied before limit. max_content_chars truncates each body (flagged \
+        content_truncated). `cache_policy` is revalidate (default; conditional GET, cheap \
+        when unchanged) | no-cache | cache-first | max-age:<duration>; every result carries \
+        from_cache, cached_at, and cache_age_seconds so you can judge staleness (a cleanly \
+        revalidating feed holds cache_age_seconds near its poll interval, not the body's true \
+        age). Over-budget results are PAGED, not rejected: check truncation.next_cursor and \
+        pass it back as `cursor` with identical arguments -- a feed already fetched costs \
+        nothing, but one the batch deadline never reached still needs a live fetch. \
+        truncation.items_omitted/feeds_omitted describe only this page, not a running total. \
+        A lone oversized item still returns RESPONSE_TOO_LARGE with \
+        suggested_max_content_chars (a tool-level failure). If the host's pacing ceiling is \
+        hit for one feed, THAT FEED gets a RATE_LIMITED entry in feeds[].error with \
+        details.retry_after_seconds -- the call itself still succeeds, so check per-feed \
+        status, not just whether the call errored; wait that long and retry that feed. \
+        Provider notes: \
+        some feeds (e.g. Reddit comment .rss) populate only updated, not published, and \
+        append the original post to a comment listing (so a comment feed can return one more \
+        item than limit); search.rss results are best-effort and may be sparse.",
         annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = true),
         output_schema = rmcp::handler::server::tool::schema_for_type::<crate::model::FetchOutput>()
     )]
@@ -513,7 +548,9 @@ impl RssServer {
         description = "Fetch a feed and return the single Item matching a stable id (from \
         fetch_feed) as structured content, or an error if the id is not present. \
         max_content_chars truncates the body; a single oversized item (e.g. a hot comment \
-        thread) returns RESPONSE_TOO_LARGE with a suggested_max_content_chars to retry with.",
+        thread) returns RESPONSE_TOO_LARGE with a suggested_max_content_chars to retry with. \
+        Served cache-first, so an item you already saw survives a rolled feed window, but not \
+        a later refetch that overwrote the cache.",
         annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = true),
         output_schema = rmcp::handler::server::tool::schema_for_type::<crate::model::Item>()
     )]
@@ -1729,6 +1766,53 @@ mod tests {
             "get_schema does not touch the network"
         );
         assert!(get_schema.output_schema.is_none());
+    }
+
+    #[test]
+    fn tool_surface_documents_its_own_pacing_and_cache_behavior() {
+        // The original field report listed conditional GET, per-host pacing, and RATE_LIMITED
+        // as "missing" -- all three shipped, but nothing on the tool surface said so. This test
+        // exists so that documentation cannot silently drift back out of sync.
+        let tools = RssServer::tool_router().list_all();
+        let fetch = tools
+            .iter()
+            .find(|t| t.name == "fetch_feed")
+            .expect("fetch_feed registered");
+        let desc = fetch.description.as_deref().unwrap_or_default().to_string();
+        let haystack = format!("{SERVER_INSTRUCTIONS}\n{desc}");
+
+        for needle in [
+            "RATE_LIMITED",
+            "retry_after_seconds",
+            "not_modified",
+            "cache_age_seconds",
+            "next_cursor",
+            "cache_policy",
+            "urls",
+            "since",
+        ] {
+            assert!(
+                haystack.contains(needle),
+                "the tool surface must document '{needle}' -- an undiscoverable feature is \
+                 indistinguishable from a missing one"
+            );
+        }
+
+        // Every argument fetch_feed advertises must be named somewhere in the docs, so adding
+        // a new one (e.g. a future `query`/`dedupe`) without documenting it fails this test
+        // rather than shipping silently undiscoverable, same as the fixed needles above.
+        let props = fetch
+            .input_schema
+            .get("properties")
+            .and_then(|p| p.as_object())
+            .expect("fetch_feed input_schema should have properties");
+        for name in props.keys() {
+            assert!(
+                haystack.contains(name.as_str()),
+                "fetch_feed argument '{name}' is not named anywhere in SERVER_INSTRUCTIONS or \
+                 the fetch_feed description -- an agent cannot discover what it cannot guess"
+            );
+        }
     }
 
     #[tokio::test]

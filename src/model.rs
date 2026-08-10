@@ -75,13 +75,16 @@ pub struct TruncationInfo {
     /// Number of items dropped entirely to fit a response budget. Non-zero when the server
     /// filled the page to the budget and shed the rest (see `next_cursor`); `0` in the
     /// cap-and-error path, which rejects an oversized response rather than trimming it.
+    /// Describes only THIS page, not a running total — a client that sums it across every
+    /// page it fetches gets the wrong answer.
     pub items_omitted: usize,
     /// Number of whole feeds not included in this page — shed to fit the budget or not
     /// reached before the batch deadline. `0` when every requested feed is present.
+    /// Per-page like `items_omitted`: do not sum it across pages.
     pub feeds_omitted: usize,
     /// Opaque token to pass back as `cursor` to retrieve the next page. `null` when this
-    /// response is complete. Continuation pages are served from cache and cost no
-    /// rate-limit budget.
+    /// response is complete. Continuation pages resume cache-first: a feed already fetched
+    /// costs nothing, but a feed the batch deadline never reached still needs a live fetch.
     pub next_cursor: Option<String>,
     /// Rough token estimate of the (possibly reduced) serialized response, if computed.
     pub estimated_tokens: Option<usize>,
