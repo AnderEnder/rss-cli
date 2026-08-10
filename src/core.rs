@@ -184,6 +184,17 @@ pub fn estimate_response_tokens(output: &FetchOutput) -> usize {
     json.chars().count().div_ceil(4)
 }
 
+/// Token cost of one *part* of a response — an item, a feed envelope — pretty-printed on its
+/// own, plus a couple of tokens for the array punctuation and indentation it picks up once
+/// nested. Deliberately approximate and low: [`paginate`]'s greedy pass adds these up and a
+/// real [`estimate_response_tokens`] measurement corrects the residue afterwards.
+fn pretty_tokens<T: serde::Serialize>(value: &T) -> usize {
+    serde_json::to_string_pretty(value)
+        .map(|s| s.chars().count().div_ceil(4))
+        .unwrap_or(0)
+        + 2
+}
+
 /// Check `output` against a token `budget`, returning the estimate on success.
 ///
 /// On overflow, returns [`RssError::ResponseTooLarge`] carrying concrete, machine-readable
@@ -250,6 +261,8 @@ pub struct PageStop {
     /// trailing feed *envelope* was deferred — so treat `Some(stop)` itself as the
     /// truncation signal, not `items_omitted > 0`.
     pub items_omitted: usize,
+    /// How many feeds the page dropped **whole**, not how many it delivered incompletely:
+    /// for `[f0(4 items → 2), f1(3 items)]` this is `1` (only `f1` was dropped), not `2`.
     pub feeds_omitted: usize,
 }
 
@@ -262,9 +275,8 @@ pub struct PageStop {
 /// Returns `Ok(None)` when everything fits and `Ok(Some(stop))` when the page was trimmed.
 /// `Err(ResponseTooLarge)` means, exactly, that **zero items shipped**: a request that
 /// carried items could not place a single one inside the budget (one oversized item, or an
-/// envelope that leaves no room), or there were no items to place to begin with. (One arm
-/// below reads the other way round — every item present, only the envelope over budget — but
-/// it is unreachable, so the invariant stands.) That is the invariant a cursor loop depends on — a stop that shipped nothing would mint a cursor no
+/// envelope that leaves no room), or there were no items to place to begin with. That is the
+/// invariant a cursor loop depends on — a stop that shipped nothing would mint a cursor no
 /// further along than the request that produced it and loop the caller forever.
 ///
 /// On `Err`, `output` **may** have been partially trimmed already (the trim, shed, and husk
@@ -295,23 +307,38 @@ pub fn paginate(
         return Err(too_large());
     }
 
-    // Cost of the envelope with no items at all: feed metadata, errors, warnings, totals.
+    // Cost of the response envelope with no feeds at all: totals, errors, warnings,
+    // truncation. Feed envelopes are charged separately below, so that feeds this page never
+    // reaches are never charged — folding them all in here inflated the baseline by one
+    // envelope per URL and made the greedy pass reject pages that fit.
     let mut skeleton = output.clone();
-    for feed in &mut skeleton.feeds {
-        feed.items.clear();
-    }
+    skeleton.feeds.clear();
     refresh_feed_counts(&mut skeleton);
     let base = estimate_response_tokens(&skeleton);
 
-    // Greedily admit items in (feed, item) order until the next one would overflow.
+    // What each feed's own metadata costs once its items are stripped, in the same currency
+    // as the per-item cost below. A feed that never had items is never charged here (nothing
+    // admits it), so the greedy pass under-counts a page carrying error entries; that is what
+    // the shed loop below is for. Do not fold these back into `base`.
+    let feed_envelopes: Vec<usize> = output
+        .feeds
+        .iter()
+        .map(|feed| {
+            let mut husk = feed.clone();
+            husk.items.clear();
+            husk.item_count = 0;
+            husk.content_tokens_est_total = 0;
+            pretty_tokens(&husk)
+        })
+        .collect();
+
+    // Greedily admit items in (feed, item) order until the next one would overflow, charging
+    // a feed's envelope when its first item is admitted.
     let mut running = base;
     let mut stop: Option<(usize, usize)> = None;
     'outer: for (fi, feed) in output.feeds.iter().enumerate() {
         for (ii, it) in feed.items.iter().enumerate() {
-            let cost = serde_json::to_string_pretty(it)
-                .map(|s| s.chars().count().div_ceil(4))
-                .unwrap_or(0)
-                + 2; // array punctuation and indentation between elements
+            let cost = pretty_tokens(it) + if ii == 0 { feed_envelopes[fi] } else { 0 };
             if running + cost > budget_tokens {
                 stop = Some((fi, ii));
                 break 'outer;
@@ -333,8 +360,12 @@ pub fn paginate(
     };
 
     if stop_feed == 0 && stop_item == 0 {
-        // Not even the first item fits. This is the genuine ResponseTooLarge case, and the
-        // one error path that returns before `output` has been touched.
+        // Feed 0's envelope plus its first item do not fit. This is the genuine
+        // ResponseTooLarge case, and — like the `original_items == 0` guard above — it
+        // returns before `output` has been touched. Reachable only when feed 0 *has* items:
+        // the greedy loop skips a leading zero-item feed entirely, so the earliest stop it
+        // can report there is `(1, 0)`. A page that ships nothing anyway — because that
+        // leading envelope was all that fit — exits via the `item_count` guard below.
         return Err(too_large());
     }
 
@@ -362,8 +393,11 @@ pub fn paginate(
     }
 
     // A trailing feed the shed loop emptied ships as a husk claiming zero items; drop it so
-    // the page only contains feeds that actually contributed. A feed that never had items
-    // (an error entry) gave everything it had, so it stays.
+    // the page only contains feeds that actually contributed. A feed that never had items (an
+    // error entry) gave everything it had, so *this* pass keeps it — but the two passes above
+    // can still have dropped it: the trim drops the stopping feed whole when nothing of it
+    // ships, and the shed loop pops a trailing feed ungated by `original_counts` when the page
+    // is still over budget. Either way the resume scan below recovers it as a named target.
     while let Some(last) = output.feeds.last() {
         let idx = output.feeds.len() - 1;
         if last.items.is_empty() && original_counts[idx] > 0 {
@@ -396,9 +430,11 @@ pub fn paginate(
     });
     let Some((feed_idx, item_idx)) = resume else {
         // Every feed is present carrying every one of its items, so there is no boundary to
-        // report and only the envelope is left to cut. Unreachable in practice — the trim
-        // always removes at least an item or a feed before this scan — but if it ever is
-        // reached, "nothing was deferred yet it still does not fit" is a genuine overflow.
+        // report and only the envelope is left to cut. This arm reads the other way round
+        // from the documented "zero items shipped" meaning of the error — but it is
+        // unreachable in practice (the trim always removes at least an item or a feed before
+        // this scan), so the documented invariant stands. If it ever is reached, "nothing was
+        // deferred yet it still does not fit" is a genuine overflow.
         return Err(too_large());
     };
 
@@ -406,7 +442,7 @@ pub fn paginate(
         feed_idx,
         item_idx,
         feed_item_count: original_counts[feed_idx],
-        items_omitted: original_items.saturating_sub(output.total_items),
+        items_omitted: original_items.saturating_sub(item_count(output)),
         feeds_omitted: original_counts.len().saturating_sub(output.feeds.len()),
     }))
 }
@@ -714,16 +750,88 @@ mod tests {
     }
 
     #[test]
+    fn paginate_ships_a_page_that_fits_even_when_a_later_feed_is_dropped() {
+        // Feed envelopes are charged per feed, when that feed's first item is admitted — not
+        // all up front. Charging every feed's envelope into the baseline (including feeds the
+        // trim then drops) inflated it by one envelope per URL, and the greedy pass rejected
+        // budgets that demonstrably fit: with two feeds it stopped at (0, 0) and raised
+        // ResponseTooLarge for any budget under `all-feeds baseline + first item`, discarding
+        // every successful fetch. The budget here is the measured cost of the state the page
+        // actually lands on — feed 0's envelope plus its first item — which is the smallest
+        // budget that can possibly ship anything, and sits inside that old false-Err window.
+        let mut target = output_with_feeds(&[2, 2]);
+        target.feeds.truncate(1);
+        target.feeds[0].items.truncate(1);
+        refresh_feed_counts(&mut target);
+        let budget = estimate_response_tokens(&target);
+
+        let mut out = output_with_feeds(&[2, 2]);
+        assert!(
+            estimate_response_tokens(&out) > budget,
+            "the fixture must be over budget for pagination to engage"
+        );
+
+        let stop = paginate(&mut out, budget)
+            .expect("a page that fits must not be rejected")
+            .expect("truncates");
+        assert!(item_count(&out) >= 1, "at least one item must ship");
+        assert!(
+            estimate_response_tokens(&out) <= budget,
+            "the shipped page must actually fit the budget"
+        );
+        assert_eq!(out.feeds.len(), 1, "feed 1 is deferred whole");
+        assert_eq!(out.feeds[0].items.len(), 1);
+        assert_eq!(stop.feed_idx, 0, "resume inside feed 0");
+        assert_eq!(stop.item_idx, 1);
+        assert_eq!(stop.feed_item_count, 2);
+        assert_eq!(stop.items_omitted, 3);
+        assert_eq!(stop.feeds_omitted, 1);
+    }
+
+    #[test]
+    fn paginate_still_errors_below_the_first_feeds_envelope_and_item() {
+        // The other side of the boundary above: charging envelopes incrementally must not
+        // soften the genuine ResponseTooLarge. A budget that cannot hold feed 0's envelope
+        // plus its first item still ships nothing, so it still errors — whether the greedy
+        // pass sees it up front (envelope-only budget) or the shed loop discovers it one
+        // token under the real landing cost.
+        let mut envelope_only = output_with_feeds(&[2, 2]);
+        envelope_only.feeds.truncate(1);
+        envelope_only.feeds[0].items.clear();
+        refresh_feed_counts(&mut envelope_only);
+        let envelope_budget = estimate_response_tokens(&envelope_only);
+
+        let mut landing = output_with_feeds(&[2, 2]);
+        landing.feeds.truncate(1);
+        landing.feeds[0].items.truncate(1);
+        refresh_feed_counts(&mut landing);
+        let landing_budget = estimate_response_tokens(&landing);
+
+        for budget in [envelope_budget, landing_budget - 1] {
+            let mut out = output_with_feeds(&[2, 2]);
+            let err = paginate(&mut out, budget).unwrap_err();
+            assert_eq!(
+                err.code(),
+                "RESPONSE_TOO_LARGE",
+                "budget {budget} cannot ship a single item, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
     fn paginate_sheds_whole_trailing_feeds() {
         // Two feeds of one item each; the budget only admits the first feed's item. It is the
-        // measured cost of exactly that state — both feed envelopes, feed 0's item, none of
-        // feed 1's — so the scenario is pinned by construction rather than by a fraction of
-        // the full payload that a wider `Item` could silently move out of the window.
+        // measured cost of exactly the state the page lands on — feed 0's envelope and its
+        // item, no trace of feed 1 — so the scenario is pinned by construction rather than by
+        // a fraction of the full payload that a wider `Item` could silently move out of the
+        // window. Measuring the landing state was impossible while every feed's envelope was
+        // charged up front: that baseline rejected this budget outright, so the test had to
+        // keep a feed envelope of slack by clearing feed 1's items instead of dropping it.
         let mut out = output_with(vec![item(false)]);
         with_second_feed(&mut out);
 
         let mut one_feed_shipped = out.clone();
-        one_feed_shipped.feeds[1].items.clear();
+        one_feed_shipped.feeds.truncate(1);
         refresh_feed_counts(&mut one_feed_shipped);
         let one_feed_budget = estimate_response_tokens(&one_feed_shipped);
 
@@ -731,6 +839,11 @@ mod tests {
             .expect("not an error")
             .expect("truncates");
         assert_eq!(out.feeds.len(), 1, "the trailing feed is dropped whole");
+        assert_eq!(
+            estimate_response_tokens(&out),
+            one_feed_budget,
+            "the page is exactly the state the budget was measured from"
+        );
         assert_eq!(stop.feed_idx, 1, "resume at the dropped feed");
         assert_eq!(stop.item_idx, 0);
         assert_eq!(stop.feeds_omitted, 1);
@@ -742,10 +855,12 @@ mod tests {
 
     #[test]
     fn paginate_resume_never_skips_a_feed_the_shed_loop_emptied() {
-        // Two feeds of two items. The budget is one token under the real cost of the state
-        // the greedy per-item pass admits (both of feed 0's items plus one of feed 1's), so
-        // the trailing-shed loop empties feed 1 after the fact. The resume position must
-        // point *into* feed 1, not past it — otherwise its items are silently lost.
+        // Two feeds of two items. The budget is one token under the real cost of [feed 0
+        // whole, one item of feed 1]. The greedy pass under-charges each item, so it believes
+        // all four fit and reports no stop at all; the `None` fallback then sheds feed 1's
+        // last item and the trailing-shed loop empties feed 1 entirely after the fact. The
+        // resume position must point *into* feed 1, not past it — otherwise its items are
+        // silently lost.
         let mut out = output_with(vec![item(false), item(false)]);
         with_second_feed(&mut out);
 
@@ -893,9 +1008,12 @@ mod tests {
 
     #[test]
     fn paginate_keeps_a_trailing_feed_that_never_had_items() {
-        // [2 items, none, 2 items]. One token under the state the greedy pass lands on, so
-        // the shed loop empties the last feed. The husk pass pops that husk but must KEEP the
-        // middle feed: it shipped everything it had (nothing), so it is data, not a husk.
+        // [2 items, none, 2 items]. One token under the real cost of [2, 0, 1]. The greedy
+        // pass believes everything fits — it under-charges items, and never charges the
+        // middle feed's envelope at all since no item admits it — so the `None` fallback
+        // sheds feed 2's last item and the shed loop empties the rest of it. The husk pass
+        // pops that husk but must KEEP the middle feed: it shipped everything it had
+        // (nothing), so it is data, not a husk.
         let mut over_shipped = output_with_feeds(&[2, 0, 2]);
         over_shipped.feeds[2].items.truncate(1);
         refresh_feed_counts(&mut over_shipped);
