@@ -31,6 +31,7 @@ pub mod mcp;
 pub mod model;
 pub mod output;
 pub mod parse;
+pub mod query;
 pub mod ratelimit;
 
 pub use error::{RssError, exit};
