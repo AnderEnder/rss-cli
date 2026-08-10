@@ -105,13 +105,125 @@ where
     }
 }
 
+/// Maximum URLs accepted by a single `fetch_feed` call. Bounds the blast radius of one
+/// request; larger sets should page via `truncation.next_cursor`.
+const MCP_MAX_URLS: usize = 50;
+
+/// Deserialize an optional list of URLs that may arrive as a JSON **array**, a JSON
+/// **string containing an array**, a newline/comma-separated **string**, or a single bare
+/// URL string. Clients that stringify every tool argument (see `de_lenient_opt_usize`) do
+/// the same to arrays, so a bare `Option<Vec<String>>` rejects `"[\"a\"]"`.
+///
+/// Empty entries are dropped; an empty result maps to `None` ("not supplied"). The tool
+/// schema still advertises `array of string` — schemars reads the field *type*.
+fn de_lenient_url_list<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    use serde::de::Error;
+
+    fn clean(items: Vec<String>) -> Option<Vec<String>> {
+        let out: Vec<String> = items
+            .into_iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        (!out.is_empty()).then_some(out)
+    }
+
+    match Option::<serde_json::Value>::deserialize(deserializer)? {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::Array(items)) => {
+            let mut out = Vec::with_capacity(items.len());
+            for v in items {
+                match v {
+                    serde_json::Value::String(s) => out.push(s),
+                    other => {
+                        return Err(Error::custom(format!(
+                            "expected a string URL in the list, got {other}"
+                        )));
+                    }
+                }
+            }
+            Ok(clean(out))
+        }
+        Some(serde_json::Value::String(s)) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                return Ok(None);
+            }
+            // A stringified JSON array from a client that serializes everything as text.
+            if trimmed.starts_with('[')
+                && let Ok(serde_json::Value::Array(items)) =
+                    serde_json::from_str::<serde_json::Value>(trimmed)
+            {
+                let mut out = Vec::with_capacity(items.len());
+                for v in items {
+                    match v {
+                        serde_json::Value::String(s) => out.push(s),
+                        other => {
+                            return Err(Error::custom(format!(
+                                "expected a string URL in the list, got {other}"
+                            )));
+                        }
+                    }
+                }
+                return Ok(clean(out));
+            }
+            // Otherwise: newline- or comma-separated, or a single bare URL.
+            Ok(clean(
+                trimmed
+                    .split(['\n', ','])
+                    .map(|s| s.to_string())
+                    .collect::<Vec<_>>(),
+            ))
+        }
+        Some(other) => Err(Error::custom(format!(
+            "expected an array of URLs or a delimited string, got {other}"
+        ))),
+    }
+}
+
+/// Resolve the effective URL list from the mutually exclusive `url` / `urls` arguments.
+///
+/// `url` is retained alongside `urls` for backward compatibility: renaming it would break
+/// every existing client configuration.
+fn resolve_urls(args: &FetchFeedArgs) -> Result<Vec<String>, RssError> {
+    let list = match (&args.url, &args.urls) {
+        (Some(_), Some(_)) => {
+            return Err(RssError::Usage(
+                "pass either 'url' (one feed) or 'urls' (many), not both".to_string(),
+            ));
+        }
+        (Some(u), None) => vec![u.trim().to_string()],
+        (None, Some(list)) => list.clone(),
+        (None, None) => {
+            return Err(RssError::Usage(
+                "missing required argument: pass 'url' (one feed) or 'urls' (many)".to_string(),
+            ));
+        }
+    };
+    if list.len() > MCP_MAX_URLS {
+        return Err(RssError::Usage(format!(
+            "too many feeds: {} exceeds the per-call cap of {MCP_MAX_URLS}; split the request",
+            list.len()
+        )));
+    }
+    Ok(list)
+}
+
 // === Tool argument structs (deserialized from MCP `arguments`; schema'd for clients) ===
 
 /// Arguments for the `fetch_feed` tool.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct FetchFeedArgs {
-    /// The RSS/Atom feed URL to fetch and parse.
-    url: String,
+    /// A single RSS/Atom feed URL. Mutually exclusive with `urls`; supply exactly one.
+    #[serde(default)]
+    url: Option<String>,
+    /// Feed URLs to fetch in one call (max 50). The server paces requests per host, so
+    /// prefer one batched call over several calls with your own delays between them.
+    #[serde(default, deserialize_with = "de_lenient_url_list")]
+    urls: Option<Vec<String>>,
     /// Content extraction format: `markdown` (default), `text`, `html`, or `none`.
     #[serde(default)]
     content_format: Option<String>,
@@ -292,6 +404,15 @@ impl ServerHandler for RssServer {
 /// unit-testable. Applies the default item cap, the per-item content cap, and the response
 /// budget, attaching a [`crate::model::TruncationInfo`] marker when content was truncated.
 async fn fetch_feed_inner(http: &HttpClient, cache: &Cache, args: FetchFeedArgs) -> CallToolResult {
+    // TODO(Task 4): this only uses the first resolved URL; batch handling over the full list
+    // is wired up in Task 4. Resolving here (rather than leaving `args.url` in place) keeps
+    // this task's `url`/`urls` argument surface independently testable and green.
+    let urls = match resolve_urls(&args) {
+        Ok(u) => u,
+        Err(e) => return tool_error_obj(&e, None),
+    };
+    let primary = urls[0].clone();
+
     let mut params = FetchParams::default();
     if let Some(cf) = args.content_format.as_deref() {
         match parse_content_format(cf) {
@@ -300,7 +421,7 @@ async fn fetch_feed_inner(http: &HttpClient, cache: &Cache, args: FetchFeedArgs)
                 return tool_error_code(
                     "USAGE_ERROR",
                     format!("invalid content_format '{cf}' (expected markdown|text|html|none)"),
-                    Some(&args.url),
+                    Some(&primary),
                 );
             }
         }
@@ -310,7 +431,7 @@ async fn fetch_feed_inner(http: &HttpClient, cache: &Cache, args: FetchFeedArgs)
     params.max_content_chars = args.max_content_chars;
 
     let mut out =
-        core::fetch_feeds_with(std::slice::from_ref(&args.url), &params, cache, http).await;
+        core::fetch_feeds_with(std::slice::from_ref(&primary), &params, cache, http).await;
 
     // Reject oversized results with an actionable error rather than letting the client trip
     // its own tool-result-too-large limit on an opaque failure.
@@ -332,10 +453,10 @@ async fn fetch_feed_inner(http: &HttpClient, cache: &Cache, args: FetchFeedArgs)
                 marker.estimated_tokens = Some(estimated);
                 out.truncation = Some(marker);
             }
-            let summary = fetch_summary(&out, &args.url);
+            let summary = fetch_summary(&out, &primary);
             structured_result(&out, summary)
         }
-        Err(e) => tool_error_obj(&e, Some(&args.url)),
+        Err(e) => tool_error_obj(&e, Some(&primary)),
     }
 }
 
@@ -579,7 +700,8 @@ mod tests {
 
     fn fetch_args(url: String) -> FetchFeedArgs {
         FetchFeedArgs {
-            url,
+            url: Some(url),
+            urls: None,
             content_format: None,
             limit: None,
             max_content_chars: None,
@@ -932,5 +1054,84 @@ mod tests {
         )
         .expect("stringified max_content_chars should deserialize");
         assert_eq!(args.max_content_chars, Some(1000));
+    }
+
+    #[test]
+    fn urls_arg_accepts_every_stringified_form() {
+        // Clients stringify every argument, so `urls` must survive the same abuse `limit` does.
+        let cases = [
+            r#"{"urls":["https://a/f","https://b/f"]}"#,
+            r#"{"urls":"[\"https://a/f\", \"https://b/f\"]"}"#,
+            r#"{"urls":"https://a/f\nhttps://b/f"}"#,
+            r#"{"urls":"https://a/f, https://b/f"}"#,
+        ];
+        for raw in cases {
+            let args: FetchFeedArgs =
+                serde_json::from_str(raw).unwrap_or_else(|e| panic!("{raw} should parse: {e}"));
+            assert_eq!(
+                args.urls.as_deref(),
+                Some(["https://a/f".to_string(), "https://b/f".to_string()].as_slice()),
+                "failed for {raw}"
+            );
+        }
+
+        // A single bare URL string is a one-element list.
+        let one: FetchFeedArgs = serde_json::from_str(r#"{"urls":"https://a/f"}"#).unwrap();
+        assert_eq!(
+            one.urls.as_deref(),
+            Some(["https://a/f".to_string()].as_slice())
+        );
+
+        // Absent, null, and empty all mean "not supplied".
+        for raw in [
+            r#"{"url":"u"}"#,
+            r#"{"urls":null}"#,
+            r#"{"urls":""}"#,
+            r#"{"urls":[]}"#,
+        ] {
+            let args: FetchFeedArgs = serde_json::from_str(raw).unwrap();
+            assert_eq!(args.urls, None, "failed for {raw}");
+        }
+    }
+
+    #[test]
+    fn resolve_urls_requires_exactly_one_of_url_or_urls() {
+        let mut args = fetch_args("https://a/f".to_string());
+        assert_eq!(
+            resolve_urls(&args).unwrap(),
+            vec!["https://a/f".to_string()]
+        );
+
+        // urls alone.
+        args.url = None;
+        args.urls = Some(vec!["https://a/f".into(), "https://b/f".into()]);
+        assert_eq!(resolve_urls(&args).unwrap().len(), 2);
+
+        // Both is ambiguous.
+        args.url = Some("https://a/f".into());
+        assert!(
+            resolve_urls(&args).is_err(),
+            "both url and urls must be rejected"
+        );
+
+        // Neither is a usage error.
+        args.url = None;
+        args.urls = None;
+        assert!(
+            resolve_urls(&args).is_err(),
+            "neither url nor urls must be rejected"
+        );
+
+        // Over the cap.
+        args.urls = Some(
+            (0..MCP_MAX_URLS + 1)
+                .map(|i| format!("https://a/{i}"))
+                .collect(),
+        );
+        let err = resolve_urls(&args).unwrap_err();
+        assert!(
+            err.to_string().contains(&MCP_MAX_URLS.to_string()),
+            "the error should name the cap: {err}"
+        );
     }
 }
