@@ -591,52 +591,16 @@ async fn fetch_feed_inner(http: &HttpClient, cache: &Cache, args: FetchFeedArgs)
         ],
     );
 
-    // A blank cursor is not a malformed one: clients that fill every advertised optional
-    // property with an empty string mean "no cursor", the same way `url: ""` means "not
-    // supplied" (see `resolve_urls`). Rejecting it would fail a plain page-1 request.
-    let mut resume: Option<crate::cursor::Cursor> = None;
-    if let Some(token) = args.cursor.as_deref().filter(|t| !t.trim().is_empty()) {
-        let c = match crate::cursor::Cursor::decode(token) {
-            Ok(c) => c,
-            Err(e) => return tool_error_obj(&e, Some(&primary)),
-        };
-        if c.fp != fp {
-            return tool_error_code(
-                "USAGE_ERROR",
-                "cursor does not match this request; pass the cursor back with the same \
-                 urls/content_format/since/limit/max_content_chars, or drop it to start over",
-                Some(&primary),
-            );
-        }
-        if c.f >= urls.len() {
-            return tool_error_code(
-                "USAGE_ERROR",
-                "cursor points past the end of this request's feed list",
-                Some(&primary),
-            );
-        }
-        // Reuse the page-1 cutoff so every page filters against one instant. An `s` that is
-        // not a representable instant would otherwise *widen* the window — dropping the cutoff
-        // entirely and returning items page 1 filtered out — so reject it instead.
-        if let Some(secs) = c.s {
-            match chrono::DateTime::from_timestamp(secs, 0) {
-                Some(dt) => params.since = Some(dt),
-                None => {
-                    return tool_error_code(
-                        "USAGE_ERROR",
-                        "invalid cursor: the recorded `since` cutoff is not a valid instant",
-                        Some(&primary),
-                    );
-                }
-            }
-        }
-        // A continuation is served from cache: feeds already fetched cost nothing, and feeds
-        // never reached fall through to the network on a cache miss (see `CachePolicy`). This
-        // deliberately overrides whatever `cache_policy` the caller passed — the body cache is
-        // the pagination store.
-        params.cache_policy = CachePolicy::CacheFirst;
-        resume = Some(c);
-    }
+    let resume = match resume_from_cursor(
+        args.cursor.as_deref(),
+        &fp,
+        urls.len(),
+        &primary,
+        &mut params,
+    ) {
+        Ok(r) => r,
+        Err(result) => return result,
+    };
 
     // `Cursor.f` always indexes the ORIGINAL request URL list; a continuation fetches
     // `urls[f..]`, so this page's feed 0 is `urls[f]`.
@@ -799,6 +763,64 @@ async fn fetch_feed_inner(http: &HttpClient, cache: &Cache, args: FetchFeedArgs)
 
     let summary = fetch_summary(&out, &primary);
     structured_result(&out, summary)
+}
+
+/// Validate the caller's `cursor` argument against this request and apply the state it records
+/// to `params`, returning the decoded position — or `None` when no cursor was supplied. `Err`
+/// carries a ready-to-return tool error.
+///
+/// Split out of [`fetch_feed_inner`] so that function reads as one sequence of batch steps
+/// while the continuation rules — and the reasons behind each rejection — live together here.
+fn resume_from_cursor(
+    token: Option<&str>,
+    fp: &str,
+    url_count: usize,
+    primary: &str,
+    params: &mut FetchParams,
+) -> Result<Option<crate::cursor::Cursor>, CallToolResult> {
+    // A blank cursor is not a malformed one: clients that fill every advertised optional
+    // property with an empty string mean "no cursor", the same way `url: ""` means "not
+    // supplied" (see `resolve_urls`). Rejecting it would fail a plain page-1 request.
+    let Some(token) = token.filter(|t| !t.trim().is_empty()) else {
+        return Ok(None);
+    };
+    let c = crate::cursor::Cursor::decode(token).map_err(|e| tool_error_obj(&e, Some(primary)))?;
+    if c.fp != fp {
+        return Err(tool_error_code(
+            "USAGE_ERROR",
+            "cursor does not match this request; pass the cursor back with the same \
+             urls/content_format/since/limit/max_content_chars, or drop it to start over",
+            Some(primary),
+        ));
+    }
+    if c.f >= url_count {
+        return Err(tool_error_code(
+            "USAGE_ERROR",
+            "cursor points past the end of this request's feed list",
+            Some(primary),
+        ));
+    }
+    // Reuse the page-1 cutoff so every page filters against one instant. An `s` that is
+    // not a representable instant would otherwise *widen* the window — dropping the cutoff
+    // entirely and returning items page 1 filtered out — so reject it instead.
+    if let Some(secs) = c.s {
+        match chrono::DateTime::from_timestamp(secs, 0) {
+            Some(dt) => params.since = Some(dt),
+            None => {
+                return Err(tool_error_code(
+                    "USAGE_ERROR",
+                    "invalid cursor: the recorded `since` cutoff is not a valid instant",
+                    Some(primary),
+                ));
+            }
+        }
+    }
+    // A continuation is served from cache: feeds already fetched cost nothing, and feeds
+    // never reached fall through to the network on a cache miss (see `CachePolicy`). This
+    // deliberately overrides whatever `cache_policy` the caller passed — the body cache is
+    // the pagination store.
+    params.cache_policy = CachePolicy::CacheFirst;
+    Ok(Some(c))
 }
 
 /// A one-line, human/agent-readable summary of a `fetch_feed` result. Kept terse on purpose:
