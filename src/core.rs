@@ -91,6 +91,21 @@ fn populate_totals(output: &mut FetchOutput) {
         .sum();
 }
 
+/// Recompute every derived count — per-feed `item_count`/`content_tokens_est_total` and the
+/// top-level totals — from the items actually present. Called after any trim so no contract
+/// field is left describing items that were shed.
+fn refresh_feed_counts(output: &mut FetchOutput) {
+    for feed in &mut output.feeds {
+        feed.item_count = feed.items.len();
+        feed.content_tokens_est_total = feed
+            .items
+            .iter()
+            .map(|i| u64::from(i.content_tokens_est))
+            .sum();
+    }
+    populate_totals(output);
+}
+
 /// Fetch and parse a single feed, returning the [`FeedResult`] plus any non-fatal
 /// [`Warning`]s the parse surfaced (e.g. a content-extraction fallback). Callers aggregate
 /// the warnings into [`FetchOutput::warnings`].
@@ -183,8 +198,20 @@ pub fn enforce_response_budget(
     if estimated <= budget_tokens {
         return Ok(estimated);
     }
+    Err(too_large_error(
+        estimated,
+        budget_tokens,
+        item_count(output),
+    ))
+}
 
-    let n = item_count(output).max(1);
+/// Build the [`RssError::ResponseTooLarge`] for a payload of `estimated` tokens holding
+/// `items` items, with concrete retry suggestions the calling agent can act on.
+///
+/// Split out of [`enforce_response_budget`] so [`paginate`] can raise the same error from the
+/// *pre-trim* measurements after it has already mutated `output`.
+fn too_large_error(estimated: usize, budget_tokens: usize, items: usize) -> RssError {
+    let n = items.max(1);
     // Scale the item cap down by how far over budget we are, with a 10% safety margin.
     let suggested_limit = (((n as f64) * (budget_tokens as f64) / (estimated as f64)) * 0.9)
         .floor()
@@ -194,12 +221,165 @@ pub fn enforce_response_budget(
     let content_budget_tokens = budget_tokens * 7 / 10;
     let suggested_max_content_chars = (content_budget_tokens.saturating_mul(4) / n).max(200);
 
-    Err(RssError::ResponseTooLarge {
+    RssError::ResponseTooLarge {
         estimated_tokens: estimated,
         budget_tokens,
         suggested_limit,
         suggested_max_content_chars,
-    })
+    }
+}
+
+/// Where a truncated page stopped, so the caller can mint a continuation cursor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PageStop {
+    /// Index into the **pre-trim** feed list — equivalently, into the request URL list —
+    /// where the next page resumes. May be `>= output.feeds.len()` once trimming has dropped
+    /// feeds, so do not use it to index the trimmed `output.feeds`.
+    pub feed_idx: usize,
+    /// Index into that feed's **pre-trim** item list where the next page resumes. Always
+    /// `< feed_item_count`, so a continuation never has to treat it as "advance to the next
+    /// feed".
+    pub item_idx: usize,
+    /// How many items the resumed feed held before shedding, for roll detection.
+    pub feed_item_count: usize,
+    pub items_omitted: usize,
+    pub feeds_omitted: usize,
+}
+
+/// Trim `output` in place to fit `budget_tokens`, returning where the next page resumes.
+///
+/// This is the **fill** counterpart to [`enforce_response_budget`]'s **reject**. With a
+/// batch of URLs, rejecting would discard every successful network fetch because one
+/// trailing item overflowed, and the retry would re-hit every host (ADR-0017).
+///
+/// Returns `Ok(None)` when everything fits, `Ok(Some(stop))` when the page was trimmed, and
+/// `Err(ResponseTooLarge)` only when the page cannot make progress — a *single* item that
+/// does not fit on its own, or an envelope already over budget with no items to shed. Those
+/// are the cases pagination cannot resolve; returning a stop for them would mint a cursor
+/// identical to the request start and loop the caller forever.
+pub fn paginate(
+    output: &mut FetchOutput,
+    budget_tokens: usize,
+) -> Result<Option<PageStop>, RssError> {
+    let estimated = estimate_response_tokens(output);
+    if estimated <= budget_tokens {
+        return Ok(None);
+    }
+
+    let original_counts: Vec<usize> = output.feeds.iter().map(|f| f.items.len()).collect();
+    let original_items: usize = original_counts.iter().sum();
+    // Measured before any trimming, so the suggestions describe the payload the caller asked
+    // for rather than the reduced one.
+    let too_large = || too_large_error(estimated, budget_tokens, original_items);
+
+    if original_items == 0 {
+        // Nothing to shed: the envelope alone (feed metadata, errors, warnings) is over
+        // budget, which no amount of paging can fix.
+        return Err(too_large());
+    }
+
+    // Cost of the envelope with no items at all: feed metadata, errors, warnings, totals.
+    let mut skeleton = output.clone();
+    for feed in &mut skeleton.feeds {
+        feed.items.clear();
+    }
+    refresh_feed_counts(&mut skeleton);
+    let base = estimate_response_tokens(&skeleton);
+
+    // Greedily admit items in (feed, item) order until the next one would overflow.
+    let mut running = base;
+    let mut stop: Option<(usize, usize)> = None;
+    'outer: for (fi, feed) in output.feeds.iter().enumerate() {
+        for (ii, it) in feed.items.iter().enumerate() {
+            let cost = serde_json::to_string_pretty(it)
+                .map(|s| s.chars().count().div_ceil(4))
+                .unwrap_or(0)
+                + 2; // array punctuation and indentation between elements
+            if running + cost > budget_tokens {
+                stop = Some((fi, ii));
+                break 'outer;
+            }
+            running += cost;
+        }
+    }
+
+    let (stop_feed, stop_item) = match stop {
+        // The greedy estimate says everything fits even though the real estimate did not;
+        // shed the final item so we always make progress.
+        None => {
+            let last = output.feeds.len().saturating_sub(1);
+            (last, output.feeds[last].items.len().saturating_sub(1))
+        }
+        Some(pos) => pos,
+    };
+
+    if stop_feed == 0 && stop_item == 0 {
+        // Not even the first item fits. This is the genuine ResponseTooLarge case.
+        return Err(too_large());
+    }
+
+    // Trim: truncate the stopping feed, drop every feed after it, and drop the stopping
+    // feed entirely when it contributes nothing.
+    output.feeds[stop_feed].items.truncate(stop_item);
+    output
+        .feeds
+        .truncate(stop_feed + usize::from(stop_item > 0));
+    refresh_feed_counts(output);
+
+    // The per-item estimate is approximate — an item costs more nested inside the response
+    // than pretty-printed on its own — so shed trailing items until the real estimate fits.
+    while estimate_response_tokens(output) > budget_tokens {
+        let Some(feed) = output.feeds.last_mut() else {
+            break;
+        };
+        if feed.items.pop().is_none() {
+            output.feeds.pop();
+            continue;
+        }
+        refresh_feed_counts(output);
+    }
+
+    // A trailing feed the shed loop emptied ships as a husk claiming zero items; drop it so
+    // the page only contains feeds that actually contributed. A feed that never had items
+    // (an error entry) gave everything it had, so it stays.
+    while let Some(last) = output.feeds.last() {
+        let idx = output.feeds.len() - 1;
+        if last.items.is_empty() && original_counts[idx] > 0 {
+            output.feeds.pop();
+        } else {
+            break;
+        }
+    }
+    refresh_feed_counts(output);
+
+    // Resume at the first position that did not ship. Shipped positions are always a prefix
+    // of the flattened (feed, item) sequence — the greedy pass admits in order, the trim
+    // keeps a prefix, and shedding only pops the tail — so the first gap *is* the boundary.
+    // Deriving both fields from this one scan is what keeps `feed_item_count` describing the
+    // same feed as `feed_idx` even when shedding dropped back into an earlier feed.
+    let resume = original_counts
+        .iter()
+        .enumerate()
+        .find_map(|(idx, &count)| {
+            let shipped = output.feeds.get(idx).map_or(0, |f| f.items.len());
+            (shipped < count).then_some((idx, shipped))
+        });
+    let Some((feed_idx, item_idx)) = resume else {
+        // Every item shipped and it still does not fit: only the envelope is left to cut.
+        return Err(too_large());
+    };
+    if (feed_idx, item_idx) == (0, 0) {
+        // Shedding left nothing to ship — a single item too large to stand on its own.
+        return Err(too_large());
+    }
+
+    Ok(Some(PageStop {
+        feed_idx,
+        item_idx,
+        feed_item_count: original_counts[feed_idx],
+        items_omitted: original_items.saturating_sub(output.total_items),
+        feeds_omitted: original_counts.len().saturating_sub(output.feeds.len()),
+    }))
 }
 
 /// Build the [`TruncationInfo`] marker for `output`, or `None` when nothing was actually
@@ -231,6 +411,8 @@ pub fn truncation_marker(
         applied_limit,
         items_content_truncated,
         items_omitted: 0,
+        feeds_omitted: 0,
+        next_cursor: None,
         estimated_tokens: None,
         suggestion,
     })
@@ -420,5 +602,154 @@ mod tests {
         assert_eq!(m.items_content_truncated, 1);
         assert_eq!(m.items_omitted, 0);
         assert_eq!(m.suggestion.as_deref(), Some("hint"));
+    }
+
+    /// Append a second feed (same items, different url) to a single-feed fixture.
+    fn with_second_feed(out: &mut FetchOutput) {
+        let second = out.feeds[0].clone();
+        out.feeds.push(FeedResult {
+            feed_url: "https://example.com/two.xml".to_string(),
+            ..second
+        });
+        populate_totals(out);
+    }
+
+    #[test]
+    fn paginate_returns_everything_when_it_fits() {
+        let mut out = output_with(vec![item(false), item(false)]);
+        assert!(paginate(&mut out, 100_000).expect("fits").is_none());
+        assert_eq!(out.feeds[0].items.len(), 2, "nothing should be shed");
+    }
+
+    #[test]
+    fn paginate_fills_to_budget_and_reports_where_to_resume() {
+        let mut out = output_with(vec![item(false), item(false), item(false), item(false)]);
+        let full = estimate_response_tokens(&out);
+        // A budget around half the full payload must keep some items and shed the rest.
+        let stop = paginate(&mut out, full / 2)
+            .expect("not an error")
+            .expect("should truncate");
+
+        let kept = out.feeds[0].items.len();
+        assert!(kept >= 1, "at least one item must ship");
+        assert!(kept < 4, "some items must be shed");
+        assert_eq!(stop.feed_idx, 0);
+        assert_eq!(
+            stop.item_idx, kept,
+            "resume exactly after the last shipped item"
+        );
+        assert_eq!(
+            stop.feed_item_count, 4,
+            "record the pre-shed count for roll detection"
+        );
+        assert_eq!(stop.items_omitted, 4 - kept);
+        assert!(
+            estimate_response_tokens(&out) <= full / 2,
+            "the shipped page must actually fit the budget"
+        );
+        // Per-feed counts follow the shipped items.
+        assert_eq!(out.feeds[0].item_count, kept);
+        assert_eq!(out.total_items, kept);
+    }
+
+    #[test]
+    fn paginate_errors_only_when_a_single_item_cannot_fit() {
+        let mut out = output_with(vec![item(false)]);
+        let err = paginate(&mut out, 1).unwrap_err();
+        assert!(
+            matches!(err, RssError::ResponseTooLarge { .. }),
+            "one oversized item is the only case pagination cannot fix, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn paginate_sheds_whole_trailing_feeds() {
+        // Two feeds; the budget only admits the first feed's item. 70% of the full payload
+        // sits inside the window that admits exactly one of the two items: the envelope plus
+        // one item costs ~62% of the full payload, plus two items ~85%.
+        let mut out = output_with(vec![item(false)]);
+        with_second_feed(&mut out);
+        let one_feed_budget = estimate_response_tokens(&out) * 7 / 10;
+
+        let stop = paginate(&mut out, one_feed_budget)
+            .expect("not an error")
+            .expect("truncates");
+        assert_eq!(out.feeds.len(), 1, "the trailing feed is dropped whole");
+        assert_eq!(stop.feed_idx, 1, "resume at the dropped feed");
+        assert_eq!(stop.item_idx, 0);
+        assert_eq!(stop.feeds_omitted, 1);
+        assert_eq!(
+            stop.feed_item_count, 1,
+            "the count describes the resumed feed"
+        );
+    }
+
+    #[test]
+    fn paginate_resume_never_skips_a_feed_the_shed_loop_emptied() {
+        // Two feeds of two items. The budget is one token under the real cost of the state
+        // the greedy per-item pass admits (both of feed 0's items plus one of feed 1's), so
+        // the trailing-shed loop empties feed 1 after the fact. The resume position must
+        // point *into* feed 1, not past it — otherwise its items are silently lost.
+        let mut out = output_with(vec![item(false), item(false)]);
+        with_second_feed(&mut out);
+
+        let mut over_shipped = out.clone();
+        over_shipped.feeds[1].items.truncate(1);
+        refresh_feed_counts(&mut over_shipped);
+        let budget = estimate_response_tokens(&over_shipped) - 1;
+
+        let stop = paginate(&mut out, budget)
+            .expect("not an error")
+            .expect("truncates");
+        assert_eq!(
+            out.feeds.len(),
+            1,
+            "a trailing feed that ships nothing is dropped, not shipped as an empty husk"
+        );
+        assert_eq!(out.feeds[0].items.len(), 2, "feed 0 ships whole");
+        assert_eq!(stop.feed_idx, 1, "resume in the emptied feed, not past it");
+        assert_eq!(stop.item_idx, 0);
+        assert_eq!(stop.feed_item_count, 2, "the count describes feed 1");
+        assert_eq!(stop.items_omitted, 2, "both of feed 1's items are omitted");
+        assert_eq!(stop.feeds_omitted, 1);
+        assert!(
+            estimate_response_tokens(&out) <= budget,
+            "the page must fit"
+        );
+    }
+
+    #[test]
+    fn paginate_errors_when_shedding_leaves_nothing_to_ship() {
+        // The greedy per-item estimate under-counts (an item nested in the response costs
+        // more than pretty-printed on its own), so a budget just under one real item's cost
+        // admits an item that the re-estimate then sheds. Shipping an empty page would mint
+        // a cursor identical to the request start and loop the caller forever.
+        let one_item = estimate_response_tokens(&output_with(vec![item(false)]));
+        let mut out = output_with(vec![item(false), item(false)]);
+        let err = paginate(&mut out, one_item - 1).unwrap_err();
+        assert!(
+            matches!(err, RssError::ResponseTooLarge { .. }),
+            "a page that ships nothing must be an error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn paginate_errors_when_the_envelope_alone_is_over_budget() {
+        // No items to shed: pagination cannot help, so say so instead of indexing into an
+        // empty feed list.
+        let mut empty = FetchOutput::new("2026-06-01T00:00:00Z".to_string());
+        let err = paginate(&mut empty, 1).unwrap_err();
+        assert!(
+            matches!(err, RssError::ResponseTooLarge { .. }),
+            "an over-budget envelope is not paginable, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn paginate_accepts_an_output_exactly_at_budget() {
+        let mut out = output_with(vec![item(false), item(false)]);
+        let exact = estimate_response_tokens(&out);
+        assert!(paginate(&mut out, exact).expect("fits").is_none());
+        assert_eq!(out.feeds[0].items.len(), 2);
     }
 }
