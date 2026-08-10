@@ -22,6 +22,7 @@ pub mod cli;
 pub mod config;
 pub mod content;
 pub mod core;
+pub mod cursor;
 pub mod discover;
 pub mod error;
 pub mod fetch;
