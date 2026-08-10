@@ -110,9 +110,12 @@ where
 const MCP_MAX_URLS: usize = 50;
 
 /// Deserialize an optional list of URLs that may arrive as a JSON **array**, a JSON
-/// **string containing an array**, a newline/comma-separated **string**, or a single bare
-/// URL string. Clients that stringify every tool argument (see `de_lenient_opt_usize`) do
-/// the same to arrays, so a bare `Option<Vec<String>>` rejects `"[\"a\"]"`.
+/// **string containing an array**, a newline-separated **string**, a comma-separated
+/// **string** (only when every resulting piece is itself an absolute `http(s)` URL — a
+/// bare comma-separated list would otherwise clash with commas inside a query string), or
+/// a single bare URL string. Clients that stringify every tool argument (see
+/// `de_lenient_opt_usize`) do the same to arrays, so a bare `Option<Vec<String>>` rejects
+/// `"[\"a\"]"`.
 ///
 /// Empty entries are dropped; an empty result maps to `None` ("not supplied"). The tool
 /// schema still advertises `array of string` — schemars reads the field *type*.
@@ -131,22 +134,24 @@ where
         (!out.is_empty()).then_some(out)
     }
 
+    fn strings_from_json_array<E>(items: Vec<serde_json::Value>) -> Result<Vec<String>, E>
+    where
+        E: serde::de::Error,
+    {
+        items
+            .into_iter()
+            .map(|v| match v {
+                serde_json::Value::String(s) => Ok(s),
+                other => Err(E::custom(format!(
+                    "expected a string URL in the list, got {other}"
+                ))),
+            })
+            .collect()
+    }
+
     match Option::<serde_json::Value>::deserialize(deserializer)? {
         None | Some(serde_json::Value::Null) => Ok(None),
-        Some(serde_json::Value::Array(items)) => {
-            let mut out = Vec::with_capacity(items.len());
-            for v in items {
-                match v {
-                    serde_json::Value::String(s) => out.push(s),
-                    other => {
-                        return Err(Error::custom(format!(
-                            "expected a string URL in the list, got {other}"
-                        )));
-                    }
-                }
-            }
-            Ok(clean(out))
-        }
+        Some(serde_json::Value::Array(items)) => Ok(clean(strings_from_json_array(items)?)),
         Some(serde_json::Value::String(s)) => {
             let trimmed = s.trim();
             if trimmed.is_empty() {
@@ -157,18 +162,7 @@ where
                 && let Ok(serde_json::Value::Array(items)) =
                     serde_json::from_str::<serde_json::Value>(trimmed)
             {
-                let mut out = Vec::with_capacity(items.len());
-                for v in items {
-                    match v {
-                        serde_json::Value::String(s) => out.push(s),
-                        other => {
-                            return Err(Error::custom(format!(
-                                "expected a string URL in the list, got {other}"
-                            )));
-                        }
-                    }
-                }
-                return Ok(clean(out));
+                return Ok(clean(strings_from_json_array(items)?));
             }
             // Otherwise: newline-separated, comma-separated, or a single bare URL.
             // Newlines can never appear inside a URL, so splitting on them is always safe.
@@ -203,20 +197,32 @@ where
 /// `url` is retained alongside `urls` for backward compatibility: renaming it would break
 /// every existing client configuration.
 fn resolve_urls(args: &FetchFeedArgs) -> Result<Vec<String>, RssError> {
+    let missing = || {
+        RssError::Usage(
+            "missing required argument: pass 'url' (one feed) or 'urls' (many)".to_string(),
+        )
+    };
     let list = match (&args.url, &args.urls) {
         (Some(_), Some(_)) => {
             return Err(RssError::Usage(
                 "pass either 'url' (one feed) or 'urls' (many), not both".to_string(),
             ));
         }
-        (Some(u), None) => vec![u.trim().to_string()],
-        (None, Some(list)) => list.clone(),
-        (None, None) => {
-            return Err(RssError::Usage(
-                "missing required argument: pass 'url' (one feed) or 'urls' (many)".to_string(),
-            ));
+        (Some(u), None) => {
+            let trimmed = u.trim();
+            if trimmed.is_empty() {
+                Vec::new()
+            } else {
+                vec![trimmed.to_string()]
+            }
         }
+        (None, Some(list)) => list.clone(),
+        (None, None) => return Err(missing()),
     };
+    // Guarded here, not borrowed from the deserializer: callers index `list[0]`.
+    if list.is_empty() {
+        return Err(missing());
+    }
     if list.len() > MCP_MAX_URLS {
         return Err(RssError::Usage(format!(
             "too many feeds: {} exceeds the per-call cap of {MCP_MAX_URLS}; split the request",
@@ -1124,6 +1130,12 @@ mod tests {
             let args: FetchFeedArgs = serde_json::from_str(raw).unwrap();
             assert_eq!(args.urls, None, "failed for {raw}");
         }
+
+        // A non-string element in the array is a hard error, not a silent skip.
+        assert!(
+            serde_json::from_str::<FetchFeedArgs>(r#"{"urls":[1,2]}"#).is_err(),
+            "non-string array elements must be rejected"
+        );
     }
 
     #[test]
@@ -1154,7 +1166,16 @@ mod tests {
             "neither url nor urls must be rejected"
         );
 
+        // A whitespace-only `url` is the same as not supplying one.
+        args.url = Some("   ".into());
+        args.urls = None;
+        assert!(
+            resolve_urls(&args).is_err(),
+            "a whitespace-only url must be rejected"
+        );
+
         // Over the cap.
+        args.url = None;
         args.urls = Some(
             (0..MCP_MAX_URLS + 1)
                 .map(|i| format!("https://a/{i}"))
