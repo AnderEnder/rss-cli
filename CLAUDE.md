@@ -48,8 +48,8 @@ A single core powers both the CLI and the MCP server, so the two front-ends cann
 |------|----------------|
 | `src/model.rs` | **The output contract.** Serialized types + `schemars` derives. The AI-facing API — treat field names as stable ([ADR-0006](./docs/adr/0006-ai-facing-output-contract.md)). |
 | `src/error.rs` | `RssError`, stable `code()` strings, and the `exit` code constants. |
-| `src/config.rs` | `FetchParams` + `CachePolicy` (the *runtime* params, not serialized). |
-| `src/core.rs` | Orchestration: concurrent fetch (`buffer_unordered`), `fetch_one`, `discover_feeds`, `show_item`, `exit_code_for`. **CLI and MCP both call into here.** |
+| `src/config.rs` | `FetchParams` + `CachePolicy` (the *runtime* params, not serialized); `parse_since`/`parse_duration`/`parse_cache_policy` (shared by the CLI and MCP); `FetchParams::deadline` bounds a batch's wall-clock budget ([ADR-0017](./docs/adr/0017-batch-fetch-and-cursor-pagination.md)). |
+| `src/core.rs` | Orchestration: concurrent fetch (`buffer_unordered`) via `fetch_feeds`/`fetch_feeds_with`, `fetch_one`, `discover_feeds`/`discover_feeds_with`, `show_item`/`show_item_with`, `exit_code_for`; `paginate`/`PageStop` fill a `FetchOutput` to a token budget for MCP cursor pagination ([ADR-0017](./docs/adr/0017-batch-fetch-and-cursor-pagination.md)). **CLI and MCP both call into here.** |
 | `src/fetch.rs` | `HttpClient`: reqwest + conditional GET, the `CachePolicy` state machine ([ADR-0005](./docs/adr/0005-conditional-get-always-revalidate-default.md)); routes every send through the per-host gate ([ADR-0016](./docs/adr/0016-per-host-request-gate.md)). |
 | `src/ratelimit.rs` | `HostGate`: shared per-host (authority) concurrency cap + adaptive cooldown for concurrent fetches ([ADR-0016](./docs/adr/0016-per-host-request-gate.md)). Lives inside a *reused* `HttpClient`. |
 | `src/cache.rs` | Atomic file cache (`<hash>.json` + `<hash>.body`) ([ADR-0004](./docs/adr/0004-file-based-atomic-cache.md)). |
@@ -58,7 +58,8 @@ A single core powers both the CLI and the MCP server, so the two front-ends cann
 | `src/content.rs` | HTML → markdown/text/html/none + `content_tokens_est` ([ADR-0009](./docs/adr/0009-html-to-markdown-htmd-html2text.md)). |
 | `src/discover.rs` | `<link rel=alternate>` autodiscovery via `tl`. |
 | `src/output.rs` | `json`/`ndjson`/`text` rendering; `schema_for` (schema emission). |
-| `src/mcp.rs` | `rmcp` stdio server; tools delegate to `core`. |
+| `src/cursor.rs` | Opaque stateless continuation cursors for paginated `fetch_feed` responses ([ADR-0017](docs/adr/0017-batch-fetch-and-cursor-pagination.md)). |
+| `src/mcp.rs` | `rmcp` stdio server; tools delegate to `core`; batches `urls[]`, mints/consumes continuation cursors, and enforces the response-token budget and batch deadline ([ADR-0017](./docs/adr/0017-batch-fetch-and-cursor-pagination.md)). |
 | `src/cli.rs` / `src/main.rs` | clap surface; dispatch; exit-code mapping; stderr `tracing`. |
 | `tests/` | Integration tests (`assert_cmd`, `mockito`, `insta`) + `fixtures/`. |
 
@@ -80,11 +81,15 @@ A single core powers both the CLI and the MCP server, so the two front-ends cann
    all-failed. Defined in `error.rs::exit`; mapped in `main.rs`.
 6. **CLI and MCP share `core.rs`.** Add behavior in the core and expose it from both
    front-ends; don't fork logic into `mcp.rs` or `cli.rs`.
-7. **MCP responses are size-bounded.** `fetch_feed` defaults to `limit=25` and rejects
-   over-budget results with a structured `RESPONSE_TOO_LARGE` error (carrying suggested
-   `limit`/`max_content_chars`); every MCP tool error is structured `ErrorObj` JSON, never
-   a bare string. Don't return an unbounded `FetchOutput` or a plain-text tool error. See
-   [ADR-0011](docs/adr/0011-bounded-mcp-responses.md).
+7. **MCP responses are size-bounded.** `fetch_feed` defaults to `limit=25` and *fills* the
+   response up to `max_response_tokens` rather than rejecting outright — an over-budget batch
+   ships whatever fits plus `truncation.next_cursor`, and the caller pages the rest
+   ([ADR-0017](docs/adr/0017-batch-fetch-and-cursor-pagination.md)). `RESPONSE_TOO_LARGE` now
+   fires only when not even one item can be placed in the budget (one oversized item, or an
+   envelope with nothing left to shed) — `get_item`'s single-item guard is unchanged, since
+   there is only ever one item to place there. Every MCP tool error is structured `ErrorObj`
+   JSON, never a bare string. Don't return an unbounded `FetchOutput` or a plain-text tool
+   error. See [ADR-0011](docs/adr/0011-bounded-mcp-responses.md).
 8. **MCP data tools return structured content, not duplicated text.** `fetch_feed` /
    `get_item` / `discover_feeds` put the payload in `structuredContent` (matching the tool's
    generated `outputSchema`) with only a one-line summary in text — never the full payload as
@@ -94,7 +99,10 @@ A single core powers both the CLI and the MCP server, so the two front-ends cann
    byte-reproducible, since `fetched_at`/`status`/`from_cache` vary). `total_items`,
    `total_content_tokens_est`, per-feed counts, `content_hash`, and `warnings` are **additive**
    contract fields computed in `core` (so CLI and MCP stay in sync); `warnings` is kept rare
-   on purpose. See [ADR-0012](docs/adr/0012-deterministic-ordering-and-output-enrichments.md).
+   on purpose. `feeds[]` is also a contiguous **prefix** of the request URL list — a batch
+   deadline may legitimately shorten it, but must never leave a gap, because the MCP cursor's
+   position indexes into that same list ([ADR-0017](docs/adr/0017-batch-fetch-and-cursor-pagination.md)).
+   See [ADR-0012](docs/adr/0012-deterministic-ordering-and-output-enrichments.md).
 10. **Item lookup is multi-key and cache-first.** `core::show_item` (`rss show` / MCP
     `get_item`) matches an item by `id` **or** `guid` **or** resolved `url`, and reads
     cache-first by default so an item the caller already saw survives a rolled feed window
@@ -103,6 +111,12 @@ A single core powers both the CLI and the MCP server, so the two front-ends cann
     `retry_after` in the error `details`
     ([ADR-0015](docs/adr/0015-bounded-retry-on-transient-429-403.md)). Both are **additive** —
     `SCHEMA_VERSION` stays `"1"`.
+11. **MCP pagination is stateless and cache-backed.** A continuation `cursor` carries the
+    position, a fingerprint of the *raw* request arguments, and the *resolved* `since`
+    cutoff; the call forces `CachePolicy::CacheFirst` so the existing body cache is the
+    pagination store. Don't add a server-side result store, and don't fingerprint the
+    resolved `since` — a relative window resolves differently on every call, so every
+    continuation would mismatch ([ADR-0017](docs/adr/0017-batch-fetch-and-cursor-pagination.md)).
 
 ## Gotchas (these already bit — don't relearn them)
 
@@ -152,6 +166,21 @@ A single core powers both the CLI and the MCP server, so the two front-ends cann
   insert-and-clone the `Arc<HostSlot>`, then drops the guard; all waiting uses the per-slot
   semaphore + atomic deadlines. Holding the `std::sync::Mutex` across a sleep would stall the
   runtime. (Also: `tokio` needs the `"sync"` feature for `Semaphore`.)
+- **MCP clients stringify array arguments too.** `urls` accepts a JSON array, a stringified
+  JSON array, or a delimited string via `de_lenient_url_list` — the same liberality
+  `de_lenient_opt_usize` gives numbers. Pinned by `urls_arg_accepts_every_stringified_form`.
+- **`fetch_feed`'s `limit` is per feed, not per batch.** A 10-URL call assembles up to
+  10 x limit candidates and lets the response budget page them. Don't "fix" this by scaling
+  the cap down by feed count — that silently returns fewer items than the same single-URL
+  call would.
+- **`core::pretty_tokens` must never over-estimate.** It deliberately under-counts (a flat
+  `+ 2` regardless of real nesting cost) so `paginate`'s greedy running total stays a
+  provable *lower bound* on the real serialized payload — a greedy rejection then implies a
+  real one. Raising the constant to "improve accuracy" lets the greedy total exceed the real
+  cost and rejects pages that would actually have fit
+  ([ADR-0017](docs/adr/0017-batch-fetch-and-cursor-pagination.md)). Pinned by
+  `paginate_ships_a_page_that_fits_even_when_a_later_feed_is_dropped` and
+  `paginate_still_errors_below_the_first_feeds_envelope_and_item`.
 
 ## Non-goals (v1)
 
