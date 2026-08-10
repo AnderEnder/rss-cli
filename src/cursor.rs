@@ -145,6 +145,14 @@ mod tests {
             err.contains("version"),
             "should name the version problem: {err}"
         );
+
+        // Valid base64 and valid JSON, but missing required fields.
+        let truncated = URL_SAFE_NO_PAD.encode(br#"{"v":1,"fp":"abc"}"#);
+        let err = Cursor::decode(&truncated).unwrap_err().to_string();
+        assert!(
+            err.contains("malformed payload"),
+            "a payload missing required fields must be rejected as malformed: {err}"
+        );
     }
 
     #[test]
