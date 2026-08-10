@@ -36,9 +36,20 @@ pub async fn fetch_feeds(urls: &[String], params: &FetchParams, cache: &Cache) -
     fetch_feeds_with(urls, params, cache, &http).await
 }
 
+/// One feed's outcome plus the warnings its parse raised, tagged with the feed's index into the
+/// request URL list so request order survives the completion-ordered stream. `None` marks a feed
+/// that was never attempted because the batch deadline had passed.
+type IndexedFetch = (usize, Option<(FeedResult, Vec<Warning>)>);
+
 /// Fetch many feeds concurrently through a **caller-provided** [`HttpClient`]. The MCP server
 /// builds the client once and shares it across tool calls so their per-host pacing coordinates
 /// (ADR-0016); [`fetch_feeds`] is the thin wrapper that builds a client per call for the CLI.
+///
+/// With [`FetchParams::deadline`] set, this is a **soft** wall-clock bound: a fetch already in
+/// flight runs to completion (bounded separately by the request timeout), but no new one starts
+/// once the deadline has passed. The feeds left unattempted are reported in
+/// [`FetchOutput::truncation`] as `feeds_omitted` rather than fabricated as errors — they did
+/// not fail, they were never tried.
 pub async fn fetch_feeds_with(
     urls: &[String],
     params: &FetchParams,
@@ -46,29 +57,50 @@ pub async fn fetch_feeds_with(
     http: &HttpClient,
 ) -> FetchOutput {
     let mut output = FetchOutput::new(now_rfc3339());
+    let stop_at = params.deadline.map(|d| tokio::time::Instant::now() + d);
 
     // Tag each task with its input index so we can restore request order after the
     // completion-ordered `buffer_unordered` stream — `feeds[]`/`errors[]` are then
     // deterministic within a run (an agent can address feeds by position). See ADR-0012.
-    let mut results: Vec<(usize, FeedResult, Vec<Warning>)> =
-        stream::iter(urls.iter().cloned().enumerate())
-            .map(|(idx, url)| async move {
-                match fetch_one(&url, http, params, cache).await {
-                    Ok((fr, warnings)) => (idx, fr, warnings),
-                    Err(e) => (
-                        idx,
+    let mut results: Vec<IndexedFetch> = stream::iter(urls.iter().cloned().enumerate())
+        .map(|(idx, url)| async move {
+            if let Some(t) = stop_at
+                && tokio::time::Instant::now() >= t
+            {
+                return (idx, None);
+            }
+            match fetch_one(&url, http, params, cache).await {
+                Ok((fr, warnings)) => (idx, Some((fr, warnings))),
+                Err(e) => (
+                    idx,
+                    Some((
                         FeedResult::error(url.clone(), e.to_error_obj(Some(&url))),
                         Vec::new(),
-                    ),
-                }
-            })
-            .buffer_unordered(params.concurrency.max(1))
-            .collect()
-            .await;
+                    )),
+                ),
+            }
+        })
+        .buffer_unordered(params.concurrency.max(1))
+        .collect()
+        .await;
 
-    results.sort_by_key(|(idx, _, _)| *idx);
+    results.sort_by_key(|(idx, _)| *idx);
 
-    for (_, fr, warnings) in results {
+    // Keep `feeds[]` a contiguous prefix of `urls`: stop at the first unattempted feed and
+    // discard anything past it, even when it completed. `buffer_unordered` finishes out of
+    // order, so the deadline can leave a gap (feeds 0, 2, 3 done, feed 1 never started) — and
+    // every consumer that maps a feed position back to a URL, the continuation cursor above
+    // all, assumes `feeds[j]` is `urls[j]`. Shipping the out-of-order survivors would save a
+    // couple of fetches and mis-address every feed after the gap.
+    let first_unattempted = results
+        .iter()
+        .position(|(_, r)| r.is_none())
+        .unwrap_or(results.len());
+
+    for (_, slot) in results.into_iter().take(first_unattempted) {
+        // Unreachable by construction — every slot before the first `None` is `Some` — but
+        // silently keeping the prefix contiguous beats an unwrap on an invariant.
+        let Some((fr, warnings)) = slot else { continue };
         if let Some(err) = &fr.error {
             output.errors.push(err.clone());
         }
@@ -76,6 +108,25 @@ pub async fn fetch_feeds_with(
         output.feeds.push(fr);
     }
     populate_totals(&mut output);
+
+    let omitted = urls.len() - first_unattempted;
+    if omitted > 0 {
+        output.truncation = Some(TruncationInfo {
+            applied_limit: params.limit,
+            items_content_truncated: 0,
+            items_omitted: 0,
+            feeds_omitted: omitted,
+            estimated_tokens: None,
+            // Left for the front-end to mint: `core` has no cursor concept (the CLI has no
+            // pagination at all), and the MCP server owns the request fingerprint a cursor
+            // has to carry.
+            next_cursor: None,
+            suggestion: Some(format!(
+                "{omitted} feed(s) were not fetched before the batch deadline; request them \
+                 separately, or pass truncation.next_cursor back as `cursor` if one is present"
+            )),
+        });
+    }
     output
 }
 
@@ -579,6 +630,89 @@ mod tests {
 
         let by_id = show_item(FEED, &item.id, &params, &cache).await.unwrap();
         assert_eq!(by_id.map(|i| i.id), Some(item.id));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn expired_deadline_attempts_nothing_and_reports_every_feed() {
+        let dir = std::env::temp_dir().join(format!("rss-deadline-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache = Cache::open(Some(dir.clone())).unwrap();
+        let http = crate::fetch::HttpClient::new("t", std::time::Duration::from_secs(5)).unwrap();
+
+        // Unroutable URLs: a zero deadline must short-circuit before any request is attempted,
+        // so this test never touches the network. Were the deadline ignored, every fetch would
+        // fail to connect and land in `feeds[]` as an error entry — the assertions below would
+        // see 4 feeds and no marker.
+        let urls: Vec<String> = (0..4)
+            .map(|i| format!("http://127.0.0.1:1/f{i}.xml"))
+            .collect();
+        let params = FetchParams {
+            deadline: Some(std::time::Duration::ZERO),
+            cache_policy: CachePolicy::NoCache,
+            ..Default::default()
+        };
+
+        let out = fetch_feeds_with(&urls, &params, &cache, &http).await;
+        assert!(
+            out.feeds.is_empty(),
+            "an expired deadline attempts no feeds"
+        );
+        assert!(
+            out.errors.is_empty(),
+            "an unattempted feed did not fail — it must not be reported as an error"
+        );
+        assert_eq!(
+            out.truncation.as_ref().map(|t| t.feeds_omitted),
+            Some(4),
+            "unattempted feeds must be reported, not silently dropped"
+        );
+        assert!(
+            out.truncation
+                .as_ref()
+                .and_then(|t| t.suggestion.as_deref())
+                .is_some(),
+            "the caller needs to be told how to get the missing feeds"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn no_deadline_fetches_every_feed() {
+        // Guards the default path: the CLI passes deadline: None and must be unaffected.
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(
+                "<?xml version=\"1.0\"?><rss version=\"2.0\"><channel><title>f</title>\
+                 <link>https://example.com/</link></channel></rss>",
+            )
+            .expect_at_least(3)
+            .create_async()
+            .await;
+
+        let dir = std::env::temp_dir().join(format!("rss-nodeadline-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache = Cache::open(Some(dir.clone())).unwrap();
+        let http = crate::fetch::HttpClient::new("t", std::time::Duration::from_secs(5)).unwrap();
+
+        let urls: Vec<String> = (0..3)
+            .map(|i| format!("{}/f{i}.xml", server.url()))
+            .collect();
+        let params = FetchParams {
+            cache_policy: CachePolicy::NoCache,
+            ..Default::default()
+        };
+
+        let out = fetch_feeds_with(&urls, &params, &cache, &http).await;
+        assert_eq!(out.feeds.len(), 3);
+        assert!(
+            out.truncation.is_none(),
+            "no deadline means no omission marker"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

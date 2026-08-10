@@ -50,6 +50,16 @@ pub struct FetchParams {
     pub timeout: Duration,
     pub user_agent: String,
     pub cache_policy: CachePolicy,
+    /// Wall-clock budget for a whole batch. Feeds not *started* by the deadline are left
+    /// unattempted and reported via `truncation.feeds_omitted`, so a large same-host batch
+    /// returns a usable partial page instead of outliving the caller's timeout. `None`
+    /// (the CLI default) means no deadline.
+    ///
+    /// A third, independent bound — deliberately *not* folded into either rate-limit cap:
+    /// `RETRY_MAX_DELAY` bounds one in-flight retry and `MAX_GATE_WAIT` bounds a sibling's
+    /// pacing wait, while this bounds the batch as a whole (including permit contention,
+    /// which neither of those covers).
+    pub deadline: Option<Duration>,
 }
 
 impl Default for FetchParams {
@@ -63,6 +73,7 @@ impl Default for FetchParams {
             timeout: Duration::from_secs(30),
             user_agent: DEFAULT_USER_AGENT.to_string(),
             cache_policy: CachePolicy::Revalidate,
+            deadline: None,
         }
     }
 }

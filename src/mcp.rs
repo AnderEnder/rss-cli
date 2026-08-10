@@ -57,6 +57,37 @@ const MCP_DEFAULT_LIMIT: usize = 25;
 /// client limit — callers with a different limit pass `max_response_tokens` explicitly.
 const MCP_DEFAULT_MAX_RESPONSE_TOKENS: usize = 10_000;
 
+/// Wall-clock budget for one batched `fetch_feed` call. Chosen to land under a typical MCP
+/// client tool timeout, in the same spirit as the `MCP_DEFAULT_MAX_RESPONSE_TOKENS`
+/// recalibration above: a heuristic, not a measured universal limit — hence the override.
+///
+/// It exists because same-host feeds serialize (`HOST_MAX_CONCURRENCY = 1`) and the gate's
+/// `MAX_GATE_WAIT` bounds only the pacing sleep, not the wait for a host permit. Without a
+/// wall-clock bound a large same-host batch can outlive the client's tool timeout and return
+/// *nothing* — strictly worse than returning the feeds that did finish plus a cursor.
+const MCP_BATCH_DEADLINE_SECS: u64 = 25;
+
+/// Environment override for [`MCP_BATCH_DEADLINE_SECS`], in whole seconds.
+const BATCH_DEADLINE_ENV: &str = "RSS_MCP_BATCH_DEADLINE_SECS";
+
+/// Resolve the batch deadline from a raw override string. Split from [`batch_deadline`] so the
+/// policy is testable without mutating process-global environment state.
+///
+/// Absent, blank or unparseable input falls back to the default: a typo must not silently
+/// remove the bound. `0` is a *valid* value meaning "already expired" — to run without a
+/// deadline, unset the variable rather than zeroing it.
+fn parse_batch_deadline(raw: Option<&str>) -> std::time::Duration {
+    raw.and_then(|s| s.trim().parse::<u64>().ok()).map_or_else(
+        || std::time::Duration::from_secs(MCP_BATCH_DEADLINE_SECS),
+        std::time::Duration::from_secs,
+    )
+}
+
+/// The batch deadline in force for this process.
+fn batch_deadline() -> std::time::Duration {
+    parse_batch_deadline(std::env::var(BATCH_DEADLINE_ENV).ok().as_deref())
+}
+
 /// Suggestion attached to a page that was bounded by `max_response_tokens`. Pulled out as a
 /// constant because [`CURSOR_HEADROOM_TOKENS`] measures it — the reserve has to track the
 /// text, not a number someone remembered to update.
@@ -556,6 +587,9 @@ async fn fetch_feed_inner(http: &HttpClient, cache: &Cache, args: FetchFeedArgs)
     // Apply a default item cap so a single huge feed doesn't blow the response budget.
     params.limit = Some(args.limit.unwrap_or(MCP_DEFAULT_LIMIT));
     params.max_content_chars = args.max_content_chars;
+    // Bound the batch in wall-clock time as well as in tokens, so a slow same-host run returns
+    // the feeds that finished plus a cursor instead of timing out with nothing.
+    params.deadline = Some(batch_deadline());
 
     // Fingerprint the *normalized* arguments — the effective limit after defaulting and the
     // parsed content format — so a client that echoes a response's resolved values back on
@@ -605,21 +639,31 @@ async fn fetch_feed_inner(http: &HttpClient, cache: &Cache, args: FetchFeedArgs)
     // `Cursor.f` always indexes the ORIGINAL request URL list; a continuation fetches
     // `urls[f..]`, so this page's feed 0 is `urls[f]`.
     let start_feed = resume.as_ref().map_or(0, |c| c.f);
-    let mut out = core::fetch_feeds_with(&urls[start_feed..], &params, cache, http).await;
-    // Load-bearing for the cursor arithmetic below: `core` returns exactly one `FeedResult`
-    // per requested URL, in request order, errors included — which is what lets
-    // `PageStop::feed_idx` (an index into the pre-trim feed list) become an index into `urls`
-    // by adding `start_feed`. Task 8's batch deadline plans to *omit* unreached feeds from
-    // `feeds[]`; the moment it does, this arithmetic must be reworked or it will mint cursors
-    // pointing at the wrong feed. The `debug_assert` fails the dev build loudly; the boolean is
-    // the release-mode belt — no cursor at all is lossy, a cursor at the wrong feed is wrong.
-    let positions_line_up = out.feeds.len() == urls.len() - start_feed;
+    let requested = &urls[start_feed..];
+    let mut out = core::fetch_feeds_with(requested, &params, cache, http).await;
+    // Load-bearing for the cursor arithmetic below: `feeds[]` is a **prefix** of the requested
+    // URLs, so `feeds[j]` is `requested[j]` — which is what lets `PageStop::feed_idx` (an index
+    // into the pre-trim feed list) become an index into `urls` by adding `start_feed`.
+    //
+    // A prefix, not a one-for-one mapping: the batch deadline leaves the feeds it never
+    // attempted out of `feeds[]` entirely (they are counted in `truncation.feeds_omitted`
+    // instead), so the list is legitimately shorter than the request. What must never happen is
+    // a *gap* — a missing feed with delivered feeds after it — which would shift every later
+    // position by one. Checking the URLs pairwise tests that directly, and is cheap at
+    // `MCP_MAX_URLS = 50`. The `debug_assert` fails the dev build loudly; the boolean is the
+    // release-mode belt — no cursor at all is lossy, a cursor at the wrong feed is wrong.
+    let positions_line_up = out.feeds.len() <= requested.len()
+        && out
+            .feeds
+            .iter()
+            .zip(requested)
+            .all(|(feed, url)| &feed.feed_url == url);
     debug_assert!(
         positions_line_up,
-        "core must return one feed per requested url for cursor positions to line up: {} feeds \
-         for {} urls",
+        "core must return feeds[] as a prefix of the requested urls for cursor positions to \
+         line up: {} feeds for {} urls",
         out.feeds.len(),
-        urls.len() - start_feed
+        requested.len()
     );
 
     // Skip the items already delivered from the resumed feed, warning if the window rolled.
@@ -633,7 +677,12 @@ async fn fetch_feed_inner(http: &HttpClient, cache: &Cache, args: FetchFeedArgs)
         // (cache evicted between pages, then a failing refetch) has zero items for a reason
         // already reported in `feeds[].error` / `errors[]`; calling that a rolled window
         // would be misdirection.
-        if feed.error.is_none() && feed.items.len() != c.n {
+        //
+        // `c.i > 0` for the same reason: resuming at the head of a feed drains nothing, so no
+        // count can make this page skip or repeat an item. It also keeps the batch deadline's
+        // cursor quiet — that one records `i: 0, n: 0` for a feed no page has *attempted*,
+        // where the `0` means "unknown", not "the window was empty".
+        if feed.error.is_none() && c.i > 0 && feed.items.len() != c.n {
             out.warnings.push(crate::model::Warning {
                 feed_url: Some(feed.feed_url.clone()),
                 code: "CACHE_WINDOW_ROLLED".to_string(),
@@ -671,6 +720,15 @@ async fn fetch_feed_inner(http: &HttpClient, cache: &Cache, args: FetchFeedArgs)
     let budget = args
         .max_response_tokens
         .unwrap_or(MCP_DEFAULT_MAX_RESPONSE_TOKENS);
+    // Taken *before* paginate: `estimate_response_tokens` serializes `truncation`, so leaving
+    // the deadline's marker in place would inflate the payload estimate and shed items that
+    // would have fit. It is folded back into the page's own marker further down.
+    //
+    // Deliberately after the empty-continuation return above: with a positive deadline feed 0
+    // always passes the check (the clock starts when the call does), so the deadline cannot
+    // empty `feeds[]` in production, and that path is better served carrying core's marker
+    // verbatim than re-deriving one.
+    let deadline_marker = out.truncation.take();
     let stop = match core::paginate(&mut out, budget.saturating_sub(*CURSOR_HEADROOM_TOKENS)) {
         Ok(stop) => stop,
         // `paginate` mutates `out` on its error paths, so surface the error alone — never a
@@ -736,19 +794,41 @@ async fn fetch_feed_inner(http: &HttpClient, cache: &Cache, args: FetchFeedArgs)
             } else {
                 0
             };
-            let next = crate::cursor::Cursor {
-                v: crate::cursor::CURSOR_VERSION,
-                fp: fp.clone(),
-                f: absolute_feed,
-                i: already + stop.item_idx,
-                n: already + stop.feed_item_count,
-                s: params.since.map(|dt| dt.timestamp()),
-            };
-            m.next_cursor = Some(next.encode());
+            m.next_cursor = Some(continuation(
+                &fp,
+                &params,
+                absolute_feed,
+                already + stop.item_idx,
+                already + stop.feed_item_count,
+            ));
             // Combine, never replace: a page can be both content-truncated and paginated, and
             // dropping the get_item hint would lose the only route to the full body.
             m.suggestion = Some(combined_suggestion(m.suggestion.as_deref()));
         }
+    }
+
+    // After the block above, never before: that one *assigns* `feeds_omitted` from the budget's
+    // `PageStop`, so merging first would have the assignment wipe the deadline's count.
+    merge_deadline_omissions(&mut marker, deadline_marker);
+
+    // The deadline, not the budget, is what bounded this page: resume at the first feed it
+    // never attempted, which is exactly where the delivered prefix ends. Gated on `stop` being
+    // absent because the budget's cursor points *earlier* in the same list and already covers
+    // these feeds; gated on `positions_line_up` for the same reason as the cursor above.
+    if stop.is_none()
+        && positions_line_up
+        && let Some(m) = marker.as_mut()
+        && m.feeds_omitted > 0
+    {
+        // `i: 0` because an unattempted feed has delivered nothing; `n: 0` because this call
+        // never saw its window (see the roll-detection gate above, which reads `i` not `n`).
+        m.next_cursor = Some(continuation(
+            &fp,
+            &params,
+            start_feed + out.feeds.len(),
+            0,
+            0,
+        ));
     }
 
     out.truncation = marker;
@@ -763,6 +843,47 @@ async fn fetch_feed_inner(http: &HttpClient, cache: &Cache, args: FetchFeedArgs)
 
     let summary = fetch_summary(&out, &primary);
     structured_result(&out, summary)
+}
+
+/// Encode a continuation cursor for this request, resuming at item `i` of feed `f` (an index
+/// into the **original** URL list) in a feed that held `n` items when the page was minted.
+///
+/// Shared by both mint sites — the response budget's and the batch deadline's — so a cursor
+/// always carries the same fingerprint and the same resolved `since` cutoff.
+fn continuation(fp: &str, params: &FetchParams, f: usize, i: usize, n: usize) -> String {
+    crate::cursor::Cursor {
+        v: crate::cursor::CURSOR_VERSION,
+        fp: fp.to_string(),
+        f,
+        i,
+        n,
+        s: params.since.map(|dt| dt.timestamp()),
+    }
+    .encode()
+}
+
+/// Fold the batch deadline's omission marker into the page's own.
+///
+/// The two counts are **disjoint sets**, so they add: the deadline omits feeds that were never
+/// fetched, the budget omits feeds that were fetched but did not fit. `max` would under-report,
+/// and a plain assignment either way round would lose one of them. The budget's suggestion wins
+/// when it has one — it already names the cursor that recovers both — and the deadline's fills
+/// in otherwise, which is the common case ([`core::truncation_marker`] yields `None` unless item
+/// *content* was truncated).
+fn merge_deadline_omissions(
+    marker: &mut Option<crate::model::TruncationInfo>,
+    deadline: Option<crate::model::TruncationInfo>,
+) {
+    let Some(d) = deadline else { return };
+    match marker.as_mut() {
+        Some(m) => {
+            m.feeds_omitted += d.feeds_omitted;
+            if m.suggestion.is_none() {
+                m.suggestion = d.suggestion;
+            }
+        }
+        None => *marker = Some(d),
+    }
 }
 
 /// Validate the caller's `cursor` argument against this request and apply the state it records
@@ -2232,6 +2353,133 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_cursor_resuming_at_index_zero_does_not_claim_the_window_rolled() {
+        // `i == 0` drains nothing, so a differing item count cannot skip or repeat anything —
+        // and `n` is then a placeholder, not a measurement. The batch deadline mints exactly
+        // such a cursor for a feed it never attempted (`i: 0, n: 0`); warning on it would fire
+        // CACHE_WINDOW_ROLLED on every continuation page of a deadline-bounded batch.
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/feed.xml")
+            .with_status(200)
+            .with_body(feed_with_items(10))
+            .create_async()
+            .await;
+        let (cache, dir) = temp_cache("resume-at-zero");
+        let http = test_http();
+        let url = format!("{}/feed.xml", server.url());
+
+        // Take a real page-1 cursor for its fingerprint, then rewind it to the head of the
+        // feed — the shape the deadline mints for a feed no page has touched.
+        let full = full_response_tokens(&http, &cache, fetch_args(url.clone())).await;
+        let mut args = fetch_args(url.clone());
+        args.max_response_tokens = Some(full / 2);
+        let cursor = cursor_of(&fetch_feed_inner(&http, &cache, args).await)
+            .expect("page 1 must hand back a cursor");
+        let mut c = crate::cursor::Cursor::decode(&cursor).expect("decode cursor");
+        c.i = 0;
+        c.n = 0;
+
+        let mut args = fetch_args(url);
+        args.cursor = Some(c.encode());
+        let page = output_of(&fetch_feed_inner(&http, &cache, args).await);
+
+        assert!(
+            !page
+                .warnings
+                .iter()
+                .any(|w| w.code == "CACHE_WINDOW_ROLLED"),
+            "resuming at index 0 skips nothing, so there is no roll to report: {:?}",
+            page.warnings
+        );
+        assert_eq!(
+            page.total_items, 10,
+            "the whole feed still ships: {:?}",
+            page.truncation
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn batch_deadline_override_parses_and_falls_back() {
+        let default = std::time::Duration::from_secs(MCP_BATCH_DEADLINE_SECS);
+        assert_eq!(
+            parse_batch_deadline(Some("5")),
+            std::time::Duration::from_secs(5)
+        );
+        assert_eq!(
+            parse_batch_deadline(Some(" 7 ")),
+            std::time::Duration::from_secs(7),
+            "trimmed, like the rate-limit overrides"
+        );
+        // `0` means "already expired", not "disabled": an operator turning the bound off has to
+        // remove the variable, not zero it.
+        assert_eq!(parse_batch_deadline(Some("0")), std::time::Duration::ZERO);
+        assert_eq!(parse_batch_deadline(None), default, "absent falls back");
+        assert_eq!(parse_batch_deadline(Some("")), default);
+        assert_eq!(
+            parse_batch_deadline(Some("soon")),
+            default,
+            "garbage falls back to the bound rather than removing it"
+        );
+    }
+
+    /// A `TruncationInfo` carrying only the fields the merge tests care about.
+    fn marker_with(feeds_omitted: usize, suggestion: Option<&str>) -> crate::model::TruncationInfo {
+        crate::model::TruncationInfo {
+            applied_limit: None,
+            items_content_truncated: 0,
+            items_omitted: 0,
+            feeds_omitted,
+            next_cursor: None,
+            estimated_tokens: None,
+            suggestion: suggestion.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn deadline_and_budget_feed_omissions_are_summed_not_overwritten() {
+        // The two sets are disjoint: the deadline omits feeds that were never fetched, the
+        // budget omits feeds that were fetched but did not fit. Reporting either count alone
+        // understates how much the caller still has to retrieve.
+        let mut marker = Some(crate::model::TruncationInfo {
+            items_omitted: 12,
+            ..marker_with(6, Some("budget advice"))
+        });
+        merge_deadline_omissions(&mut marker, Some(marker_with(40, Some("deadline advice"))));
+
+        let m = marker.expect("the merged marker survives");
+        assert_eq!(m.feeds_omitted, 46, "6 shed by the budget + 40 never tried");
+        assert_eq!(
+            m.items_omitted, 12,
+            "the deadline omits whole feeds, never items"
+        );
+        assert_eq!(
+            m.suggestion.as_deref(),
+            Some("budget advice"),
+            "the budget's advice already names the cursor that recovers both"
+        );
+    }
+
+    #[test]
+    fn a_deadline_marker_survives_when_the_page_has_none() {
+        // `core::truncation_marker` returns None unless item *content* was truncated — the
+        // common case — so a merge requiring both markers to be Some would silently drop every
+        // ordinary deadline report.
+        let mut marker = None;
+        merge_deadline_omissions(&mut marker, Some(marker_with(3, Some("deadline advice"))));
+        let m = marker.expect("the deadline's marker becomes the page's marker");
+        assert_eq!(m.feeds_omitted, 3);
+        assert_eq!(m.suggestion.as_deref(), Some("deadline advice"));
+
+        // No deadline marker leaves an existing one exactly as it was.
+        let mut marker = Some(marker_with(2, Some("budget advice")));
+        merge_deadline_omissions(&mut marker, None);
+        assert_eq!(marker.map(|m| m.feeds_omitted), Some(2));
     }
 
     #[tokio::test]

@@ -190,6 +190,10 @@ impl FetchArgs {
                 .clone()
                 .unwrap_or_else(|| DEFAULT_USER_AGENT.to_string()),
             cache_policy: self.cache_policy()?,
+            // No wall-clock bound on the CLI: an interactive caller can Ctrl-C, and a partial
+            // batch is not more useful than a slow complete one at a terminal. The deadline
+            // exists for the MCP server, whose client enforces a tool timeout of its own.
+            deadline: None,
         })
     }
 
