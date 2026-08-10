@@ -239,6 +239,10 @@ pub async fn fetch_one(
 
 /// Discover feeds advertised on a website homepage, through a **caller-provided** client.
 /// The MCP server passes its shared client so discovery shares the per-host gate (ADR-0016).
+///
+/// `_params` is unread — discovery has no params to apply — and exists only so this signature
+/// stays parallel to [`fetch_feeds_with`]'s `(url, params, http)` shape; that symmetry is what
+/// the brief asked for, not an oversight.
 pub async fn discover_feeds_with(
     site_url: &str,
     _params: &FetchParams,

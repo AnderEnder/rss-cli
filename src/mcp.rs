@@ -1602,16 +1602,45 @@ mod tests {
         // above (NOT_FOUND / a discovered feed), because those don't depend on which gate the
         // request went through.
         //
-        // ADR-0016's gate caps same-host concurrency at 1, so two requests to the SAME
-        // authority through ONE shared client must serialize: total wall time is at least
-        // 2x the per-request delay. Through two independent clients (the pre-fix behavior —
-        // each of `core::show_item`/`core::discover_feeds` built its own), each gets its own
-        // gate and the requests run in parallel: total wall time is ~1x the delay. A
-        // regression that re-introduces a per-call client (even behind the new signature)
-        // makes this test observe ~1x delay and fail the `>= 1.6x` bound below.
-        let delay = std::time::Duration::from_millis(150);
-        let base = slow_feed_server(delay, feed_with_items(1));
-        let (cache, dir) = temp_cache("shared-gate-timing");
+        // Proved the same way `ratelimit::tests::cap_one_serializes_same_authority` proves
+        // blocking: hold a permit open indefinitely (no timer) and race the contender against
+        // a short `tokio::time::timeout`, rather than comparing elapsed wall time against a
+        // threshold. `feed_hold_server` holds `/feed.xml`'s response until released, while
+        // `/site` answers immediately.
+        //
+        // ADR-0016 caps same-authority concurrency at 1. Assumes the default env (unset
+        // `RSS_HOST_CONCURRENCY` / `RSS_MAX_GATE_WAIT_SECS`) — see `HostGate::from_env`; a
+        // loosened cap lets `discover_fut` take the second permit and fail the assertion below
+        // even on correct code.
+        //
+        // One residual timing dependency: the 100ms "drive `item_fut`" step below exists only
+        // to make `get_item_inner` acquire the one permit *before* `discover_fut` starts racing
+        // for it — on a runner so starved that 100ms isn't enough for a loopback connect+acquire
+        // to run, `discover_fut` could win the permit first and the assertion below would fail
+        // on correct code (a false red, not the silent false green this replaces).
+        //
+        // - Correct (shared gate): `get_item_inner`'s request to `/feed.xml` acquires the
+        //   host's one permit and blocks in-process waiting for the held response.
+        //   `discover_feeds_with`'s request to `/site` (same authority) then blocks *before*
+        //   it ever reaches the socket, in `HostGate::acquire` — it cannot complete within any
+        //   timeout while the hold is up, no matter how long we wait or how loaded the runner
+        //   is, because nothing is timer-driven on this side.
+        // - Regression (a fresh `HttpClient`/gate built inside `discover_feeds_with`): its
+        //   request to `/site` never contends for the held permit at all, reaches the server's
+        //   immediate-answer path, and completes almost instantly — well inside the race
+        //   window below, on any runner.
+        //
+        // This removes the wall-clock margin question for the *correct* side entirely: there
+        // is no timer to race against while the hold is up, so a false red (this test failing
+        // on genuinely correct code) cannot happen from scheduling delay, full stop. The
+        // *regression* side still has to finish inside the 300ms window to be caught — a false
+        // green is not impossible in principle, only far less likely than before: the
+        // regression's round trip is a no-delay localhost request (measured ~10ms against the
+        // 300ms budget under the mutation check below, a ~30x margin), versus the old
+        // formulation's ~150ms server delay racing an ~240ms threshold (~1.25x margin, per the
+        // review finding this replaces).
+        let (base, hold) = feed_hold_server(feed_with_items(1), site_with_alternate_link());
+        let (cache, dir) = temp_cache("shared-gate-probe");
         let http = test_http();
 
         let get_item_args = GetItemArgs {
@@ -1619,38 +1648,42 @@ mod tests {
             id: "0000000000000000".to_string(),
             max_content_chars: None,
         };
-
         let site_url = format!("{base}/site");
         let discover_params = FetchParams::default();
 
-        let started = std::time::Instant::now();
-        let (item_result, discover_result) = tokio::join!(
-            get_item_inner(&http, &cache, get_item_args),
-            core::discover_feeds_with(&site_url, &discover_params, &http),
-        );
-        let elapsed = started.elapsed();
+        let item_fut = get_item_inner(&http, &cache, get_item_args);
+        tokio::pin!(item_fut);
+        let discover_fut = core::discover_feeds_with(&site_url, &discover_params, &http);
+        tokio::pin!(discover_fut);
 
-        // Both calls still complete successfully (NOT_FOUND is a structured success path for
-        // get_item; the slow server answers every path with the same RSS body, whose <link>
-        // elements carry no rel="alternate", so discover finds nothing) — the point of this
-        // test is the timing, not the outcome.
-        let (is_error, payload) = decode(&item_result);
+        // Drive the first call forward until it's blocked on the held socket read — this is
+        // what establishes "in flight, holding the one permit" below. It can never finish
+        // inside this window (the server won't answer `/feed.xml` until `hold.release()`), so
+        // the timeout always elapses here; we only care about the side effect of polling it.
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(100), &mut item_fut).await;
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(300), &mut discover_fut)
+                .await
+                .is_err(),
+            "discover_feeds_with must not complete while get_item_inner's /feed.xml request is \
+             still held and holding the shared gate's one permit (ADR-0016) — completing here \
+             means it went through its own gate instead of the shared client's"
+        );
+
+        hold.release();
+
+        let (is_error, payload) = decode(&item_fut.await);
         assert!(is_error, "expected NOT_FOUND, got {payload}");
         assert_eq!(payload["code"], "NOT_FOUND");
         assert_eq!(
-            discover_result
+            discover_fut
+                .await
                 .expect("discover should succeed")
                 .feeds
                 .len(),
-            0
-        );
-
-        assert!(
-            elapsed >= delay.mul_f64(1.6),
-            "two same-host requests through ONE shared HttpClient must serialize on the \
-             per-host gate (ADR-0016): expected >= {:?}, got {elapsed:?}. A shorter elapsed \
-             means each call built its own client/gate and ran in parallel.",
-            delay.mul_f64(1.6)
+            1,
+            "site body advertises one alternate feed"
         );
 
         std::fs::remove_dir_all(&dir).ok();
@@ -2725,6 +2758,88 @@ mod tests {
             }
         });
         base
+    }
+
+    /// Sends `()` to release the `/feed.xml` hold in [`feed_hold_server`]. A raw `Sender`
+    /// would work too; the wrapper just makes the call site (`hold.release()`) read as intent
+    /// rather than a bare channel send.
+    struct HoldRelease(std::sync::mpsc::Sender<()>);
+
+    impl HoldRelease {
+        fn release(&self) {
+            let _ = self.0.send(());
+        }
+    }
+
+    /// A minimal HTTP/1.1 server that answers `/site` with `site_body` **immediately**, but
+    /// blocks `/feed.xml`'s response until [`HoldRelease::release`] is called — no timer
+    /// involved, on either path.
+    ///
+    /// This is the network-level analogue of `ratelimit::tests::cap_one_serializes_same_authority`'s
+    /// "hold a permit open, then race a contender against a short timeout" shape: a caller can
+    /// prove a second same-authority request is stuck *before* it ever reaches the socket
+    /// (blocked in `HostGate::acquire`, because the first request's held response is still
+    /// occupying the one permit) by racing it against a timeout while never releasing the
+    /// hold — no wall-clock margin to tune, because the "blocked" side has no clock in it at
+    /// all.
+    fn feed_hold_server(feed_body: String, site_body: String) -> (String, HoldRelease) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let base = format!("http://{}", listener.local_addr().expect("local addr"));
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let rx = std::sync::Arc::new(std::sync::Mutex::new(Some(rx)));
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let feed_body = feed_body.clone();
+                let site_body = site_body.clone();
+                let rx = rx.clone();
+                std::thread::spawn(move || {
+                    use std::io::{BufRead, BufReader, Write};
+                    let mut path = String::new();
+                    if let Ok(peer) = stream.try_clone() {
+                        let mut reader = BufReader::new(peer);
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).unwrap_or(0) > 0 {
+                            path = line.split_whitespace().nth(1).unwrap_or("").to_string();
+                        }
+                        line.clear();
+                        while reader.read_line(&mut line).unwrap_or(0) > 0 {
+                            if line == "\r\n" {
+                                break;
+                            }
+                            line.clear();
+                        }
+                    }
+                    let (content_type, body) = if path == "/feed.xml" {
+                        // Block until released. Only one request ever hits this path in these
+                        // tests, so taking the single `Receiver` once is enough.
+                        if let Some(rx) = rx.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                            let _ = rx.recv();
+                        }
+                        ("application/rss+xml", feed_body)
+                    } else {
+                        ("text/html", site_body)
+                    };
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: {content_type}\r\n\
+                         content-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(head.as_bytes());
+                    let _ = stream.write_all(body.as_bytes());
+                    let _ = stream.flush();
+                });
+            }
+        });
+        (base, HoldRelease(tx))
+    }
+
+    /// A homepage advertising exactly one alternate feed at `/feed.xml`, for
+    /// [`feed_hold_server`]'s immediate-answer `/site` path.
+    fn site_with_alternate_link() -> String {
+        "<html><head><link rel=\"alternate\" type=\"application/rss+xml\" \
+         href=\"/feed.xml\"></head></html>"
+            .to_string()
     }
 
     #[tokio::test]
