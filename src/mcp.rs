@@ -247,6 +247,10 @@ struct FetchFeedArgs {
     /// Content extraction format: `markdown` (default), `text`, `html`, or `none`.
     #[serde(default)]
     content_format: Option<String>,
+    /// Only include items published at or after this time: a duration (`2h`, `7d`) or an
+    /// ISO-8601 date/datetime (`2026-06-01`). Applied before `limit`.
+    #[serde(default)]
+    since: Option<String>,
     /// Maximum number of items to return (most recent first). Omit to use the default cap
     /// of 25; pass a larger number to fetch more (subject to the response budget).
     #[serde(default, deserialize_with = "de_lenient_opt_usize")]
@@ -429,9 +433,6 @@ impl ServerHandler for RssServer {
 /// unit-testable. Applies the default item cap, the per-item content cap, and the response
 /// budget, attaching a [`crate::model::TruncationInfo`] marker when content was truncated.
 async fn fetch_feed_inner(http: &HttpClient, cache: &Cache, args: FetchFeedArgs) -> CallToolResult {
-    // TODO(Task 4): this only uses the first resolved URL; batch handling over the full list
-    // is wired up in Task 4. Resolving here (rather than leaving `args.url` in place) keeps
-    // this task's `url`/`urls` argument surface independently testable and green.
     let urls = match resolve_urls(&args) {
         Ok(u) => u,
         Err(e) => return tool_error_obj(&e, None),
@@ -451,6 +452,12 @@ async fn fetch_feed_inner(http: &HttpClient, cache: &Cache, args: FetchFeedArgs)
             }
         }
     }
+    if let Some(raw) = args.since.as_deref() {
+        match crate::config::parse_since(raw) {
+            Ok(dt) => params.since = Some(dt),
+            Err(e) => return tool_error_obj(&e, Some(&primary)),
+        }
+    }
     if let Some(raw) = args.cache_policy.as_deref() {
         match crate::config::parse_cache_policy(raw) {
             Ok(p) => params.cache_policy = p,
@@ -461,8 +468,7 @@ async fn fetch_feed_inner(http: &HttpClient, cache: &Cache, args: FetchFeedArgs)
     params.limit = Some(args.limit.unwrap_or(MCP_DEFAULT_LIMIT));
     params.max_content_chars = args.max_content_chars;
 
-    let mut out =
-        core::fetch_feeds_with(std::slice::from_ref(&primary), &params, cache, http).await;
+    let mut out = core::fetch_feeds_with(&urls, &params, cache, http).await;
 
     // Reject oversized results with an actionable error rather than letting the client trip
     // its own tool-result-too-large limit on an opaque failure.
@@ -496,16 +502,16 @@ async fn fetch_feed_inner(http: &HttpClient, cache: &Cache, args: FetchFeedArgs)
 /// we don't duplicate the whole FetchOutput as text (which would ~double the response and
 /// undercut the token budget — see ADR-0011/ADR-0013).
 fn fetch_summary(out: &crate::model::FetchOutput, url: &str) -> String {
-    match out.feeds.first() {
-        Some(feed) if feed.error.is_some() => {
-            let code = feed
-                .error
-                .as_ref()
-                .map(|e| e.code.as_str())
-                .unwrap_or("ERROR");
-            format!("fetch_feed: {url} returned an error ({code}); see structuredContent.")
-        }
-        Some(feed) => {
+    match out.feeds.len() {
+        0 => format!("fetch_feed: no result for {url}."),
+        1 => {
+            let feed = &out.feeds[0];
+            if let Some(err) = &feed.error {
+                return format!(
+                    "fetch_feed: {url} returned an error ({}); see structuredContent.",
+                    err.code
+                );
+            }
             let title = feed.title.as_deref().unwrap_or(url);
             let mut s = format!(
                 "Fetched {} item(s) (~{} content tokens) from \"{title}\".",
@@ -517,7 +523,20 @@ fn fetch_summary(out: &crate::model::FetchOutput, url: &str) -> String {
             s.push_str(" Full data in structuredContent.");
             s
         }
-        None => format!("fetch_feed: no result for {url}."),
+        n => {
+            let failed = out.errors.len();
+            let mut s = format!(
+                "Fetched {} item(s) (~{} content tokens) from {n} feed(s)",
+                out.total_items, out.total_content_tokens_est
+            );
+            if failed > 0 {
+                s.push_str(&format!(
+                    "; {failed} feed(s) failed (see structuredContent.errors)"
+                ));
+            }
+            s.push_str(". Full data in structuredContent.");
+            s
+        }
     }
 }
 
@@ -734,6 +753,7 @@ mod tests {
             url: Some(url),
             urls: None,
             content_format: None,
+            since: None,
             limit: None,
             max_content_chars: None,
             max_response_tokens: None,
@@ -772,6 +792,77 @@ mod tests {
             payload["truncation"].is_null(),
             "untruncated result → truncation null"
         );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn fetch_feed_fetches_a_batch_in_request_order() {
+        let mut server = mockito::Server::new_async().await;
+        let _a = server
+            .mock("GET", "/a.xml")
+            .with_status(200)
+            .with_body(feed_with_items(2))
+            .create_async()
+            .await;
+        let _b = server
+            .mock("GET", "/b.xml")
+            .with_status(200)
+            .with_body(feed_with_items(3))
+            .create_async()
+            .await;
+        let (cache, dir) = temp_cache("batch");
+
+        let mut args = fetch_args(String::new());
+        args.url = None;
+        args.urls = Some(vec![
+            format!("{}/a.xml", server.url()),
+            format!("{}/b.xml", server.url()),
+        ]);
+
+        let (is_error, payload) = decode(&fetch_feed_inner(&test_http(), &cache, args).await);
+        assert!(!is_error, "batch fetch should succeed: {payload}");
+        let feeds = payload["feeds"].as_array().expect("feeds");
+        assert_eq!(feeds.len(), 2);
+        // Request order is a contract (invariant 9), not completion order.
+        assert!(feeds[0]["feed_url"].as_str().unwrap().ends_with("/a.xml"));
+        assert!(feeds[1]["feed_url"].as_str().unwrap().ends_with("/b.xml"));
+        assert_eq!(payload["total_items"], 5);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn batch_keeps_good_feeds_when_one_fails() {
+        let mut server = mockito::Server::new_async().await;
+        let _a = server
+            .mock("GET", "/a.xml")
+            .with_status(200)
+            .with_body(feed_with_items(2))
+            .create_async()
+            .await;
+        let _bad = server
+            .mock("GET", "/bad.xml")
+            .with_status(404)
+            .create_async()
+            .await;
+        let (cache, dir) = temp_cache("batch-partial");
+
+        let mut args = fetch_args(String::new());
+        args.url = None;
+        args.urls = Some(vec![
+            format!("{}/a.xml", server.url()),
+            format!("{}/bad.xml", server.url()),
+        ]);
+
+        let (is_error, payload) = decode(&fetch_feed_inner(&test_http(), &cache, args).await);
+        assert!(
+            !is_error,
+            "one bad feed must not fail the whole call: {payload}"
+        );
+        assert_eq!(payload["feeds"][0]["status"], "ok");
+        assert_eq!(payload["feeds"][1]["status"], "error");
+        assert_eq!(payload["errors"].as_array().unwrap().len(), 1);
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1009,6 +1100,19 @@ mod tests {
             message.contains("no-cache"),
             "error should list valid forms: {message}"
         );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn fetch_feed_rejects_bad_since() {
+        let (cache, dir) = temp_cache("badsince");
+        let mut args = fetch_args("https://example.com/feed.xml".to_string());
+        args.since = Some("not-a-date".to_string());
+
+        let (is_error, payload) = decode(&fetch_feed_inner(&test_http(), &cache, args).await);
+        assert!(is_error);
+        assert_eq!(payload["code"], "USAGE_ERROR");
 
         std::fs::remove_dir_all(&dir).ok();
     }
