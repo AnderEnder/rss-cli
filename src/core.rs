@@ -206,6 +206,11 @@ pub async fn fetch_one(
         .map(|i| u64::from(i.content_tokens_est))
         .sum();
     let cached_at = raw.cached_at.clone();
+    // `.ok()` -> `None` here is defensive, not expected: `cached_at` is always written by
+    // `now_rfc3339()` (see `cache.rs`/`fetch.rs`), the only producer, so parsing should never
+    // fail in practice. If it ever did, `cached_at` would stay `Some(<string>)` while
+    // `cache_age_seconds` fell back to `None` — an inconsistent pair we accept rather than
+    // add error handling for a case that cannot occur.
     let cache_age_seconds = cached_at.as_deref().and_then(|ts| {
         chrono::DateTime::parse_from_rfc3339(ts)
             .ok()
@@ -688,6 +693,40 @@ mod tests {
             fr.cache_age_seconds.is_some_and(|s| s > 60),
             "a 2020 entry must report a large age, got {:?}",
             fr.cache_age_seconds
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn fetch_one_clamps_a_future_fetched_at_to_zero_age() {
+        // A clock-skewed cache entry stamped in the future must not wrap to a huge number
+        // when `i64 -> u64` casts a negative elapsed duration; it must clamp to 0.
+        let dir = std::env::temp_dir().join(format!("rss-skew-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache = Cache::open(Some(dir.clone())).unwrap();
+        let future = (Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+        let meta = CacheMeta {
+            feed_url: FEED.to_string(),
+            etag: None,
+            last_modified: None,
+            fetched_at: future.clone(),
+            content_type: Some("application/rss+xml".to_string()),
+        };
+        cache.put(&meta, BODY.as_bytes()).expect("seed");
+
+        let params = FetchParams {
+            cache_policy: CachePolicy::CacheFirst,
+            ..Default::default()
+        };
+        let http = crate::fetch::HttpClient::new("t", std::time::Duration::from_secs(5)).unwrap();
+        let (fr, _) = fetch_one(FEED, &http, &params, &cache).await.unwrap();
+
+        assert_eq!(fr.cached_at.as_deref(), Some(future.as_str()));
+        assert_eq!(
+            fr.cache_age_seconds,
+            Some(0),
+            "a future fetched_at must clamp to 0, not wrap to a huge u64"
         );
 
         std::fs::remove_dir_all(&dir).ok();

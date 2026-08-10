@@ -118,11 +118,17 @@ pub struct FeedResult {
     pub content_tokens_est_total: u64,
     pub items: Vec<Item>,
     pub error: Option<ErrorObj>,
-    /// RFC-3339 time the served body was originally fetched from origin, when this result
-    /// came from cache. `null` when fetched fresh. Pair with `cache_age_seconds` to judge
+    /// RFC-3339 time this cache entry was last written — the original fetch, or the most
+    /// recent successful revalidation preceding this one, whichever is newer. `null` when
+    /// fetched fresh this call. A feed that revalidates cleanly on every call (repeated
+    /// `304`s) will show this drifting forward with the polling interval, not staying
+    /// pinned to when the body was first fetched from origin — it reflects "last confirmed
+    /// with origin," not "age of these bytes." Pair with `cache_age_seconds` to judge
     /// staleness — `from_cache: true` alone cannot distinguish 5 minutes from 5 days.
     pub cached_at: Option<String>,
-    /// Age in seconds of the served cached body. `null` when not served from cache.
+    /// Age in seconds since `cached_at` was written. `null` when not served from cache.
+    /// Same caveat as `cached_at`: for a feed revalidated every N minutes, this hovers
+    /// around N minutes indefinitely rather than growing toward the body's true age.
     pub cache_age_seconds: Option<u64>,
 }
 

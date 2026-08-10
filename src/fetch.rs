@@ -521,7 +521,7 @@ mod tests {
         assert_eq!(
             raw.cached_at.as_deref(),
             Some(seeded.as_str()),
-            "a 304 must report when the served body was originally stored, not the refreshed time"
+            "a 304 must report the timestamp the entry carried before this call refreshed it"
         );
 
         // The conditional GET fired and `fetched_at` was refreshed (validators kept).
@@ -530,6 +530,70 @@ mod tests {
         assert_ne!(entry.meta.fetched_at, seeded);
         assert_eq!(entry.meta.etag.as_deref(), Some("\"v1\""));
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Pins the documented drift: across successive `304`s, `cached_at` reports the time of
+    /// the *previous* revalidation, not the original origin fetch. A second 304 must report
+    /// what the first one wrote, not the value seeded before either ran.
+    #[tokio::test]
+    async fn revalidate_304_twice_reports_previous_revalidation_time() {
+        let mut server = mockito::Server::new_async().await;
+        let dir = temp_cache_dir("revalidate-twice");
+        let cache = Cache::open(Some(dir.clone())).expect("open cache");
+        let url = format!("{}/feed.xml", server.url());
+
+        let original_fetch = "2020-01-01T00:00:00Z".to_string();
+        let meta = CacheMeta {
+            feed_url: url.clone(),
+            etag: Some("\"v1\"".to_string()),
+            last_modified: None,
+            fetched_at: original_fetch.clone(),
+            content_type: Some("application/rss+xml".to_string()),
+        };
+        cache.put(&meta, b"<rss>cached</rss>").expect("seed cache");
+
+        // The etag survives both 304 branches (`entry.meta.etag.clone()`), so one mock with
+        // `expect(2)` matches both conditional GETs.
+        let mock = server
+            .mock("GET", "/feed.xml")
+            .match_header("if-none-match", "\"v1\"")
+            .with_status(304)
+            .expect(2)
+            .create_async()
+            .await;
+
+        let http = client();
+
+        let first = http
+            .fetch(&url, &cache, CachePolicy::Revalidate)
+            .await
+            .expect("first revalidate ok");
+        assert_eq!(first.cached_at.as_deref(), Some(original_fetch.as_str()));
+        let after_first = cache
+            .get(&url)
+            .expect("cache get")
+            .expect("entry present")
+            .meta
+            .fetched_at;
+        assert_ne!(after_first, original_fetch);
+
+        let second = http
+            .fetch(&url, &cache, CachePolicy::Revalidate)
+            .await
+            .expect("second revalidate ok");
+        assert_eq!(
+            second.cached_at.as_deref(),
+            Some(after_first.as_str()),
+            "a second successive 304 must report the previous revalidation's timestamp"
+        );
+        assert_ne!(
+            second.cached_at.as_deref(),
+            Some(original_fetch.as_str()),
+            "cached_at is NOT stable across repeated revalidations — it drifts forward"
+        );
+
+        mock.assert_async().await;
         std::fs::remove_dir_all(&dir).ok();
     }
 
