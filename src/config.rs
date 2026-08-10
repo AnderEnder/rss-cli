@@ -56,9 +56,18 @@ pub struct FetchParams {
     /// (the CLI default) means no deadline.
     ///
     /// A third, independent bound — deliberately *not* folded into either rate-limit cap:
-    /// `RETRY_MAX_DELAY` bounds one in-flight retry and `MAX_GATE_WAIT` bounds a sibling's
-    /// pacing wait, while this bounds the batch as a whole (including permit contention,
-    /// which neither of those covers).
+    /// `RETRY_MAX_DELAY` bounds one in-flight retry, `MAX_GATE_WAIT` bounds a sibling's pacing
+    /// wait, and this bounds when a fetch may **start**.
+    ///
+    /// What it therefore does *not* bound is a fetch already admitted. The first `concurrency`
+    /// futures are polled at once, all pass the check at t≈0, and then queue on the per-host
+    /// permit, where no clock reaches them. So the real bound on a batch is the deadline **plus
+    /// up to `concurrency - 1` already-admitted fetches** draining serially behind
+    /// `HOST_MAX_CONCURRENCY`, each of which can additionally sit out a cooldown escalating
+    /// toward `HOST_MAX_COOLDOWN` (and is itself capped by `timeout`). Permit contention is
+    /// exactly what `MAX_GATE_WAIT` does not cover — and this does not cover it either; the
+    /// deeper fix (a deadline threaded into the gate's permit acquire) is recorded as a known
+    /// limitation in ADR-0017.
     pub deadline: Option<Duration>,
 }
 
