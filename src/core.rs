@@ -185,9 +185,16 @@ pub fn estimate_response_tokens(output: &FetchOutput) -> usize {
 }
 
 /// Token cost of one *part* of a response — an item, a feed envelope — pretty-printed on its
-/// own, plus a couple of tokens for the array punctuation and indentation it picks up once
-/// nested. Deliberately approximate and low: [`paginate`]'s greedy pass adds these up and a
-/// real [`estimate_response_tokens`] measurement corrects the residue afterwards.
+/// own, plus a couple of tokens for the array punctuation it picks up once nested.
+/// Deliberately approximate and low: [`paginate`]'s greedy pass adds these up and a real
+/// [`estimate_response_tokens`] measurement corrects the residue afterwards.
+///
+/// **This must never over-estimate.** Nesting actually costs far more than the `+ 2` here
+/// (indentation alone runs ~12 tokens per feed envelope and ~38 per item), and that gap is
+/// load-bearing: it is what makes the greedy total a lower bound on the real payload, so a
+/// greedy rejection implies a real one. Raise this constant to "improve accuracy" and a
+/// greedy total can exceed the real cost — which rejects pages that would have fit, the
+/// false `RESPONSE_TOO_LARGE` this accounting exists to prevent.
 fn pretty_tokens<T: serde::Serialize>(value: &T) -> usize {
     serde_json::to_string_pretty(value)
         .map(|s| s.chars().count().div_ceil(4))
