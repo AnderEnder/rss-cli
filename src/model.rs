@@ -118,6 +118,12 @@ pub struct FeedResult {
     pub content_tokens_est_total: u64,
     pub items: Vec<Item>,
     pub error: Option<ErrorObj>,
+    /// RFC-3339 time the served body was originally fetched from origin, when this result
+    /// came from cache. `null` when fetched fresh. Pair with `cache_age_seconds` to judge
+    /// staleness — `from_cache: true` alone cannot distinguish 5 minutes from 5 days.
+    pub cached_at: Option<String>,
+    /// Age in seconds of the served cached body. `null` when not served from cache.
+    pub cache_age_seconds: Option<u64>,
 }
 
 impl FeedResult {
@@ -134,6 +140,8 @@ impl FeedResult {
             content_tokens_est_total: 0,
             items: Vec::new(),
             error: Some(error),
+            cached_at: None,
+            cache_age_seconds: None,
         }
     }
 }

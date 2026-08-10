@@ -205,6 +205,12 @@ pub async fn fetch_one(
         .iter()
         .map(|i| u64::from(i.content_tokens_est))
         .sum();
+    let cached_at = raw.cached_at.clone();
+    let cache_age_seconds = cached_at.as_deref().and_then(|ts| {
+        chrono::DateTime::parse_from_rfc3339(ts)
+            .ok()
+            .map(|dt| (Utc::now() - dt.with_timezone(&Utc)).num_seconds().max(0) as u64)
+    });
     let fr = FeedResult {
         feed_url: url.to_string(),
         status: if raw.not_modified {
@@ -220,6 +226,8 @@ pub async fn fetch_one(
         content_tokens_est_total,
         items: parsed.items,
         error: None,
+        cached_at,
+        cache_age_seconds,
     };
     Ok((fr, parsed.warnings))
 }
@@ -662,6 +670,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fetch_one_reports_cache_age_for_a_cached_feed() {
+        let dir = std::env::temp_dir().join(format!("rss-age-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache = Cache::open(Some(dir.clone())).unwrap();
+        seed(&cache, FEED, BODY.as_bytes()); // seeded with fetched_at = 2020-01-01
+
+        let params = FetchParams {
+            cache_policy: CachePolicy::CacheFirst,
+            ..Default::default()
+        };
+        let http = crate::fetch::HttpClient::new("t", std::time::Duration::from_secs(5)).unwrap();
+        let (fr, _) = fetch_one(FEED, &http, &params, &cache).await.unwrap();
+
+        assert_eq!(fr.cached_at.as_deref(), Some("2020-01-01T00:00:00Z"));
+        assert!(
+            fr.cache_age_seconds.is_some_and(|s| s > 60),
+            "a 2020 entry must report a large age, got {:?}",
+            fr.cache_age_seconds
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
     async fn expired_deadline_attempts_nothing_and_reports_every_feed() {
         let dir = std::env::temp_dir().join(format!("rss-deadline-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -721,6 +753,8 @@ mod tests {
                 content_tokens_est_total: 1,
                 items,
                 error: None,
+                cached_at: None,
+                cache_age_seconds: None,
             },
             Vec::new(),
         )
@@ -881,6 +915,8 @@ mod tests {
             content_tokens_est_total,
             items,
             error: None,
+            cached_at: None,
+            cache_age_seconds: None,
         });
         populate_totals(&mut out);
         out
@@ -970,6 +1006,8 @@ mod tests {
                 content_tokens_est_total: 0,
                 items: (0..n).map(|_| item(false)).collect(),
                 error: None,
+                cached_at: None,
+                cache_age_seconds: None,
             });
         }
         refresh_feed_counts(&mut out);

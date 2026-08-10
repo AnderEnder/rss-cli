@@ -48,6 +48,9 @@ pub struct RawFeed {
     pub not_modified: bool,
     /// True when the returned body came from the cache rather than a fresh `200` body.
     pub from_cache: bool,
+    /// RFC-3339 time the served body was written to cache, when it came from cache.
+    /// `None` for a body fetched fresh from the network this call.
+    pub cached_at: Option<String>,
 }
 
 /// Reusable HTTP client.
@@ -110,6 +113,7 @@ impl HttpClient {
                     status: status.as_u16(),
                     not_modified: false,
                     from_cache: false,
+                    cached_at: None,
                 })
             }
 
@@ -118,6 +122,7 @@ impl HttpClient {
                 if let Some(entry) = cache.get(url)?
                     && is_fresh(&entry.meta.fetched_at, max_age)
                 {
+                    let cached_at = entry.meta.fetched_at.clone();
                     return Ok(RawFeed {
                         body: entry.body,
                         final_url: url.to_string(),
@@ -125,6 +130,7 @@ impl HttpClient {
                         status: 200,
                         not_modified: true,
                         from_cache: true,
+                        cached_at: Some(cached_at),
                     });
                 }
                 self.revalidate(url, cache).await
@@ -134,6 +140,7 @@ impl HttpClient {
             // Only a cache miss falls through to a normal conditional GET. See ADR-0014.
             CachePolicy::CacheFirst => {
                 if let Some(entry) = cache.get(url)? {
+                    let cached_at = entry.meta.fetched_at.clone();
                     return Ok(RawFeed {
                         body: entry.body,
                         final_url: url.to_string(),
@@ -141,6 +148,7 @@ impl HttpClient {
                         status: 200,
                         not_modified: true,
                         from_cache: true,
+                        cached_at: Some(cached_at),
                     });
                 }
                 self.revalidate(url, cache).await
@@ -180,6 +188,10 @@ impl HttpClient {
                     "server returned 304 but no cache entry exists for {url}"
                 ))
             })?;
+            // The body served here is the one written at `entry.meta.fetched_at` — report
+            // that (pre-refresh) time, not the `now()` this call is about to stamp on the
+            // entry for the *next* lookup.
+            let cached_at = entry.meta.fetched_at.clone();
             let meta = CacheMeta {
                 feed_url: url.to_string(),
                 etag: entry.meta.etag.clone(),
@@ -195,6 +207,7 @@ impl HttpClient {
                 status: StatusCode::NOT_MODIFIED.as_u16(),
                 not_modified: true,
                 from_cache: true,
+                cached_at: Some(cached_at),
             });
         }
 
@@ -232,6 +245,7 @@ impl HttpClient {
             status: status.as_u16(),
             not_modified: false,
             from_cache: false,
+            cached_at: None,
         })
     }
 
@@ -502,6 +516,13 @@ mod tests {
         assert!(raw.not_modified);
         assert_eq!(raw.body, b"<rss>cached</rss>".to_vec());
         assert_eq!(raw.content_type.as_deref(), Some("application/rss+xml"));
+        // The served body is the one stored at the pre-refresh time, not the `now()` this
+        // call is about to stamp on the entry for the *next* lookup.
+        assert_eq!(
+            raw.cached_at.as_deref(),
+            Some(seeded.as_str()),
+            "a 304 must report when the served body was originally stored, not the refreshed time"
+        );
 
         // The conditional GET fired and `fetched_at` was refreshed (validators kept).
         mock.assert_async().await;
@@ -519,11 +540,12 @@ mod tests {
         let cache = Cache::open(Some(dir.clone())).expect("open cache");
         let url = format!("{}/feed.xml", server.url());
 
+        let seeded = now_rfc3339();
         let meta = CacheMeta {
             feed_url: url.clone(),
             etag: Some("\"v1\"".to_string()),
             last_modified: None,
-            fetched_at: now_rfc3339(),
+            fetched_at: seeded.clone(),
             content_type: Some("application/atom+xml".to_string()),
         };
         cache
@@ -551,6 +573,11 @@ mod tests {
         // The cached body (not the mock's) proves no network round-trip happened.
         assert_eq!(raw.body, b"<feed>cached</feed>".to_vec());
         assert_eq!(raw.content_type.as_deref(), Some("application/atom+xml"));
+        assert_eq!(
+            raw.cached_at.as_deref(),
+            Some(seeded.as_str()),
+            "a MaxAge hit must report the entry's write time"
+        );
 
         mock.assert_async().await; // expect(0): fails if the network was hit.
         std::fs::remove_dir_all(&dir).ok();
@@ -620,6 +647,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cache_hit_reports_when_the_body_was_fetched() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/feed.xml")
+            .with_status(200)
+            .with_header("etag", "\"v1\"")
+            .with_body("<rss version=\"2.0\"><channel><title>t</title></channel></rss>")
+            .create_async()
+            .await;
+
+        let dir = std::env::temp_dir().join(format!("rss-cachedat-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache = Cache::open(Some(dir.clone())).unwrap();
+        let client = HttpClient::new("t", Duration::from_secs(5)).unwrap();
+        let url = format!("{}/feed.xml", server.url());
+
+        // A fresh 200 body did not come from cache.
+        let fresh = client
+            .fetch(&url, &cache, CachePolicy::Revalidate)
+            .await
+            .unwrap();
+        assert!(
+            fresh.cached_at.is_none(),
+            "a fresh body has no cache timestamp"
+        );
+
+        // A CacheFirst hit reports the entry's write time.
+        let hit = client
+            .fetch(&url, &cache, CachePolicy::CacheFirst)
+            .await
+            .unwrap();
+        assert!(hit.from_cache);
+        assert!(
+            hit.cached_at.is_some(),
+            "a cache hit must report when it was stored"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
     async fn retries_once_on_403_then_succeeds() {
         let mut server = mockito::Server::new_async().await;
         let dir = temp_cache_dir("retry-ok");
@@ -645,6 +713,10 @@ mod tests {
             .await
             .expect("retry should succeed");
         assert_eq!(raw.body, b"<rss>ok</rss>".to_vec());
+        assert!(
+            raw.cached_at.is_none(),
+            "NoCache never reads or writes the cache, so it has no cache timestamp"
+        );
 
         m403.assert_async().await;
         m200.assert_async().await;

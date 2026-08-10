@@ -262,6 +262,8 @@ mod tests {
             content_tokens_est_total,
             items,
             error: None,
+            cached_at: None,
+            cache_age_seconds: None,
         });
         out.total_items = out.feeds.iter().map(|f| f.items.len()).sum();
         out.total_content_tokens_est = out
