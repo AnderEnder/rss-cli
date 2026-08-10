@@ -710,6 +710,30 @@ async fn fetch_feed_inner(http: &HttpClient, cache: &Cache, args: FetchFeedArgs)
     // here, so every error still has its feed. This is the one page that may exceed
     // `max_response_tokens` — there is no item left to drop.
     if resume.is_some() && core::item_count(&out) == 0 {
+        // "Finished" only as far as the *roll* goes: the batch deadline may still have left
+        // feeds unattempted behind the drained one, and they are real data the caller has not
+        // seen. Hand back a cursor for them rather than ending the loop on a roll the caller
+        // did not cause. Without a deadline this cannot arise — every later feed would be here
+        // carrying items, so `item_count` would not be zero.
+        //
+        // Gated on a non-empty `feeds[]`, which says the resumed feed *was* fetched (the drain
+        // is what emptied it), so resuming past it is right. An empty `feeds[]` means the
+        // deadline attempted nothing at all — reachable only with a zero override — and there
+        // the caller's own cursor is still the correct place to resume from, so leave it be
+        // rather than mint one that would re-deliver the items page 1 already sent.
+        if positions_line_up
+            && !out.feeds.is_empty()
+            && let Some(m) = out.truncation.as_mut()
+            && m.feeds_omitted > 0
+        {
+            m.next_cursor = Some(continuation(
+                &fp,
+                &params,
+                start_feed + out.feeds.len(),
+                0,
+                0,
+            ));
+        }
         let summary = fetch_summary(&out, &primary);
         return structured_result(&out, summary);
     }
@@ -724,10 +748,9 @@ async fn fetch_feed_inner(http: &HttpClient, cache: &Cache, args: FetchFeedArgs)
     // the deadline's marker in place would inflate the payload estimate and shed items that
     // would have fit. It is folded back into the page's own marker further down.
     //
-    // Deliberately after the empty-continuation return above: with a positive deadline feed 0
-    // always passes the check (the clock starts when the call does), so the deadline cannot
-    // empty `feeds[]` in production, and that path is better served carrying core's marker
-    // verbatim than re-deriving one.
+    // Deliberately *after* the empty-continuation return above, which reports the deadline's
+    // omissions — and cursors them — from core's marker in place. Only pages that reach the
+    // budget need the marker lifted out of the payload being measured.
     let deadline_marker = out.truncation.take();
     let stop = match core::paginate(&mut out, budget.saturating_sub(*CURSOR_HEADROOM_TOKENS)) {
         Ok(stop) => stop,
