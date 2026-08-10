@@ -495,7 +495,7 @@ impl RssServer {
         &self,
         Parameters(args): Parameters<DiscoverFeedsArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        match core::discover_feeds(&args.site_url, &FetchParams::default()).await {
+        match core::discover_feeds_with(&args.site_url, &FetchParams::default(), &self.http).await {
             Ok(out) => {
                 let summary = format!(
                     "Discovered {} feed(s) at {}.",
@@ -521,7 +521,7 @@ impl RssServer {
         &self,
         Parameters(args): Parameters<GetItemArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        Ok(get_item_inner(&self.cache, args).await)
+        Ok(get_item_inner(&self.http, &self.cache, args).await)
     }
 
     /// Return the authoritative JSON Schema for a command's output.
@@ -1101,13 +1101,13 @@ fn truncation_note(out: &crate::model::FetchOutput) -> String {
 /// Core of the `get_item` tool, free of the `#[tool]` macro plumbing. Guards the
 /// full-content escape hatch: a single item that still exceeds the budget yields a
 /// `RESPONSE_TOO_LARGE` error rather than tripping the client limit.
-async fn get_item_inner(cache: &Cache, args: GetItemArgs) -> CallToolResult {
+async fn get_item_inner(http: &HttpClient, cache: &Cache, args: GetItemArgs) -> CallToolResult {
     let params = FetchParams {
         max_content_chars: args.max_content_chars,
         cache_policy: CachePolicy::CacheFirst,
         ..FetchParams::default()
     };
-    match core::show_item(&args.feed_url, &args.id, &params, cache).await {
+    match core::show_item_with(&args.feed_url, &args.id, &params, cache, http).await {
         Ok(Some(item)) => {
             let estimated = serde_json::to_string_pretty(&item)
                 .map(|s| s.chars().count().div_ceil(4))
@@ -1548,6 +1548,114 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[tokio::test]
+    async fn get_item_and_discover_use_the_shared_client() {
+        // ADR-0016: every tool must share one HttpClient so their per-host pacing coordinates.
+        // Before this fix, core::show_item and core::discover_feeds each built their own.
+        let mut server = mockito::Server::new_async().await;
+        let _f = server
+            .mock("GET", "/feed.xml")
+            .with_status(200)
+            .with_body(feed_with_items(3))
+            .create_async()
+            .await;
+        let _s = server
+            .mock("GET", "/site")
+            .with_status(200)
+            .with_header("content-type", "text/html")
+            .with_body(
+                "<html><head><link rel=\"alternate\" type=\"application/rss+xml\" \
+                 href=\"/feed.xml\"></head></html>",
+            )
+            .create_async()
+            .await;
+        let (cache, dir) = temp_cache("shared-all");
+        let http = test_http();
+
+        let args = GetItemArgs {
+            feed_url: format!("{}/feed.xml", server.url()),
+            id: "0000000000000000".to_string(),
+            max_content_chars: None,
+        };
+        // Signature proves the client is threaded through; NOT_FOUND is the expected outcome.
+        let (is_error, payload) = decode(&get_item_inner(&http, &cache, args).await);
+        assert!(is_error);
+        assert_eq!(payload["code"], "NOT_FOUND");
+
+        let out = core::discover_feeds_with(
+            &format!("{}/site", server.url()),
+            &FetchParams::default(),
+            &http,
+        )
+        .await
+        .expect("discover should succeed");
+        assert_eq!(out.feeds.len(), 1);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn get_item_and_discover_serialize_through_one_gate_on_the_same_host() {
+        // This is the property the signature change above only *enables* — it does not prove
+        // it. A `*_with` that compiles, accepts `http`, and quietly builds its own
+        // `HttpClient::new(...)` inside instead of using it would still pass every assertion
+        // above (NOT_FOUND / a discovered feed), because those don't depend on which gate the
+        // request went through.
+        //
+        // ADR-0016's gate caps same-host concurrency at 1, so two requests to the SAME
+        // authority through ONE shared client must serialize: total wall time is at least
+        // 2x the per-request delay. Through two independent clients (the pre-fix behavior —
+        // each of `core::show_item`/`core::discover_feeds` built its own), each gets its own
+        // gate and the requests run in parallel: total wall time is ~1x the delay. A
+        // regression that re-introduces a per-call client (even behind the new signature)
+        // makes this test observe ~1x delay and fail the `>= 1.6x` bound below.
+        let delay = std::time::Duration::from_millis(150);
+        let base = slow_feed_server(delay, feed_with_items(1));
+        let (cache, dir) = temp_cache("shared-gate-timing");
+        let http = test_http();
+
+        let get_item_args = GetItemArgs {
+            feed_url: format!("{base}/feed.xml"),
+            id: "0000000000000000".to_string(),
+            max_content_chars: None,
+        };
+
+        let site_url = format!("{base}/site");
+        let discover_params = FetchParams::default();
+
+        let started = std::time::Instant::now();
+        let (item_result, discover_result) = tokio::join!(
+            get_item_inner(&http, &cache, get_item_args),
+            core::discover_feeds_with(&site_url, &discover_params, &http),
+        );
+        let elapsed = started.elapsed();
+
+        // Both calls still complete successfully (NOT_FOUND is a structured success path for
+        // get_item; the slow server answers every path with the same RSS body, whose <link>
+        // elements carry no rel="alternate", so discover finds nothing) — the point of this
+        // test is the timing, not the outcome.
+        let (is_error, payload) = decode(&item_result);
+        assert!(is_error, "expected NOT_FOUND, got {payload}");
+        assert_eq!(payload["code"], "NOT_FOUND");
+        assert_eq!(
+            discover_result
+                .expect("discover should succeed")
+                .feeds
+                .len(),
+            0
+        );
+
+        assert!(
+            elapsed >= delay.mul_f64(1.6),
+            "two same-host requests through ONE shared HttpClient must serialize on the \
+             per-host gate (ADR-0016): expected >= {:?}, got {elapsed:?}. A shorter elapsed \
+             means each call built its own client/gate and ran in parallel.",
+            delay.mul_f64(1.6)
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn tools_advertise_annotations_and_output_schema() {
         let tools = RssServer::tool_router().list_all();
@@ -1832,7 +1940,7 @@ mod tests {
             id: "0000000000000000".to_string(),
             max_content_chars: None,
         };
-        let (is_error, payload) = decode(&get_item_inner(&cache, args).await);
+        let (is_error, payload) = decode(&get_item_inner(&test_http(), &cache, args).await);
         assert!(is_error);
         assert_eq!(payload["code"], "NOT_FOUND");
 

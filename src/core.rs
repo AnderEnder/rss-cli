@@ -237,22 +237,47 @@ pub async fn fetch_one(
     Ok((fr, parsed.warnings))
 }
 
-/// Discover feeds advertised on a website homepage.
+/// Discover feeds advertised on a website homepage, through a **caller-provided** client.
+/// The MCP server passes its shared client so discovery shares the per-host gate (ADR-0016).
+pub async fn discover_feeds_with(
+    site_url: &str,
+    _params: &FetchParams,
+    http: &HttpClient,
+) -> Result<DiscoverOutput, RssError> {
+    discover::discover(site_url, http).await
+}
+
+/// Discover feeds advertised on a website homepage. Thin wrapper that builds a client for
+/// the CLI, mirroring how [`fetch_feeds`] wraps [`fetch_feeds_with`].
 pub async fn discover_feeds(
     site_url: &str,
     params: &FetchParams,
 ) -> Result<DiscoverOutput, RssError> {
     let http = HttpClient::new(&params.user_agent, params.timeout)?;
-    discover::discover(site_url, &http).await
+    discover_feeds_with(site_url, params, &http).await
+}
+
+/// Item lookup through a **caller-provided** client. See [`show_item`] for the semantics.
+pub async fn show_item_with(
+    feed_url: &str,
+    key: &str,
+    params: &FetchParams,
+    cache: &Cache,
+    http: &HttpClient,
+) -> Result<Option<crate::model::Item>, RssError> {
+    let (fr, _warnings) = fetch_one(feed_url, http, params, cache).await?;
+    Ok(fr.items.into_iter().find(|it| {
+        it.id == key || it.guid.as_deref() == Some(key) || it.url.as_deref() == Some(key)
+    }))
 }
 
 /// Fetch a feed (cache-first) and return the single item whose `id`, raw `guid`, or resolved
-/// `url` equals `key`, if present.
+/// `url` equals `key`, if present. Thin wrapper that builds a client for the CLI.
 ///
-/// Used by `rss show` and the MCP `get_item` tool. `id` is namespaced by `feed_url` (see
-/// ADR-0003); a `guid` (e.g. Reddit `t3_…`) is feed-window-independent and is the reliable
-/// key across different feed URLs. The lookup is cache-first (ADR-0014): an item the caller
-/// already saw survives a rolled feed window, but not a later cache-overwriting refetch.
+/// `id` is namespaced by `feed_url` (ADR-0003); a `guid` (e.g. Reddit `t3_…`) is
+/// feed-window-independent and is the reliable key across different feed URLs. The lookup is
+/// cache-first (ADR-0014): an item the caller already saw survives a rolled feed window, but
+/// not a later cache-overwriting refetch.
 pub async fn show_item(
     feed_url: &str,
     key: &str,
@@ -260,10 +285,7 @@ pub async fn show_item(
     cache: &Cache,
 ) -> Result<Option<crate::model::Item>, RssError> {
     let http = HttpClient::new(&params.user_agent, params.timeout)?;
-    let (fr, _warnings) = fetch_one(feed_url, &http, params, cache).await?;
-    Ok(fr.items.into_iter().find(|it| {
-        it.id == key || it.guid.as_deref() == Some(key) || it.url.as_deref() == Some(key)
-    }))
+    show_item_with(feed_url, key, params, cache, &http).await
 }
 
 /// Total number of items across every feed in `output`.
