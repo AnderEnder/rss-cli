@@ -180,9 +180,12 @@ pub fn item_count(output: &FetchOutput) -> usize {
     output.feeds.iter().map(|f| f.items.len()).sum()
 }
 
-/// Rough token estimate of the *serialized* `output` — i.e. of the payload an MCP client
-/// actually receives (pretty JSON, matching [`crate::mcp`]'s emission). Uses the same
-/// `ceil(chars / 4)` heuristic as per-item content estimates.
+/// Rough token estimate of the *serialized* `output` (pretty JSON, matching [`crate::mcp`]'s
+/// emission). Uses the same `ceil(chars / 4)` heuristic as per-item content estimates.
+///
+/// This measures the **payload only**. An MCP `CallToolResult` also carries a one-line text
+/// summary next to the `structuredContent`, which is not counted here — callers budgeting
+/// against a client limit must reserve for it separately (`mcp::CURSOR_HEADROOM_TOKENS` does).
 pub fn estimate_response_tokens(output: &FetchOutput) -> usize {
     let json = serde_json::to_string_pretty(output).unwrap_or_default();
     json.chars().count().div_ceil(4)
