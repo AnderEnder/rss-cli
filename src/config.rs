@@ -113,6 +113,27 @@ pub fn parse_duration(s: &str) -> Result<Duration, RssError> {
     Ok(Duration::from_secs(secs))
 }
 
+/// Parse an MCP `cache_policy` argument into a [`CachePolicy`].
+///
+/// A single string rather than a `no_cache: bool` + `max_age: String` pair: clients that
+/// stringify integers stringify booleans too, so `"false"` would fail to deserialize as a
+/// bare `Option<bool>` exactly as `"25"` failed as a bare `Option<usize>`.
+pub fn parse_cache_policy(s: &str) -> Result<CachePolicy, RssError> {
+    let s = s.trim().to_ascii_lowercase();
+    match s.as_str() {
+        "" | "revalidate" => Ok(CachePolicy::Revalidate),
+        "no-cache" => Ok(CachePolicy::NoCache),
+        "cache-first" => Ok(CachePolicy::CacheFirst),
+        other => match other.strip_prefix("max-age:") {
+            Some(dur) if !dur.trim().is_empty() => Ok(CachePolicy::MaxAge(parse_duration(dur)?)),
+            _ => Err(RssError::Usage(format!(
+                "invalid cache_policy '{s}' (expected revalidate | no-cache | cache-first | \
+                 max-age:<duration>, e.g. max-age:15m)"
+            ))),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -126,6 +147,40 @@ mod tests {
         assert_eq!(parse_duration("1w").unwrap(), Duration::from_secs(604_800));
         assert!(parse_duration("2y").is_err(), "unknown unit must error");
         assert!(parse_duration("abc").is_err());
+    }
+
+    #[test]
+    fn parse_cache_policy_covers_the_documented_grammar() {
+        assert_eq!(
+            parse_cache_policy("revalidate").unwrap(),
+            CachePolicy::Revalidate
+        );
+        assert_eq!(
+            parse_cache_policy("no-cache").unwrap(),
+            CachePolicy::NoCache
+        );
+        assert_eq!(
+            parse_cache_policy("cache-first").unwrap(),
+            CachePolicy::CacheFirst
+        );
+        assert_eq!(
+            parse_cache_policy("max-age:15m").unwrap(),
+            CachePolicy::MaxAge(Duration::from_secs(900))
+        );
+        // Case- and whitespace-insensitive, since clients vary.
+        assert_eq!(
+            parse_cache_policy("  No-Cache ").unwrap(),
+            CachePolicy::NoCache
+        );
+
+        // An unknown form must name the accepted ones, so an agent can self-correct.
+        let err = parse_cache_policy("aggressive").unwrap_err().to_string();
+        assert!(
+            err.contains("no-cache"),
+            "error should list valid forms: {err}"
+        );
+        assert!(parse_cache_policy("max-age:").is_err());
+        assert!(parse_cache_policy("max-age:2y").is_err());
     }
 
     #[test]

@@ -260,6 +260,11 @@ struct FetchFeedArgs {
     /// instead of an oversized payload. Omit to use the default budget.
     #[serde(default, deserialize_with = "de_lenient_opt_usize")]
     max_response_tokens: Option<usize>,
+    /// Cache behavior: `revalidate` (default — conditional GET, cheap when unchanged),
+    /// `no-cache` (always refetch), `cache-first` (serve any cached copy without a network
+    /// call), or `max-age:<duration>` (serve cache younger than e.g. `15m`).
+    #[serde(default)]
+    cache_policy: Option<String>,
 }
 
 /// Arguments for the `discover_feeds` tool.
@@ -444,6 +449,12 @@ async fn fetch_feed_inner(http: &HttpClient, cache: &Cache, args: FetchFeedArgs)
                     Some(&primary),
                 );
             }
+        }
+    }
+    if let Some(raw) = args.cache_policy.as_deref() {
+        match crate::config::parse_cache_policy(raw) {
+            Ok(p) => params.cache_policy = p,
+            Err(e) => return tool_error_obj(&e, Some(&primary)),
         }
     }
     // Apply a default item cap so a single huge feed doesn't blow the response budget.
@@ -726,6 +737,7 @@ mod tests {
             limit: None,
             max_content_chars: None,
             max_response_tokens: None,
+            cache_policy: None,
         }
     }
 
@@ -979,6 +991,65 @@ mod tests {
         let (is_error, payload) = decode(&fetch_feed_inner(&test_http(), &cache, args).await);
         assert!(is_error);
         assert_eq!(payload["code"], "USAGE_ERROR");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn fetch_feed_rejects_bad_cache_policy() {
+        let (cache, dir) = temp_cache("badcachepolicy");
+        let mut args = fetch_args("https://example.com/feed.xml".to_string());
+        args.cache_policy = Some("aggressive".to_string());
+
+        let (is_error, payload) = decode(&fetch_feed_inner(&test_http(), &cache, args).await);
+        assert!(is_error);
+        assert_eq!(payload["code"], "USAGE_ERROR");
+        let message = payload["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("no-cache"),
+            "error should list valid forms: {message}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn fetch_feed_cache_first_avoids_network_on_warm_cache() {
+        // Discriminates the wiring from a no-op: the default policy (Revalidate) would send
+        // a conditional GET here and hit the mock; `cache-first` must serve the cached body
+        // without any network call at all. Mirrors
+        // `fetch::tests::cache_first_serves_stale_cache_without_network`.
+        let mut server = mockito::Server::new_async().await;
+        let (cache, dir) = temp_cache("cachepolicy-cachefirst");
+        let url = format!("{}/feed.xml", server.url());
+
+        let meta = crate::cache::CacheMeta {
+            feed_url: url.clone(),
+            etag: Some("\"v1\"".to_string()),
+            last_modified: None,
+            fetched_at: "2020-01-01T00:00:00Z".to_string(),
+            content_type: Some("application/rss+xml".to_string()),
+        };
+        cache
+            .put(&meta, feed_with_items(1).as_bytes())
+            .expect("seed cache");
+
+        // A conditional GET (what Revalidate would send) would match and count as a hit;
+        // `cache-first` must never send it.
+        let mock = server
+            .mock("GET", "/feed.xml")
+            .match_header("if-none-match", "\"v1\"")
+            .with_status(304)
+            .expect(0)
+            .create_async()
+            .await;
+
+        let mut args = fetch_args(url);
+        args.cache_policy = Some("  Cache-First ".to_string());
+
+        let (is_error, payload) = decode(&fetch_feed_inner(&test_http(), &cache, args).await);
+        assert!(!is_error, "cache-first must not error: {payload}");
+        mock.assert_async().await; // expect(0): fails if the network was hit.
 
         std::fs::remove_dir_all(&dir).ok();
     }
