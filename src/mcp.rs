@@ -614,7 +614,11 @@ async fn fetch_feed_inner(http: &HttpClient, cache: &Cache, args: FetchFeedArgs)
     if let Some(c) = &resume
         && let Some(feed) = out.feeds.first_mut()
     {
-        if feed.items.len() != c.n {
+        // Only a *successful* fetch can tell us the window moved. A feed that errored here
+        // (cache evicted between pages, then a failing refetch) has zero items for a reason
+        // already reported in `feeds[].error` / `errors[]`; calling that a rolled window
+        // would be misdirection.
+        if feed.error.is_none() && feed.items.len() != c.n {
             out.warnings.push(crate::model::Warning {
                 feed_url: Some(feed.feed_url.clone()),
                 code: "CACHE_WINDOW_ROLLED".to_string(),
@@ -1861,8 +1865,51 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn garbage_cursor_is_a_usage_error_before_any_fetch() {
-        // Validation happens before the fetch: a bad token never costs a network call.
+    async fn a_failed_continuation_feed_is_not_reported_as_a_rolled_window() {
+        // A feed that *errors* on the continuation also has zero items, but the reason is
+        // already in feeds[].error — labelling it CACHE_WINDOW_ROLLED would misdirect.
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/feed.xml")
+            .with_status(200)
+            .with_body(feed_with_items(10))
+            .create_async()
+            .await;
+        let (cache, dir) = temp_cache("page-roll-vs-error");
+        let http = test_http();
+        let url = format!("{}/feed.xml", server.url());
+
+        let full = full_response_tokens(&http, &cache, fetch_args(url.clone())).await;
+        let mut args = fetch_args(url.clone());
+        args.max_response_tokens = Some(full / 2);
+        let cursor = cursor_of(&fetch_feed_inner(&http, &cache, args).await)
+            .expect("page 1 must hand back a cursor");
+
+        // Evict the cache, then make the refetch fail: the continuation's CacheFirst misses
+        // and falls through to a network call that no longer has a mock behind it.
+        cache.clear().expect("evict the cache");
+        server.reset();
+
+        let mut args = fetch_args(url);
+        args.cursor = Some(cursor);
+        let page2 = output_of(&fetch_feed_inner(&http, &cache, args).await);
+
+        assert_eq!(page2.errors.len(), 1, "the failed refetch must be reported");
+        assert!(
+            !page2
+                .warnings
+                .iter()
+                .any(|w| w.code == "CACHE_WINDOW_ROLLED"),
+            "a fetch failure is not a rolled window: {:?}",
+            page2.warnings
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn garbage_cursor_is_a_usage_error() {
+        // The token is validated rather than silently ignored.
         let (cache, dir) = temp_cache("page-garbage");
         let mut args = fetch_args("https://example.invalid/feed.xml".to_string());
         args.cursor = Some("not-a-real-cursor!!".to_string());
