@@ -347,21 +347,30 @@ and `openWorldHint` for the network-touching tools). See
 
 **Batching and per-host pacing.** Pass several feeds in one `fetch_feed` call via `urls`
 (max 50) instead of looping with your own delays: the server serializes requests to the same
-host and applies an adaptive cooldown that honors the origin's `Retry-After`. If that pacing
-would exceed the server's wait ceiling for one feed of a batch, that feed gets a structured
-**`RATE_LIMITED`** entry in its own `feeds[].error` (`details.retry_after_seconds`/
-`retry_after_ms`) — the `fetch_feed` call itself still succeeds, so check each feed's
-`status`, not just whether the call errored, then wait and retry that feed. `get_item` and
-`discover_feeds` surface the same codes as an actual tool error instead, since each targets
-a single feed or site. A batch that cannot finish inside the server's wall-clock deadline
-returns the feeds it completed plus `truncation.feeds_omitted` for the rest.
+host and applies an adaptive cooldown that honors the origin's `Retry-After`. The common case
+is the origin itself sending a `429`/`403`: that feed gets a structured
+**`FEED_FETCH_FAILED`** entry in its own `feeds[].error` (`details.http_status`,
+`details.retry_after` — the origin's raw header, `null` when it sent none, so back off
+yourself rather than assume none is needed). Only when the server's own pacing ceiling is hit
+(rare at default settings) does a feed instead get **`RATE_LIMITED`**
+(`details.retry_after_seconds`/`retry_after_ms`, always populated). Either way the
+`fetch_feed` call itself still succeeds, so check each feed's `status`, not just whether the
+call errored. `get_item` and `discover_feeds` surface the same codes as an actual tool error
+instead, because each targets a single feed or site. A batch that cannot finish inside the
+server's wall-clock deadline returns the feeds it completed plus `truncation.feeds_omitted`
+for the rest.
 
-**Caching.** Every fetch already performs a conditional GET; an unchanged feed comes back as
-`status: "not_modified"` with `from_cache: true`. Each `FeedResult` carries `cached_at` and
-`cache_age_seconds` so a caller can judge staleness (a feed that revalidates cleanly on every
-call holds `cache_age_seconds` near its polling interval, not the body's true age). Control
-it per call with `cache_policy`: `revalidate` (default), `no-cache`, `cache-first`, or
-`max-age:<duration>`.
+**Caching.** `cache_policy` controls the network call: `revalidate` (default) re-checks with
+whatever validators the cache holds (`If-None-Match`/`If-Modified-Since`) — a `304` comes back
+as `status: "not_modified"` with `from_cache: true`, but a cold cache or an origin that sends
+no validators still gets a full fetch; `no-cache` always refetches in full; `cache-first`
+serves any cached copy with no network call at all; `max-age:<duration>` does the same but
+only when the cache is younger than that duration. A continuation page (`cursor`) forces
+`cache-first` for the whole page, so a feed already cached comes back
+`not_modified`/`from_cache: true` whether or not it actually changed. Each
+`FeedResult` carries `cached_at` and `cache_age_seconds` (both `null` when not served from
+cache) so a caller can judge staleness (a feed that revalidates cleanly on every call holds
+`cache_age_seconds` near its polling interval, not the body's true age).
 
 **Responses are size-bounded, and paged rather than rejected.** AI clients reject oversized
 tool results, so `fetch_feed` caps items per feed (default 25) and checks an estimated-token

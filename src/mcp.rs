@@ -32,40 +32,47 @@ use crate::output;
 
 /// Human-readable guidance surfaced to MCP clients during `initialize`.
 const SERVER_INSTRUCTIONS: &str = "\
-AI-friendly RSS/Atom tools. Every tool returns JSON matching the rss-cli output contract \
-(use get_schema for authoritative shapes). fetch_feed retrieves and parses feeds; \
-discover_feeds finds feeds advertised on a website; get_item returns a single item by its \
-stable id, guid, or permalink; get_schema returns the JSON Schema for 'fetch' or 'discover'.\n\
+AI-friendly RSS/Atom tools. Every tool returns JSON matching the rss-cli output \
+contract (use get_schema for authoritative shapes). fetch_feed retrieves and parses \
+feeds; discover_feeds finds feeds advertised on a website; get_item returns a single \
+item by its stable id, guid, or permalink; get_schema returns the JSON Schema for \
+'fetch' or 'discover'.\n\
 \n\
 BATCHING AND PACING. Pass several feeds at once via fetch_feed's `urls` array (max 50) \
-rather than making one call per feed with your own delays -- the server serializes requests \
-to the same host and applies an adaptive cooldown that honors the origin's Retry-After, so \
-it paces on your behalf. Do NOT hand-roll sleeps between calls. If pacing would exceed the \
-server's wait ceiling, or the origin itself sends a 429/403, that feed gets a RATE_LIMITED \
-or FEED_FETCH_FAILED entry (details.retry_after_seconds / details.http_status+retry_after) \
-in ITS OWN feeds[].error -- the fetch_feed call still succeeds overall, so check each feed's \
-status, not just whether the call errored; wait the given amount and retry that feed. \
-get_item and discover_feeds report the same codes as an actual tool failure instead, since \
-each targets a single feed or site. A batch that cannot finish inside the server's \
-wall-clock deadline returns the feeds it completed plus truncation.feeds_omitted for the \
-rest -- follow truncation.next_cursor when present, or request the omitted feeds separately.\n\
+rather than one call per feed with your own delays -- the server serializes same-host \
+requests and applies an adaptive cooldown honoring the origin's Retry-After, so it \
+paces on your behalf; do NOT hand-roll sleeps. A throttled feed gets its own \
+feeds[].error, not a failed call -- check each feed's status, not just the call's. \
+FEED_FETCH_FAILED (an origin 429/403, the common case) carries details.retry_after, the \
+origin's raw header, null if absent -- then back off yourself rather than assume none \
+is needed. RATE_LIMITED (the server's own pacing ceiling, rare at default settings) \
+carries retry_after_seconds/retry_after_ms instead, always populated; see fetch_feed's \
+own description for exact fields. get_item/discover_feeds report the same codes as an \
+actual tool failure, because each targets one feed or site. A batch that cannot finish \
+inside the wall-clock deadline returns what it completed plus truncation.feeds_omitted \
+-- follow truncation.next_cursor when present, or request the omitted feeds separately.\n\
 \n\
-CACHING. Every fetch already performs a conditional GET (If-None-Match / \
-If-Modified-Since); an unchanged feed comes back as status 'not_modified' with from_cache \
-true, at almost no bandwidth cost -- you do not need to implement this yourself. `since` (a \
-duration like 2h/7d, or an ISO-8601 date) filters items before `limit` is applied. Judge \
-staleness via each feed's cached_at and cache_age_seconds -- note that a feed which \
-revalidates cleanly on every call holds cache_age_seconds near its polling interval, not the \
-body's true age. Control freshness with cache_policy: revalidate (default), no-cache, \
-cache-first, or max-age:<duration> such as max-age:15m.\n\
+CACHING. cache_policy controls the network call: revalidate (default) re-checks with \
+whatever validators the cache holds (If-None-Match / If-Modified-Since) -- a 304 comes \
+back as 'not_modified' with from_cache true, but a cold cache or an origin that sends \
+no validators still gets a full fetch; no-cache always refetches in full; cache-first \
+serves any cached copy with no network call at all; max-age:<duration> (e.g. \
+max-age:15m) does the same but only when the cache is younger than that duration. A \
+continuation page (see `cursor`) forces cache-first for the whole page, so a feed \
+already cached comes back not_modified/from_cache true whether or not it actually \
+changed -- indistinguishable from the result alone. `since` (a duration like 2h/7d, or \
+an ISO-8601 date) filters items before `limit`. Judge staleness via \
+cached_at/cache_age_seconds -- a feed revalidated every call holds cache_age_seconds \
+near its poll interval, not the body's true age.\n\
 \n\
-SIZE LIMITS AND PAGING. Responses are size-bounded. fetch_feed caps items per feed (default \
-25) and fills up to max_response_tokens; whatever did not fit is reported in truncation \
-(items_omitted, feeds_omitted -- both PER PAGE, not cumulative: do not sum them across \
-pages) with truncation.next_cursor. Pass that token back as `cursor` WITH THE SAME \
-ARGUMENTS for the next page: a feed already fetched costs nothing, but one the batch \
-deadline never reached still needs a live fetch. A single item too large on its own still \
-returns RESPONSE_TOO_LARGE with suggested_limit / suggested_max_content_chars.";
+SIZE LIMITS AND PAGING. Responses are size-bounded. fetch_feed caps items per feed \
+(default 25) and fills up to max_response_tokens; whatever did not fit is reported in \
+truncation (items_omitted, feeds_omitted -- both PER PAGE, not cumulative: do not sum \
+them across pages) with truncation.next_cursor. Pass that token back as `cursor` WITH \
+THE SAME ARGUMENTS for the next page: a feed already fetched costs nothing, but one the \
+batch deadline never reached still needs a live fetch. A single item too large on its \
+own still returns RESPONSE_TOO_LARGE with suggested_limit / \
+suggested_max_content_chars.";
 
 /// Default item cap `fetch_feed` applies when the caller passes no `limit`. Bounds the common
 /// "too many items" blow-up (e.g. a hot post's comment feed) without the caller opting in.
@@ -126,8 +133,9 @@ fn batch_deadline() -> std::time::Duration {
 /// constant because [`CURSOR_HEADROOM_TOKENS`] measures it — the reserve has to track the
 /// text, not a number someone remembered to update.
 const PAGINATION_SUGGESTION: &str = "response was bounded by max_response_tokens; pass \
-     truncation.next_cursor back as `cursor` with the same arguments for the next page \
-     (served from cache)";
+     truncation.next_cursor back as `cursor` with the same arguments for the next page -- \
+     a feed already fetched costs nothing, but a feed the batch deadline never reached \
+     still needs a live fetch";
 
 /// Suggestion attached when per-item content was capped by `max_content_chars`. A page can be
 /// both content-truncated *and* paginated, so this is combined with [`PAGINATION_SUGGESTION`]
@@ -413,10 +421,11 @@ struct FetchFeedArgs {
     /// instead of an oversized payload. Omit to use the default budget.
     #[serde(default, deserialize_with = "de_lenient_opt_usize")]
     max_response_tokens: Option<usize>,
-    /// Cache behavior: `revalidate` (default — conditional GET, cheap when unchanged),
-    /// `no-cache` (always refetch), `cache-first` (serve any cached copy without a network
-    /// call), or `max-age:<duration>` (serve cache younger than e.g. `15m`). Ignored on a
-    /// continuation call (see `cursor`), which is always served cache-first.
+    /// Cache behavior: `revalidate` (default — re-checks with cached validators, cheap when
+    /// unchanged, but a cold cache or a validator-less origin gets a full fetch), `no-cache`
+    /// (always refetch), `cache-first` (serve any cached copy without a network call), or
+    /// `max-age:<duration>` (serve cache younger than e.g. `15m`). Ignored on a continuation
+    /// call (see `cursor`), which is always served cache-first.
     #[serde(default)]
     cache_policy: Option<String>,
     /// Opaque continuation token from a prior response's `truncation.next_cursor`. Pass it
@@ -483,7 +492,7 @@ impl RssServer {
     /// Fetch and parse RSS/Atom feeds. Returns the full `FetchOutput` (one entry per URL in
     /// `feeds`), so feed-level errors (including a rate-limit or HTTP failure on one feed of
     /// a batch) surface as a `FeedStatus::Error` entry in `feeds[]`/`errors[]` rather than a
-    /// tool failure — args are `{ url | urls[], content_format?, since?, limit?, \
+    /// tool failure — args are `{ url | urls[], content_format?, since?, limit?,
     /// max_content_chars?, max_response_tokens?, cache_policy?, cursor? }`.
     #[tool(
         description = "Fetch and parse RSS/Atom feeds. Pass one `url` OR a `urls` array (max \
@@ -492,19 +501,23 @@ impl RssServer {
         command=fetch. content_format is markdown|text|html|none. `limit` caps items PER \
         FEED, newest first (DEFAULT 25); `since` accepts a duration (2h, 7d) or an ISO-8601 \
         date and is applied before limit. max_content_chars truncates each body (flagged \
-        content_truncated). `cache_policy` is revalidate (default; conditional GET, cheap \
-        when unchanged) | no-cache | cache-first | max-age:<duration>; every result carries \
-        from_cache, cached_at, and cache_age_seconds so you can judge staleness (a cleanly \
-        revalidating feed holds cache_age_seconds near its poll interval, not the body's true \
-        age). Over-budget results are PAGED, not rejected: check truncation.next_cursor and \
-        pass it back as `cursor` with identical arguments -- a feed already fetched costs \
-        nothing, but one the batch deadline never reached still needs a live fetch. \
+        content_truncated). `cache_policy` is revalidate (default; re-checks with cached \
+        validators, cheap when unchanged, but a cold cache or validator-less origin is a \
+        full fetch) | no-cache | cache-first (serves any cached copy, regardless of age) | \
+        max-age:<duration> (serves a copy younger than that duration); every result carries \
+        from_cache, cached_at, and cache_age_seconds so you can judge staleness (cached_at and \
+        cache_age_seconds are null when not served from cache; a cleanly revalidating feed \
+        holds cache_age_seconds near its poll interval, not the body's true age). Over-budget \
+        results are PAGED, not rejected: check truncation.next_cursor and pass it back as \
+        `cursor` with identical arguments -- a feed already fetched costs nothing, but one \
+        the batch deadline never reached still needs a live fetch. \
         truncation.items_omitted/feeds_omitted describe only this page, not a running total. \
         A lone oversized item still returns RESPONSE_TOO_LARGE with \
         suggested_max_content_chars (a tool-level failure). If the host's pacing ceiling is \
         hit for one feed, THAT FEED gets a RATE_LIMITED entry in feeds[].error with \
-        details.retry_after_seconds -- the call itself still succeeds, so check per-feed \
-        status, not just whether the call errored; wait that long and retry that feed. \
+        details.retry_after_seconds/retry_after_ms -- the call itself still succeeds, so \
+        check per-feed status, not just whether the call errored; wait that long and retry \
+        that feed. \
         Provider notes: \
         some feeds (e.g. Reddit comment .rss) populate only updated, not published, and \
         append the original post to a comment listing (so a comment feed can return one more \
@@ -1773,13 +1786,31 @@ mod tests {
         // The original field report listed conditional GET, per-host pacing, and RATE_LIMITED
         // as "missing" -- all three shipped, but nothing on the tool surface said so. This test
         // exists so that documentation cannot silently drift back out of sync.
+        //
+        // Read the *served* value, not the bare `SERVER_INSTRUCTIONS` const: a prior version of
+        // this test read the const directly, so deleting `.with_instructions(SERVER_INSTRUCTIONS)`
+        // in `get_info()` (i.e. shipping no instructions at all over the protocol) still passed
+        // every assertion below -- the exact failure this test exists to catch.
+        let (cache, dir) = temp_cache("tool-surface-docs");
+        let server = RssServer::new(cache, test_http());
+        let served = server
+            .get_info()
+            .instructions
+            .expect("get_info() must advertise instructions to MCP clients");
+        assert_eq!(
+            served, SERVER_INSTRUCTIONS,
+            "get_info().instructions must be exactly SERVER_INSTRUCTIONS -- the const alone is \
+             not what a client sees"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+
         let tools = RssServer::tool_router().list_all();
         let fetch = tools
             .iter()
             .find(|t| t.name == "fetch_feed")
             .expect("fetch_feed registered");
         let desc = fetch.description.as_deref().unwrap_or_default().to_string();
-        let haystack = format!("{SERVER_INSTRUCTIONS}\n{desc}");
+        let haystack = format!("{served}\n{desc}");
 
         for needle in [
             "RATE_LIMITED",
@@ -1801,6 +1832,17 @@ mod tests {
         // Every argument fetch_feed advertises must be named somewhere in the docs, so adding
         // a new one (e.g. a future `query`/`dedupe`) without documenting it fails this test
         // rather than shipping silently undiscoverable, same as the fixed needles above.
+        //
+        // Near-miss caveat: this is a substring check, so some of these pass only because they
+        // are a substring of a *different*, unrelated word that happens to already be
+        // documented -- not because the argument itself was named. Verified by hand for the
+        // current nine properties: `limit` ← `suggested_limit`, `cursor` ← `next_cursor`,
+        // `max_content_chars` ← `suggested_max_content_chars`, and `url` ← `urls` are all
+        // near-misses (each also has an independent, genuine mention elsewhere in the text, but
+        // the loop below cannot tell the difference and would still pass without one). A
+        // property whose *only* real-world mention is coincidentally a substring of another
+        // property's name would pass this loop while remaining genuinely undocumented -- do not
+        // over-trust a green run here as proof every argument has its own explanation.
         let props = fetch
             .input_schema
             .get("properties")
