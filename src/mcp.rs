@@ -36,8 +36,10 @@ AI-friendly RSS/Atom tools. All tools return JSON text matching the rss-cli outp
 contract (use get_schema for the authoritative shapes). fetch_feed retrieves and parses a \
 feed; discover_feeds finds feeds advertised on a website; get_item returns a single item by \
 its stable id; get_schema returns the JSON Schema for the 'fetch' or 'discover' output. \
-Responses are size-bounded: fetch_feed caps items (default 25) and rejects oversized results \
-with a RESPONSE_TOO_LARGE error carrying suggested limit/max_content_chars to retry with.";
+Responses are size-bounded: fetch_feed caps items (default 25) and pages an over-budget \
+result, returning what fits plus truncation.next_cursor to pass back as 'cursor'. \
+RESPONSE_TOO_LARGE (carrying suggested limit/max_content_chars) is reserved for the case \
+where not even one item fits.";
 
 /// Default item cap `fetch_feed` applies when the caller passes no `limit`. Bounds the common
 /// "too many items" blow-up (e.g. a hot post's comment feed) without the caller opting in.
@@ -54,6 +56,54 @@ const MCP_DEFAULT_LIMIT: usize = 25;
 /// while staying generous for ordinary feeds. This is a heuristic, not a measured universal
 /// client limit — callers with a different limit pass `max_response_tokens` explicitly.
 const MCP_DEFAULT_MAX_RESPONSE_TOKENS: usize = 10_000;
+
+/// Suggestion attached to a page that was bounded by `max_response_tokens`. Pulled out as a
+/// constant because [`cursor_headroom_tokens`] measures it — the reserve has to track the
+/// text, not a number someone remembered to update.
+const PAGINATION_SUGGESTION: &str = "response was bounded by max_response_tokens; pass \
+     truncation.next_cursor back as `cursor` with the same arguments for the next page \
+     (served from cache)";
+
+/// The widest [`crate::model::TruncationInfo`] a paginated response can carry: every numeric
+/// field at its maximum, a full-length cursor, and the real suggestion text.
+fn worst_case_marker() -> crate::model::TruncationInfo {
+    crate::model::TruncationInfo {
+        applied_limit: Some(usize::MAX),
+        items_content_truncated: usize::MAX,
+        items_omitted: usize::MAX,
+        feeds_omitted: usize::MAX,
+        next_cursor: Some(
+            crate::cursor::Cursor {
+                v: u8::MAX,
+                fp: "f".repeat(16),
+                f: usize::MAX,
+                i: usize::MAX,
+                n: usize::MAX,
+                s: Some(i64::MIN),
+            }
+            .encode(),
+        ),
+        estimated_tokens: Some(usize::MAX),
+        suggestion: Some(PAGINATION_SUGGESTION.to_string()),
+    }
+}
+
+/// Tokens to hold back from `max_response_tokens` before calling [`core::paginate`].
+///
+/// `paginate` measures the page *as it stands*: the `truncation` marker and `next_cursor`
+/// attached afterwards are not counted, so a page filled exactly to the budget would ship
+/// over it. Measured rather than hardcoded — the dominant terms are [`PAGINATION_SUGGESTION`]
+/// and the encoded cursor, both of which move when the code does. Pinned by
+/// `cursor_headroom_covers_the_marker_it_reserves_for`.
+fn cursor_headroom_tokens() -> usize {
+    // `+ 8` for the two extra spaces of indentation each of the marker's lines picks up once
+    // nested inside `FetchOutput`. The `"truncation":` key itself needs no reserve: it was
+    // already measured (as `null`) in the page `paginate` saw.
+    serde_json::to_string_pretty(&worst_case_marker())
+        .map(|s| s.chars().count().div_ceil(4))
+        .unwrap_or(0)
+        + 8
+}
 
 /// Deserialize an optional `usize` that may arrive as a JSON **number** *or* a JSON
 /// **string** (`25` or `"25"`); `null`/absent both map to `None`. Many MCP clients serialize
@@ -266,9 +316,15 @@ struct FetchFeedArgs {
     max_response_tokens: Option<usize>,
     /// Cache behavior: `revalidate` (default — conditional GET, cheap when unchanged),
     /// `no-cache` (always refetch), `cache-first` (serve any cached copy without a network
-    /// call), or `max-age:<duration>` (serve cache younger than e.g. `15m`).
+    /// call), or `max-age:<duration>` (serve cache younger than e.g. `15m`). Ignored on a
+    /// continuation call (see `cursor`), which is always served cache-first.
     #[serde(default)]
     cache_policy: Option<String>,
+    /// Opaque continuation token from a prior response's `truncation.next_cursor`. Pass it
+    /// back with the SAME arguments to get the next page. Continuation pages are served from
+    /// cache, so they cost no rate-limit budget.
+    #[serde(default)]
+    cursor: Option<String>,
 }
 
 /// Arguments for the `discover_feeds` tool.
@@ -336,9 +392,12 @@ impl RssServer {
         structured content (and a one-line text summary); schema: get_schema command=fetch. \
         content_format is one of markdown|text|html|none; limit caps items, newest first \
         (DEFAULT 25 when omitted). max_content_chars truncates each item body (flagged \
-        content_truncated). The response is size-bounded by max_response_tokens; if it would \
-        overflow, the tool returns a RESPONSE_TOO_LARGE error whose details include \
-        suggested_limit and suggested_max_content_chars to retry with. Provider notes: some \
+        content_truncated). The response is size-bounded by max_response_tokens: an \
+        over-budget result returns the items that fit plus truncation.next_cursor — pass that \
+        token back as `cursor` with the SAME arguments for the next page, which is served \
+        from cache and costs no rate-limit budget. RESPONSE_TOO_LARGE (whose details include \
+        suggested_limit and suggested_max_content_chars to retry with) is returned only when \
+        not even one item fits. Provider notes: some \
         feeds (e.g. Reddit comment .rss) populate only updated, not published, and append the \
         original post to a comment listing (so a comment feed can return one more item than \
         limit); search.rss results are best-effort and may be sparse.",
@@ -468,33 +527,205 @@ async fn fetch_feed_inner(http: &HttpClient, cache: &Cache, args: FetchFeedArgs)
     params.limit = Some(args.limit.unwrap_or(MCP_DEFAULT_LIMIT));
     params.max_content_chars = args.max_content_chars;
 
-    let mut out = core::fetch_feeds_with(&urls, &params, cache, http).await;
+    // Fingerprint the RAW argument strings, never the resolved values: `since: "2h"` resolves
+    // to a new instant on every call, so a resolved fingerprint would never match on page 2
+    // (the resolved cutoff rides in the cursor's `s` field instead). The two trailing
+    // placeholders stand in for Phase 3's `query` / `dedupe`; their exact bytes are part of
+    // every fingerprint, so changing them invalidates every outstanding cursor.
+    let fp = crate::cursor::fingerprint(
+        &urls,
+        &[
+            args.content_format.as_deref().unwrap_or("markdown"),
+            args.since.as_deref().unwrap_or(""),
+            &args.limit.map(|n| n.to_string()).unwrap_or_default(),
+            &args
+                .max_content_chars
+                .map(|n| n.to_string())
+                .unwrap_or_default(),
+            "",       // query — populated in Phase 3
+            "report", // dedupe — populated in Phase 3
+        ],
+    );
 
-    // Reject oversized results with an actionable error rather than letting the client trip
-    // its own tool-result-too-large limit on an opaque failure.
+    let mut resume: Option<crate::cursor::Cursor> = None;
+    if let Some(token) = args.cursor.as_deref() {
+        let c = match crate::cursor::Cursor::decode(token) {
+            Ok(c) => c,
+            Err(e) => return tool_error_obj(&e, Some(&primary)),
+        };
+        if c.fp != fp {
+            return tool_error_code(
+                "USAGE_ERROR",
+                "cursor does not match this request; pass the cursor back with the same \
+                 urls/content_format/since/limit/max_content_chars, or drop it to start over",
+                Some(&primary),
+            );
+        }
+        if c.f >= urls.len() {
+            return tool_error_code(
+                "USAGE_ERROR",
+                "cursor points past the end of this request's feed list",
+                Some(&primary),
+            );
+        }
+        // Reuse the page-1 cutoff so every page filters against one instant. An `s` that is
+        // not a representable instant would otherwise *widen* the window — dropping the cutoff
+        // entirely and returning items page 1 filtered out — so reject it instead.
+        if let Some(secs) = c.s {
+            match chrono::DateTime::from_timestamp(secs, 0) {
+                Some(dt) => params.since = Some(dt),
+                None => {
+                    return tool_error_code(
+                        "USAGE_ERROR",
+                        "invalid cursor: the recorded `since` cutoff is not a valid instant",
+                        Some(&primary),
+                    );
+                }
+            }
+        }
+        // A continuation is served from cache: feeds already fetched cost nothing, and feeds
+        // never reached fall through to the network on a cache miss (see `CachePolicy`). This
+        // deliberately overrides whatever `cache_policy` the caller passed — the body cache is
+        // the pagination store.
+        params.cache_policy = CachePolicy::CacheFirst;
+        resume = Some(c);
+    }
+
+    // `Cursor.f` always indexes the ORIGINAL request URL list; a continuation fetches
+    // `urls[f..]`, so this page's feed 0 is `urls[f]`.
+    let start_feed = resume.as_ref().map_or(0, |c| c.f);
+    let mut out = core::fetch_feeds_with(&urls[start_feed..], &params, cache, http).await;
+    // Load-bearing for the cursor arithmetic below: `core` returns exactly one `FeedResult`
+    // per requested URL, in request order, errors included — which is what lets
+    // `PageStop::feed_idx` (an index into the pre-trim feed list) become an index into `urls`
+    // by adding `start_feed`. Task 8's batch deadline plans to *omit* unreached feeds from
+    // `feeds[]`; the moment it does, this arithmetic must be reworked or it will mint cursors
+    // pointing at the wrong feed.
+    debug_assert_eq!(
+        out.feeds.len(),
+        urls.len() - start_feed,
+        "core must return one feed per requested url for cursor positions to line up"
+    );
+
+    // Skip the items already delivered from the resumed feed, warning if the window rolled.
+    // `skipped` is what we *actually* dropped (a rolled window can hold fewer items than the
+    // cursor's `i`), and it is the offset that makes the next cursor absolute again.
+    let mut skipped = 0usize;
+    if let Some(c) = &resume
+        && let Some(feed) = out.feeds.first_mut()
+    {
+        if feed.items.len() != c.n {
+            out.warnings.push(crate::model::Warning {
+                feed_url: Some(feed.feed_url.clone()),
+                code: "CACHE_WINDOW_ROLLED".to_string(),
+                message: format!(
+                    "feed now has {} item(s) but had {} when the cursor was minted; resuming \
+                     at index {} may skip or repeat items",
+                    feed.items.len(),
+                    c.n,
+                    c.i
+                ),
+            });
+        }
+        skipped = c.i.min(feed.items.len());
+        feed.items.drain(..skipped);
+        // Per-feed counts *and* the top-level totals now describe items that are gone.
+        core::refresh_feed_counts(&mut out);
+    }
+
+    // Fill the page to the budget rather than rejecting the whole batch: with `urls[]`,
+    // rejecting would discard every successful fetch because one trailing item overflowed
+    // (ADR-0017). Reserve headroom for the marker + cursor `paginate` cannot measure.
     let budget = args
         .max_response_tokens
         .unwrap_or(MCP_DEFAULT_MAX_RESPONSE_TOKENS);
-    match core::enforce_response_budget(&out, budget) {
-        Ok(estimated) => {
-            // A marker is emitted only when content was actually truncated; the default cap
-            // is documented in the tool description, so an untruncated response stays clean.
-            if let Some(mut marker) = core::truncation_marker(
-                &out,
-                params.limit,
-                Some(
-                    "content was truncated; call get_item for the full body of a specific item"
-                        .to_string(),
-                ),
-            ) {
-                marker.estimated_tokens = Some(estimated);
-                out.truncation = Some(marker);
+    let stop = match core::paginate(&mut out, budget.saturating_sub(cursor_headroom_tokens())) {
+        Ok(stop) => stop,
+        // `paginate` mutates `out` on its error paths, so surface the error alone — never a
+        // half-trimmed page. On a continuation this does *not* mean the batch failed: the
+        // pages already delivered are still valid, so say so.
+        Err(e) => {
+            let mut obj = e.to_error_obj(Some(&primary));
+            if resume.is_some() {
+                obj.message.push_str(
+                    " (this is a continuation page: the pages you already received are still \
+                     valid — retry this same cursor with a larger max_response_tokens or a \
+                     smaller max_content_chars)",
+                );
+                if let Some(details) = obj.details.as_object_mut() {
+                    details.insert("continuation".to_string(), serde_json::Value::Bool(true));
+                }
             }
-            let summary = fetch_summary(&out, &primary);
-            structured_result(&out, summary)
+            return error_result(obj);
         }
-        Err(e) => tool_error_obj(&e, Some(&primary)),
+    };
+
+    // `paginate` trims `feeds` but not `errors`, so a feed it dropped whole would leave an
+    // entry in `errors[]` with no matching `feeds[]` entry, breaking the documented mirror.
+    // Dropping it loses nothing: `paginate` resumes at the first feed this page does not carry
+    // in full — which a dropped feed always is — so the next page reports it again.
+    let present: std::collections::HashSet<String> =
+        out.feeds.iter().map(|f| f.feed_url.clone()).collect();
+    out.errors
+        .retain(|e| e.feed_url.as_ref().is_none_or(|u| present.contains(u)));
+
+    // A marker is emitted only when the agent is genuinely not seeing everything: content was
+    // truncated, or (below) the page was bounded and there is more to fetch.
+    let mut marker = core::truncation_marker(
+        &out,
+        params.limit,
+        Some(
+            "content was truncated; call get_item for the full body of a specific item".to_string(),
+        ),
+    );
+    // Borrow rather than move: Task 8 inspects `stop` again to decide whether the deadline
+    // (not the budget) is what truncated the page.
+    if let Some(stop) = stop.as_ref() {
+        // Positions in `stop` are relative to the fetched slice; the cursor is absolute.
+        let absolute_feed = start_feed + stop.feed_idx;
+        // Items this call already skipped in the resumed feed, so the next cursor's `i`/`n`
+        // stay absolute within that feed's item list rather than relative to this page. Only
+        // the resumed feed (this page's feed 0) carries such an offset.
+        let already = if absolute_feed == start_feed {
+            skipped
+        } else {
+            0
+        };
+        let next = crate::cursor::Cursor {
+            v: crate::cursor::CURSOR_VERSION,
+            fp: fp.clone(),
+            f: absolute_feed,
+            i: already + stop.item_idx,
+            n: already + stop.feed_item_count,
+            s: params.since.map(|dt| dt.timestamp()),
+        };
+        let m = marker.get_or_insert(crate::model::TruncationInfo {
+            applied_limit: params.limit,
+            items_content_truncated: 0,
+            items_omitted: 0,
+            feeds_omitted: 0,
+            estimated_tokens: None,
+            next_cursor: None,
+            suggestion: None,
+        });
+        m.items_omitted = stop.items_omitted;
+        m.feeds_omitted = stop.feeds_omitted;
+        m.next_cursor = Some(next.encode());
+        m.suggestion = Some(PAGINATION_SUGGESTION.to_string());
     }
+
+    out.truncation = marker;
+    // Measured with the marker already attached, so `estimated_tokens` describes the payload
+    // the client actually receives (bar the digits of the number itself).
+    if out.truncation.is_some() {
+        let estimated = core::estimate_response_tokens(&out);
+        if let Some(m) = out.truncation.as_mut() {
+            m.estimated_tokens = Some(estimated);
+        }
+    }
+
+    let summary = fetch_summary(&out, &primary);
+    structured_result(&out, summary)
 }
 
 /// A one-line, human/agent-readable summary of a `fetch_feed` result. Kept terse on purpose:
@@ -517,9 +748,7 @@ fn fetch_summary(out: &crate::model::FetchOutput, url: &str) -> String {
                 "Fetched {} item(s) (~{} content tokens) from \"{title}\".",
                 out.total_items, out.total_content_tokens_est
             );
-            if out.truncation.is_some() {
-                s.push_str(" Content truncated (see structuredContent.truncation).");
-            }
+            s.push_str(&truncation_note(out));
             s.push_str(" Full data in structuredContent.");
             s
         }
@@ -534,10 +763,31 @@ fn fetch_summary(out: &crate::model::FetchOutput, url: &str) -> String {
                     "; {failed} feed(s) failed (see structuredContent.errors)"
                 ));
             }
-            s.push_str(". Full data in structuredContent.");
+            s.push('.');
+            s.push_str(&truncation_note(out));
+            s.push_str(" Full data in structuredContent.");
             s
         }
     }
+}
+
+/// How this response was bounded, as a sentence or two for the summary line. Kept separate
+/// from [`fetch_summary`]'s two branches so both report pagination identically — an agent that
+/// reads only the text must still learn that a `next_cursor` is waiting.
+fn truncation_note(out: &crate::model::FetchOutput) -> String {
+    let Some(t) = &out.truncation else {
+        return String::new();
+    };
+    let mut s = String::new();
+    if t.items_content_truncated > 0 {
+        s.push_str(" Content truncated (see structuredContent.truncation).");
+    }
+    if t.next_cursor.is_some() {
+        s.push_str(
+            " More items remain: pass truncation.next_cursor back as `cursor` for the next page.",
+        );
+    }
+    s
 }
 
 /// Core of the `get_item` tool, free of the `#[tool]` macro plumbing. Guards the
@@ -682,6 +932,33 @@ pub async fn serve_stdio(cache: Cache) -> Result<(), RssError> {
     Ok(())
 }
 
+/// Test-only seam: run one `fetch_feed` page and return the model rather than the wire
+/// `CallToolResult`, so integration tests assert on typed data. Not part of the MCP surface.
+#[doc(hidden)]
+pub async fn fetch_page_for_test(
+    http: &HttpClient,
+    cache: &Cache,
+    urls: &[String],
+    max_response_tokens: usize,
+    cursor: Option<String>,
+) -> crate::model::FetchOutput {
+    let args = FetchFeedArgs {
+        url: None,
+        urls: Some(urls.to_vec()),
+        content_format: None,
+        limit: None,
+        max_content_chars: None,
+        max_response_tokens: Some(max_response_tokens),
+        since: None,
+        cache_policy: None,
+        cursor,
+    };
+    let result = fetch_feed_inner(http, cache, args).await;
+    let wire = serde_json::to_value(&result).expect("serialize result");
+    serde_json::from_value(wire["structuredContent"].clone())
+        .expect("structuredContent should be a FetchOutput")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -748,6 +1025,33 @@ mod tests {
         )
     }
 
+    /// `fetch_feed` arguments for a multi-URL batch.
+    fn batch_args(urls: Vec<String>) -> FetchFeedArgs {
+        let mut args = fetch_args(String::new());
+        args.url = None;
+        args.urls = Some(urls);
+        args
+    }
+
+    /// Decode a page that must have succeeded into the typed model.
+    fn output_of(result: &CallToolResult) -> crate::model::FetchOutput {
+        let (is_error, payload) = decode(result);
+        assert!(!is_error, "expected a successful page, got: {payload}");
+        serde_json::from_value(payload).expect("structuredContent should be a FetchOutput")
+    }
+
+    /// The `truncation.next_cursor` of a successful page, if it has one.
+    fn cursor_of(result: &CallToolResult) -> Option<String> {
+        output_of(result).truncation.and_then(|t| t.next_cursor)
+    }
+
+    /// Estimated size of the whole (unpaginated) response for `args`. Tests derive their
+    /// budgets from this rather than hardcoding a fraction, so they cannot drift into the
+    /// "not even one item fits" window if the fixture changes size.
+    async fn full_response_tokens(http: &HttpClient, cache: &Cache, args: FetchFeedArgs) -> usize {
+        core::estimate_response_tokens(&output_of(&fetch_feed_inner(http, cache, args).await))
+    }
+
     fn fetch_args(url: String) -> FetchFeedArgs {
         FetchFeedArgs {
             url: Some(url),
@@ -758,6 +1062,7 @@ mod tests {
             max_content_chars: None,
             max_response_tokens: None,
             cache_policy: None,
+            cursor: None,
         }
     }
 
@@ -914,6 +1219,15 @@ mod tests {
         assert!(
             fetch.output_schema.is_some(),
             "fetch_feed should advertise its FetchOutput output_schema"
+        );
+        // The continuation token is useless to a client that cannot see it in the input schema.
+        assert!(
+            fetch
+                .input_schema
+                .get("properties")
+                .is_some_and(|p| p.as_object().is_some_and(|p| p.contains_key("cursor"))),
+            "fetch_feed must advertise the `cursor` argument: {:?}",
+            fetch.input_schema
         );
 
         // get_schema is local-only (not open-world) and has no fixed output shape.
@@ -1311,6 +1625,399 @@ mod tests {
             serde_json::from_str::<FetchFeedArgs>(r#"{"urls":[1,2]}"#).is_err(),
             "non-string array elements must be rejected"
         );
+    }
+
+    /// Serve two feeds and return `(http, cache, dir, urls, full_tokens)` — the shared setup
+    /// for the pagination tests. `full_tokens` is the size of the *unpaginated* response, so
+    /// each test can ask for a budget that provably forces a second page.
+    async fn paging_fixture(
+        server: &mut mockito::ServerGuard,
+        tag: &str,
+    ) -> (HttpClient, Cache, std::path::PathBuf, Vec<String>, usize) {
+        server
+            .mock("GET", "/a.xml")
+            .with_status(200)
+            .with_body(feed_with_items(10))
+            .create_async()
+            .await;
+        server
+            .mock("GET", "/b.xml")
+            .with_status(200)
+            .with_body(feed_with_items(10))
+            .create_async()
+            .await;
+        let (cache, dir) = temp_cache(tag);
+        let http = test_http();
+        let urls = vec![
+            format!("{}/a.xml", server.url()),
+            format!("{}/b.xml", server.url()),
+        ];
+        let full = full_response_tokens(&http, &cache, batch_args(urls.clone())).await;
+        (http, cache, dir, urls, full)
+    }
+
+    #[test]
+    fn cursor_headroom_covers_the_marker_it_reserves_for() {
+        // The reserve must be an upper bound on what attaching the marker actually costs,
+        // measured the same way the budget is: if it under-reserves, a page filled exactly to
+        // `budget - headroom` ships over the caller's budget.
+        let mut out = crate::model::FetchOutput::new("2026-01-01T00:00:00Z".to_string());
+        let bare = core::estimate_response_tokens(&out);
+        out.truncation = Some(worst_case_marker());
+        let with_marker = core::estimate_response_tokens(&out);
+
+        let actual = with_marker - bare;
+        let reserved = cursor_headroom_tokens();
+        assert!(
+            actual <= reserved,
+            "attaching the marker costs {actual} tokens but only {reserved} are reserved"
+        );
+        // ...and not wildly generous either: a bloated reserve silently shrinks every page.
+        assert!(
+            reserved <= actual + 30,
+            "reserve {reserved} is far above the real cost {actual}"
+        );
+    }
+
+    #[tokio::test]
+    async fn over_budget_batch_returns_a_page_plus_a_cursor() {
+        // The headline behavior change: an over-budget batch used to throw away every
+        // successful fetch with RESPONSE_TOO_LARGE. It now ships what fits and hands back a
+        // continuation token (ADR-0017).
+        let mut server = mockito::Server::new_async().await;
+        let (http, cache, dir, urls, full) = paging_fixture(&mut server, "page-first").await;
+
+        let budget = full / 2;
+        let mut args = batch_args(urls);
+        args.max_response_tokens = Some(budget);
+        let result = fetch_feed_inner(&http, &cache, args).await;
+        let page = output_of(&result);
+
+        assert!(
+            page.total_items > 0,
+            "an over-budget batch must still ship the items that fit"
+        );
+        let t = page
+            .truncation
+            .as_ref()
+            .expect("a bounded page must carry a truncation marker");
+        assert!(
+            t.next_cursor.is_some(),
+            "a bounded page must hand back a cursor: {t:?}"
+        );
+        assert!(
+            t.items_omitted > 0,
+            "it must report what it deferred: {t:?}"
+        );
+        assert_eq!(t.applied_limit, Some(MCP_DEFAULT_LIMIT));
+        assert!(
+            t.suggestion
+                .as_deref()
+                .is_some_and(|s| s.contains("next_cursor")),
+            "the suggestion must tell the agent how to page: {:?}",
+            t.suggestion
+        );
+        // Headroom check: the *emitted* page carries the marker and cursor that `paginate`
+        // never measured, and must still fit the caller's budget.
+        let emitted = core::estimate_response_tokens(&page);
+        assert!(
+            emitted <= budget,
+            "the emitted page must fit the budget: {emitted} > {budget}"
+        );
+        let summary = summary_text(&result).expect("a text summary");
+        assert!(
+            summary.contains("next_cursor"),
+            "the one-line summary must point at the cursor: {summary}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_shed_error_feed_leaves_no_orphan_in_errors() {
+        // `paginate` trims `feeds` but not `errors`. A failed feed dropped whole must not
+        // linger in `errors[]` with no matching `feeds[]` entry (the two are documented as
+        // mirrors) — it belongs to the next page, which resumes at exactly that feed.
+        let mut server = mockito::Server::new_async().await;
+        let _a = server
+            .mock("GET", "/a.xml")
+            .with_status(200)
+            .with_body(feed_with_items(10))
+            .create_async()
+            .await;
+        let _bad = server
+            .mock("GET", "/bad.xml")
+            .with_status(404)
+            .create_async()
+            .await;
+        let (cache, dir) = temp_cache("page-orphan-error");
+        let http = test_http();
+        let urls = vec![
+            format!("{}/a.xml", server.url()),
+            format!("{}/bad.xml", server.url()),
+        ];
+
+        let full = full_response_tokens(&http, &cache, batch_args(urls.clone())).await;
+        let mut args = batch_args(urls.clone());
+        args.max_response_tokens = Some(full / 2);
+        let result = fetch_feed_inner(&http, &cache, args).await;
+        let page1 = output_of(&result);
+
+        assert_eq!(
+            page1.feeds.len(),
+            1,
+            "the budget must have shed the trailing feed: {:?}",
+            page1.feeds.iter().map(|f| &f.feed_url).collect::<Vec<_>>()
+        );
+        assert!(
+            page1.errors.is_empty(),
+            "an error whose feed was shed must not be reported without it: {:?}",
+            page1.errors
+        );
+        let cursor = page1
+            .truncation
+            .and_then(|t| t.next_cursor)
+            .expect("page 1 must hand back a cursor");
+
+        // The next page reaches the failed feed and reports it there, so nothing is lost.
+        let mut args = batch_args(urls);
+        args.cursor = Some(cursor);
+        let page2 = output_of(&fetch_feed_inner(&http, &cache, args).await);
+        assert_eq!(
+            page2.errors.len(),
+            1,
+            "the failed feed must surface on the page that reaches it: {page2:?}"
+        );
+        assert!(
+            page2
+                .feeds
+                .iter()
+                .any(|f| f.status == crate::model::FeedStatus::Error),
+            "and it must be present in feeds[] alongside its error"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn cursor_from_a_different_request_is_rejected() {
+        // Resuming at a position computed under different arguments would return wrong data,
+        // so a fingerprint mismatch is a hard usage error, not a silent restart.
+        let mut server = mockito::Server::new_async().await;
+        let (http, cache, dir, urls, full) = paging_fixture(&mut server, "page-fp").await;
+
+        let mut args = batch_args(urls.clone());
+        args.max_response_tokens = Some(full / 2);
+        let cursor = cursor_of(&fetch_feed_inner(&http, &cache, args).await)
+            .expect("page 1 must hand back a cursor");
+
+        let mut args = batch_args(urls);
+        args.max_response_tokens = Some(full / 2);
+        args.content_format = Some("text".to_string()); // changes the request shape
+        args.cursor = Some(cursor);
+        let (is_error, payload) = decode(&fetch_feed_inner(&http, &cache, args).await);
+
+        assert!(is_error, "a mismatched cursor must not be honored");
+        assert_eq!(payload["code"], "USAGE_ERROR");
+        assert!(
+            payload["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("does not match")),
+            "the error must say the cursor belongs to another request: {payload}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn cursor_past_the_end_of_the_url_list_is_rejected() {
+        let mut server = mockito::Server::new_async().await;
+        let (http, cache, dir, urls, full) = paging_fixture(&mut server, "page-oob").await;
+
+        let mut args = batch_args(urls.clone());
+        args.max_response_tokens = Some(full / 2);
+        let cursor = cursor_of(&fetch_feed_inner(&http, &cache, args).await)
+            .expect("page 1 must hand back a cursor");
+
+        // Keep the (matching) fingerprint, move the feed position out of range.
+        let mut c = crate::cursor::Cursor::decode(&cursor).expect("decode page 1 cursor");
+        c.f = urls.len() + 5;
+
+        let mut args = batch_args(urls);
+        args.max_response_tokens = Some(full / 2);
+        args.cursor = Some(c.encode());
+        let (is_error, payload) = decode(&fetch_feed_inner(&http, &cache, args).await);
+
+        assert!(is_error);
+        assert_eq!(payload["code"], "USAGE_ERROR");
+        assert!(
+            payload["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("past the end")),
+            "the error must name the out-of-range position: {payload}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn garbage_cursor_is_a_usage_error_before_any_fetch() {
+        // Validation happens before the fetch: a bad token never costs a network call.
+        let (cache, dir) = temp_cache("page-garbage");
+        let mut args = fetch_args("https://example.invalid/feed.xml".to_string());
+        args.cursor = Some("not-a-real-cursor!!".to_string());
+
+        let (is_error, payload) = decode(&fetch_feed_inner(&test_http(), &cache, args).await);
+        assert!(is_error);
+        assert_eq!(payload["code"], "USAGE_ERROR");
+        assert!(
+            payload["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("cursor")),
+            "the error must name the cursor: {payload}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn continuation_that_cannot_fit_an_item_says_earlier_pages_shipped() {
+        // `paginate` can still raise RESPONSE_TOO_LARGE on page 2 (an item that fits no
+        // budget). The agent must not read that as "the whole batch failed" — pages already
+        // delivered are still good and the cursor is still valid.
+        let mut server = mockito::Server::new_async().await;
+        let (http, cache, dir, urls, full) = paging_fixture(&mut server, "page-cont-err").await;
+
+        let mut args = batch_args(urls.clone());
+        args.max_response_tokens = Some(full / 2);
+        let cursor = cursor_of(&fetch_feed_inner(&http, &cache, args).await)
+            .expect("page 1 must hand back a cursor");
+
+        let mut args = batch_args(urls);
+        args.max_response_tokens = Some(1); // no item can fit
+        args.cursor = Some(cursor);
+        let (is_error, payload) = decode(&fetch_feed_inner(&http, &cache, args).await);
+
+        assert!(is_error);
+        assert_eq!(payload["code"], "RESPONSE_TOO_LARGE");
+        assert_eq!(
+            payload["details"]["continuation"], true,
+            "the error must be machine-readably marked as a continuation: {payload}"
+        );
+        assert!(
+            payload["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("continuation")),
+            "the message must say earlier pages already shipped: {payload}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn continuation_warns_when_the_cached_window_rolled() {
+        // Another caller can overwrite the cached body between pages (a `revalidate` fetch).
+        // The item count then no longer matches what the cursor recorded: we resume anyway and
+        // warn, because `warnings` is the additive "you should know, but here is your data"
+        // channel (invariant 9).
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/feed.xml")
+            .with_status(200)
+            .with_body(feed_with_items(10))
+            .create_async()
+            .await;
+        let (cache, dir) = temp_cache("page-roll");
+        let http = test_http();
+        let url = format!("{}/feed.xml", server.url());
+
+        let full = full_response_tokens(&http, &cache, fetch_args(url.clone())).await;
+        let mut args = fetch_args(url.clone());
+        args.max_response_tokens = Some(full / 2);
+        let cursor = cursor_of(&fetch_feed_inner(&http, &cache, args).await)
+            .expect("page 1 must hand back a cursor");
+        let c = crate::cursor::Cursor::decode(&cursor).expect("decode cursor");
+        assert_eq!(c.f, 0, "a single-feed request resumes in feed 0");
+        assert_eq!(
+            c.n, 10,
+            "the cursor records the window it was minted against"
+        );
+
+        // Roll the window: the same feed, now two items shorter.
+        let meta = crate::cache::CacheMeta {
+            feed_url: url.clone(),
+            etag: None,
+            last_modified: None,
+            fetched_at: "2020-01-01T00:00:00Z".to_string(),
+            content_type: Some("application/rss+xml".to_string()),
+        };
+        cache
+            .put(&meta, feed_with_items(8).as_bytes())
+            .expect("overwrite the cached body");
+
+        // Page 2 gets the full budget (`max_response_tokens` is deliberately outside the
+        // fingerprint), so everything the rolled window still holds ships in one go and the
+        // resumed count is exact.
+        let mut args = fetch_args(url);
+        args.cursor = Some(cursor);
+        let page2 = output_of(&fetch_feed_inner(&http, &cache, args).await);
+
+        assert!(
+            page2
+                .warnings
+                .iter()
+                .any(|w| w.code == "CACHE_WINDOW_ROLLED"),
+            "a shifted window must be warned about: {:?}",
+            page2.warnings
+        );
+        assert_eq!(
+            page2.total_items,
+            8usize.saturating_sub(c.i),
+            "the continuation resumes at the recorded index in the new, shorter window"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn continuation_reuses_the_page_one_since_cutoff() {
+        // `since: "7d"` resolves to a new instant on every call. The fingerprint covers the
+        // RAW string (so the continuation matches at all) and the resolved cutoff rides in the
+        // cursor's `s` field (so every page filters against one instant).
+        let mut server = mockito::Server::new_async().await;
+        let (http, cache, dir, urls, full) = paging_fixture(&mut server, "page-since").await;
+
+        let mut args = batch_args(urls.clone());
+        args.since = Some("7d".to_string());
+        args.max_response_tokens = Some(full / 2);
+        let cursor = cursor_of(&fetch_feed_inner(&http, &cache, args).await)
+            .expect("page 1 must hand back a cursor");
+        let c1 = crate::cursor::Cursor::decode(&cursor).expect("decode cursor");
+        let cutoff =
+            c1.s.expect("a resolved `since` cutoff must ride in the cursor");
+        let expected = (chrono::Utc::now() - chrono::Duration::days(7)).timestamp();
+        assert!(
+            (cutoff - expected).abs() < 60,
+            "the cursor must carry the resolved cutoff ({cutoff} vs ~{expected})"
+        );
+
+        let mut args = batch_args(urls);
+        args.since = Some("7d".to_string()); // same raw string, later resolved instant
+        args.max_response_tokens = Some(full / 2);
+        args.cursor = Some(cursor);
+        let result = fetch_feed_inner(&http, &cache, args).await;
+        let page2 = output_of(&result);
+        assert!(page2.total_items > 0, "the continuation must be accepted");
+        if let Some(next) = page2.truncation.and_then(|t| t.next_cursor) {
+            let c2 = crate::cursor::Cursor::decode(&next).expect("decode page 2 cursor");
+            assert_eq!(
+                c2.s,
+                Some(cutoff),
+                "every page must carry page 1's cutoff, not a freshly resolved one"
+            );
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

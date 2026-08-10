@@ -94,7 +94,11 @@ fn populate_totals(output: &mut FetchOutput) {
 /// Recompute every derived count — per-feed `item_count`/`content_tokens_est_total` and the
 /// top-level totals — from the items actually present. Called after any trim so no contract
 /// field is left describing items that were shed.
-fn refresh_feed_counts(output: &mut FetchOutput) {
+///
+/// Public so front-ends that trim a `FetchOutput` themselves keep the derived fields in one
+/// place (invariant 9): the MCP server calls it after dropping the items a continuation
+/// cursor already delivered.
+pub fn refresh_feed_counts(output: &mut FetchOutput) {
     for feed in &mut output.feeds {
         feed.item_count = feed.items.len();
         feed.content_tokens_est_total = feed
