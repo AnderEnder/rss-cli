@@ -76,6 +76,14 @@ const BATCH_DEADLINE_ENV: &str = "RSS_MCP_BATCH_DEADLINE_SECS";
 /// Absent, blank or unparseable input falls back to the default: a typo must not silently
 /// remove the bound. `0` is a *valid* value meaning "already expired" — to run without a
 /// deadline, unset the variable rather than zeroing it.
+///
+/// An operator who sets an already-expired deadline should know what it costs continuation
+/// callers: page 1 attempts nothing, so it hands back a cursor at feed 0 having delivered no
+/// data — and the continuation that cursor points at attempts nothing either. With `feeds[]`
+/// empty there is no fetched prefix to resume past, so the mint is gated off and that page
+/// reports `feeds_omitted > 0` with `next_cursor: null`, leaving the caller only the
+/// "request them separately" advice. Zero is for tests and for shedding load, not for
+/// paginating.
 fn parse_batch_deadline(raw: Option<&str>) -> std::time::Duration {
     raw.and_then(|s| s.trim().parse::<u64>().ok()).map_or_else(
         || std::time::Duration::from_secs(MCP_BATCH_DEADLINE_SECS),
@@ -106,8 +114,12 @@ const CONTENT_TRUNCATION_SUGGESTION: &str =
 const CONTENT_TRUNCATED_NOTE: &str = " Content truncated (see structuredContent.truncation).";
 
 /// The summary-line clause for a paginated page. See [`CONTENT_TRUNCATED_NOTE`].
-const MORE_ITEMS_NOTE: &str =
-    " More items remain: pass truncation.next_cursor back as `cursor` for the next page.";
+///
+/// "items or feeds" because both bounds mint this cursor: the response budget defers items,
+/// while the batch deadline defers whole feeds it never attempted — a page bounded only by the
+/// deadline has every item of every feed it shipped.
+const MORE_ITEMS_NOTE: &str = " More items or feeds remain: pass truncation.next_cursor back \
+     as `cursor` for the next page.";
 
 /// Join whatever suggestion the content-truncation marker already carries with the pagination
 /// advice, so a page that is both content-truncated and bounded keeps both hints.
@@ -552,7 +564,21 @@ impl ServerHandler for RssServer {
 /// Core of the `fetch_feed` tool, free of the `#[tool]` macro plumbing so it is directly
 /// unit-testable. Applies the default item cap, the per-item content cap, and the response
 /// budget, attaching a [`crate::model::TruncationInfo`] marker when content was truncated.
+///
+/// A thin wrapper over [`fetch_feed_with_deadline`] with the process-wide batch deadline: the
+/// deadline is the one input a tool argument cannot carry, so injecting it is what makes the
+/// deadline-bounded paths testable without mutating process-global environment state.
 async fn fetch_feed_inner(http: &HttpClient, cache: &Cache, args: FetchFeedArgs) -> CallToolResult {
+    fetch_feed_with_deadline(http, cache, args, batch_deadline()).await
+}
+
+/// [`fetch_feed_inner`] with the batch deadline supplied by the caller. See that function.
+async fn fetch_feed_with_deadline(
+    http: &HttpClient,
+    cache: &Cache,
+    args: FetchFeedArgs,
+    deadline: std::time::Duration,
+) -> CallToolResult {
     let urls = match resolve_urls(&args) {
         Ok(u) => u,
         Err(e) => return tool_error_obj(&e, None),
@@ -589,7 +615,7 @@ async fn fetch_feed_inner(http: &HttpClient, cache: &Cache, args: FetchFeedArgs)
     params.max_content_chars = args.max_content_chars;
     // Bound the batch in wall-clock time as well as in tokens, so a slow same-host run returns
     // the feeds that finished plus a cursor instead of timing out with nothing.
-    params.deadline = Some(batch_deadline());
+    params.deadline = Some(deadline);
 
     // Fingerprint the *normalized* arguments — the effective limit after defaulting and the
     // parsed content format — so a client that echoes a response's resolved values back on
@@ -652,16 +678,13 @@ async fn fetch_feed_inner(http: &HttpClient, cache: &Cache, args: FetchFeedArgs)
     // position by one. Checking the URLs pairwise tests that directly, and is cheap at
     // `MCP_MAX_URLS = 50`. The `debug_assert` fails the dev build loudly; the boolean is the
     // release-mode belt — no cursor at all is lossy, a cursor at the wrong feed is wrong.
-    let positions_line_up = out.feeds.len() <= requested.len()
-        && out
-            .feeds
-            .iter()
-            .zip(requested)
-            .all(|(feed, url)| &feed.feed_url == url);
+    let mismatch = first_position_mismatch(&out.feeds, requested);
+    let positions_line_up = mismatch.is_none();
     debug_assert!(
         positions_line_up,
         "core must return feeds[] as a prefix of the requested urls for cursor positions to \
-         line up: {} feeds for {} urls",
+         line up; first mismatch (index, feeds[i].feed_url, urls[i]): {mismatch:?} ({} feeds \
+         for {} urls)",
         out.feeds.len(),
         requested.len()
     );
@@ -682,6 +705,13 @@ async fn fetch_feed_inner(http: &HttpClient, cache: &Cache, args: FetchFeedArgs)
         // count can make this page skip or repeat an item. It also keeps the batch deadline's
         // cursor quiet — that one records `i: 0, n: 0` for a feed no page has *attempted*,
         // where the `0` means "unknown", not "the window was empty".
+        //
+        // What this deliberately gives up: a budget cursor can carry `i: 0, n: 10` — a feed the
+        // page dropped whole, whose window *was* measured — and a genuine roll on that feed goes
+        // unreported. Accepted, because the warning only ever claims "resuming here may skip or
+        // repeat items", and at `i == 0` it cannot: the next page re-delivers that feed from its
+        // head whatever its window now holds. Pinned by
+        // `a_cursor_that_measured_a_window_but_resumes_at_zero_stays_quiet`.
         if feed.error.is_none() && c.i > 0 && feed.items.len() != c.n {
             out.warnings.push(crate::model::Warning {
                 feed_url: Some(feed.feed_url.clone()),
@@ -734,6 +764,9 @@ async fn fetch_feed_inner(http: &HttpClient, cache: &Cache, args: FetchFeedArgs)
                 0,
             ));
         }
+        // Stamped here too: every other page that ships a marker reports its size, and a caller
+        // that reads `estimated_tokens` should not have to special-case this one.
+        stamp_estimated_tokens(&mut out);
         let summary = fetch_summary(&out, &primary);
         return structured_result(&out, summary);
     }
@@ -855,17 +888,55 @@ async fn fetch_feed_inner(http: &HttpClient, cache: &Cache, args: FetchFeedArgs)
     }
 
     out.truncation = marker;
-    // Measured with the marker already attached, so `estimated_tokens` describes the payload
-    // the client actually receives (bar the digits of the number itself).
+    stamp_estimated_tokens(&mut out);
+
+    let summary = fetch_summary(&out, &primary);
+    structured_result(&out, summary)
+}
+
+/// Record the response size on the truncation marker, if there is one.
+///
+/// Measured with the marker already attached, so `estimated_tokens` describes the payload the
+/// client actually receives (bar the digits of the number itself). Shared by both return paths
+/// — the ordinary one and the drained-continuation early return — so a marker never ships
+/// without its size.
+fn stamp_estimated_tokens(out: &mut crate::model::FetchOutput) {
     if out.truncation.is_some() {
-        let estimated = core::estimate_response_tokens(&out);
+        let estimated = core::estimate_response_tokens(out);
         if let Some(m) = out.truncation.as_mut() {
             m.estimated_tokens = Some(estimated);
         }
     }
+}
 
-    let summary = fetch_summary(&out, &primary);
-    structured_result(&out, summary)
+/// The first position at which `feeds[]` stops being a contiguous **prefix** of `requested`,
+/// as `(index, feeds[index].feed_url, requested[index])`, or `None` when it is a genuine
+/// prefix — including the legitimately shorter list the batch deadline produces.
+///
+/// A pure function rather than an inline `all(...)` so the failure modes are unit-testable: the
+/// gap case (a missing feed with delivered feeds after it, which would shift every later cursor
+/// position by one) and the overrun case (more feeds than URLs) are both unreachable from a
+/// real fetch, and would otherwise be compiled but never run.
+fn first_position_mismatch(
+    feeds: &[crate::model::FeedResult],
+    requested: &[String],
+) -> Option<(usize, String, String)> {
+    if feeds.len() > requested.len() {
+        // More feeds than were asked for: there is no URL to compare the extras against, so
+        // name the first one and say so.
+        let idx = requested.len();
+        return Some((
+            idx,
+            feeds[idx].feed_url.clone(),
+            "<no url requested at this position>".to_string(),
+        ));
+    }
+    feeds
+        .iter()
+        .zip(requested)
+        .enumerate()
+        .find(|(_, (feed, url))| &&feed.feed_url != url)
+        .map(|(idx, (feed, url))| (idx, feed.feed_url.clone(), url.clone()))
 }
 
 /// Encode a continuation cursor for this request, resuming at item `i` of feed `f` (an index
@@ -2503,6 +2574,396 @@ mod tests {
         let mut marker = Some(marker_with(2, Some("budget advice")));
         merge_deadline_omissions(&mut marker, None);
         assert_eq!(marker.map(|m| m.feeds_omitted), Some(2));
+    }
+
+    /// A minimal HTTP/1.1 server that answers **every** request with `body` after `delay`, on
+    /// its own OS threads. Returns its base URL; the listener lives as long as the test process.
+    ///
+    /// mockito answers instantly, and `core`'s deadline is a wall clock, so this is the only way
+    /// to make the deadline expire *between* one feed and the next without either mutating the
+    /// clock (`tokio::time::pause` races with real socket I/O) or the environment. `delay` must
+    /// stay comfortably above the deadline a test pairs it with — the margin is what keeps the
+    /// test deterministic.
+    fn slow_feed_server(delay: std::time::Duration, body: String) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let base = format!("http://{}", listener.local_addr().expect("local addr"));
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let body = body.clone();
+                std::thread::spawn(move || {
+                    use std::io::{BufRead, BufReader, Write};
+                    // Drain the request head first: answering mid-write can trip the client.
+                    if let Ok(peer) = stream.try_clone() {
+                        let mut reader = BufReader::new(peer);
+                        let mut line = String::new();
+                        while reader.read_line(&mut line).unwrap_or(0) > 0 {
+                            if line == "\r\n" {
+                                break;
+                            }
+                            line.clear();
+                        }
+                    }
+                    std::thread::sleep(delay);
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/rss+xml\r\n\
+                         content-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(head.as_bytes());
+                    let _ = stream.write_all(body.as_bytes());
+                    let _ = stream.flush();
+                });
+            }
+        });
+        base
+    }
+
+    #[tokio::test]
+    async fn an_expired_deadline_ships_nothing_and_cursors_the_whole_batch() {
+        // The deadline's OWN mint, the `stop.is_none()` one: nothing was fetched, so `paginate`
+        // reports no stop and the marker `merge_deadline_omissions` carried over is what gets
+        // the cursor — at feed 0, because the delivered prefix is empty. Unroutable URLs prove
+        // it never reaches the network: an expired deadline attempts nothing.
+        let (cache, dir) = temp_cache("deadline-expired");
+        let urls: Vec<String> = (0..3)
+            .map(|i| format!("http://127.0.0.1:1/f{i}.xml"))
+            .collect();
+
+        // Default budget on purpose: with zero items a small `max_response_tokens` would send
+        // `paginate` down its `original_items == 0` branch and answer RESPONSE_TOO_LARGE.
+        let page = output_of(
+            &fetch_feed_with_deadline(
+                &test_http(),
+                &cache,
+                batch_args(urls.clone()),
+                std::time::Duration::ZERO,
+            )
+            .await,
+        );
+
+        assert!(page.feeds.is_empty(), "nothing was attempted: {page:?}");
+        assert!(
+            page.errors.is_empty(),
+            "an unattempted feed did not fail: {:?}",
+            page.errors
+        );
+        let t = page
+            .truncation
+            .as_ref()
+            .expect("every omitted feed must be reported");
+        assert_eq!(t.feeds_omitted, urls.len());
+        assert!(
+            t.estimated_tokens.is_some(),
+            "a shipped marker always reports its size"
+        );
+        let c = crate::cursor::Cursor::decode(
+            t.next_cursor
+                .as_deref()
+                .expect("the caller needs a cursor for the feeds it never got"),
+        )
+        .expect("decode the minted cursor");
+        assert_eq!(
+            (c.f, c.i, c.n),
+            (0, 0, 0),
+            "resume at the first feed, which is every feed: nothing was delivered"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The delay a slow-server test serves each response after, and the deadline it pairs with.
+    /// The gap between them is the determinism margin: the first `concurrency` fetches are
+    /// admitted within microseconds (well inside `DEADLINE`), and no later feed can be polled
+    /// until one of them completes — which takes at least `SERVER_DELAY`, well past it.
+    const SERVER_DELAY: std::time::Duration = std::time::Duration::from_millis(80);
+    const DEADLINE: std::time::Duration = std::time::Duration::from_millis(25);
+
+    #[tokio::test]
+    async fn a_page_bounded_by_both_the_deadline_and_the_budget_keeps_both_counts() {
+        // The full composition on one page: core's deadline marker is lifted out BEFORE
+        // `paginate` measures the payload, the budget's `PageStop` then assigns its own counts,
+        // and `merge_deadline_omissions` adds them — with the BUDGET minting the cursor, because
+        // it points earlier in the same list than the deadline's would.
+        let base = slow_feed_server(SERVER_DELAY, feed_with_items(5));
+        let urls: Vec<String> = (0..10).map(|i| format!("{base}/f{i}.xml")).collect();
+        let (cache, dir) = temp_cache("deadline-and-budget");
+        let http = test_http();
+
+        // Measure the same deadline-bounded page under a generous budget first, so the budget
+        // below is a fraction of the page actually being trimmed — not of the whole batch.
+        let generous = output_of(
+            &fetch_feed_with_deadline(&http, &cache, batch_args(urls.clone()), DEADLINE).await,
+        );
+        let delivered = generous.feeds.len();
+        // A range, not an equality: admission is timing-derived, and delivering *fewer* would
+        // only mean the deadline bit harder — never a defect. More than one feed getting past a
+        // 25 ms deadline is the whole of Finding 1; `concurrency` is the structural ceiling.
+        assert!(
+            delivered > 1 && delivered <= FetchParams::default().concurrency,
+            "feeds admitted at t≈0 come back regardless of the deadline — it stops feeds that \
+             have not STARTED and cannot touch ones already queued on the per-host permit \
+             (Finding 1's known limitation); expected 2..={}, got {delivered}",
+            FetchParams::default().concurrency
+        );
+        let full = core::estimate_response_tokens(&generous);
+
+        let mut args = batch_args(urls.clone());
+        args.max_response_tokens = Some(full / 2);
+        let page = output_of(&fetch_feed_with_deadline(&http, &cache, args, DEADLINE).await);
+
+        assert!(
+            page.total_items > 0,
+            "a doubly-bounded page still ships what fits: {page:?}"
+        );
+        let t = page
+            .truncation
+            .as_ref()
+            .expect("a doubly-bounded page must carry a marker");
+        assert_eq!(
+            t.feeds_omitted,
+            urls.len() - page.feeds.len(),
+            "the two sets are disjoint — never tried plus fetched-but-dropped — so every \
+             requested feed is either delivered or counted: {t:?}"
+        );
+        let c = crate::cursor::Cursor::decode(
+            t.next_cursor
+                .as_deref()
+                .expect("a trimmed page needs a cursor"),
+        )
+        .expect("decode the minted cursor");
+        assert!(
+            c.f < delivered,
+            "the BUDGET minted this: its cursor points inside the fetched prefix, while the \
+             deadline's would point just past it (feed {delivered})"
+        );
+        assert!(
+            c.n > 0,
+            "the budget measured the window it stopped in; the deadline's mint records n: 0"
+        );
+        assert!(
+            t.suggestion
+                .as_deref()
+                .is_some_and(|s| s.contains("max_response_tokens")),
+            "the budget's advice wins — it already names the cursor that recovers both: {:?}",
+            t.suggestion
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_continuation_drained_by_a_roll_still_cursors_the_deadlines_feeds() {
+        // The early-return mint. The resumed feed drains to nothing, so the page is "finished"
+        // as far as the ROLL goes — but the deadline left feeds behind it that the caller has
+        // never seen, and ending the loop there would silently lose them.
+        //
+        // The feeds behind the resumed one carry no items, which is what makes the whole page
+        // itemless (the early-return condition) while `feeds[]` is non-empty (the mint's gate).
+        let base = slow_feed_server(SERVER_DELAY, feed_with_items(0));
+        let urls: Vec<String> = (0..10).map(|i| format!("{base}/f{i}.xml")).collect();
+        let (cache, dir) = temp_cache("deadline-drained-continuation");
+        let http = test_http();
+
+        // A continuation is served cache-first, so seeding feed 0's window is what the resumed
+        // feed returns.
+        let meta = crate::cache::CacheMeta {
+            feed_url: urls[0].clone(),
+            etag: None,
+            last_modified: None,
+            fetched_at: "2020-01-01T00:00:00Z".to_string(),
+            content_type: Some("application/rss+xml".to_string()),
+        };
+        cache
+            .put(&meta, feed_with_items(10).as_bytes())
+            .expect("seed the resumed feed's window");
+
+        // Take a real cursor for its fingerprint from an expired-deadline page (which fetches
+        // nothing), then point it past the end of feed 0's window so the drain empties it.
+        let page1 = output_of(
+            &fetch_feed_with_deadline(
+                &http,
+                &cache,
+                batch_args(urls.clone()),
+                std::time::Duration::ZERO,
+            )
+            .await,
+        );
+        let mut c = crate::cursor::Cursor::decode(
+            page1
+                .truncation
+                .and_then(|t| t.next_cursor)
+                .as_deref()
+                .expect("the expired page hands back a cursor"),
+        )
+        .expect("decode cursor");
+        c.i = 10;
+        c.n = 10;
+
+        let mut args = batch_args(urls.clone());
+        args.cursor = Some(c.encode());
+        let page = output_of(&fetch_feed_with_deadline(&http, &cache, args, DEADLINE).await);
+
+        assert_eq!(
+            page.total_items, 0,
+            "the drained feed and the itemless ones behind it leave nothing to ship: {page:?}"
+        );
+        assert!(
+            !page.feeds.is_empty() && page.feeds.len() < urls.len(),
+            "the resumed feed WAS fetched and the deadline stopped later ones: {} feeds",
+            page.feeds.len()
+        );
+        let t = page
+            .truncation
+            .as_ref()
+            .expect("the feeds the deadline never tried must be reported");
+        assert_eq!(
+            t.feeds_omitted,
+            urls.len() - page.feeds.len(),
+            "every requested feed is either delivered or counted: {t:?}"
+        );
+        assert!(
+            t.estimated_tokens.is_some(),
+            "this page ships a marker like any other, so it reports its size too"
+        );
+        let next = crate::cursor::Cursor::decode(
+            t.next_cursor
+                .as_deref()
+                .expect("a roll the caller did not cause must not end the loop early"),
+        )
+        .expect("decode the minted cursor");
+        assert_eq!(
+            (next.f, next.i, next.n),
+            (page.feeds.len(), 0, 0),
+            "resume at the first feed the deadline never attempted — the end of the delivered \
+             prefix — with no measurement of its window"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A `FeedResult` that only has to carry a `feed_url`, for the position checks.
+    fn placeholder_feed(url: &str) -> crate::model::FeedResult {
+        crate::model::FeedResult::error(url, crate::model::ErrorObj::new("X", "x"))
+    }
+
+    #[test]
+    fn a_short_feed_list_is_a_prefix_but_a_gap_or_an_overrun_is_not() {
+        // The guard the cursor mints are gated on. The deadline makes `feeds[]` legitimately
+        // SHORTER than the request, so length alone cannot be the test; what must never pass is
+        // a gap, which shifts every later position by one and would point a cursor at the wrong
+        // feed. Neither the gap nor the overrun is reachable from a real fetch, so this is the
+        // only place they execute.
+        let urls: Vec<String> = (0..4)
+            .map(|i| format!("https://e.example/{i}.xml"))
+            .collect();
+
+        // Vacuous, short, and exact: all genuine prefixes.
+        assert_eq!(
+            first_position_mismatch(&[], &urls),
+            None,
+            "empty is a prefix"
+        );
+        let short = vec![placeholder_feed(&urls[0]), placeholder_feed(&urls[1])];
+        assert_eq!(
+            first_position_mismatch(&short, &urls),
+            None,
+            "the shape a deadline-bounded page has: shorter, but still a prefix"
+        );
+        let exact: Vec<_> = urls.iter().map(|u| placeholder_feed(u)).collect();
+        assert_eq!(first_position_mismatch(&exact, &urls), None);
+
+        // A gap: feed 1 was never attempted but 2 and 3 completed and shipped anyway. Note it
+        // has the same length as a legitimate two-feed trim — only the pairwise check sees it.
+        let gapped = vec![
+            placeholder_feed(&urls[0]),
+            placeholder_feed(&urls[2]),
+            placeholder_feed(&urls[3]),
+        ];
+        let (idx, got, want) =
+            first_position_mismatch(&gapped, &urls).expect("a gap is not a prefix");
+        assert_eq!(
+            (idx, got.as_str(), want.as_str()),
+            (1, urls[2].as_str(), urls[1].as_str()),
+            "the report names the first mismatching index and BOTH urls, which the counts \
+             cannot distinguish from a deadline trim"
+        );
+
+        // More feeds than urls: the extra has nothing to be compared against.
+        let mut over = exact.clone();
+        over.push(placeholder_feed(&urls[0]));
+        let (idx, _, want) =
+            first_position_mismatch(&over, &urls).expect("an overrun is not a prefix");
+        assert_eq!(idx, urls.len());
+        assert!(
+            want.contains("no url requested"),
+            "explains the overrun: {want}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cursor_that_measured_a_window_but_resumes_at_zero_stays_quiet() {
+        // The case the `c.i > 0` gate deliberately gives up, pinned so the narrowing stays a
+        // decision rather than an accident: a BUDGET cursor can carry `i: 0, n: 10` — a feed the
+        // page dropped whole, whose window really was measured — and a genuine window change on
+        // that feed is then not reported. Accepted because at `i == 0` nothing is drained: the
+        // next page re-delivers the feed from its head whatever its window now holds, so the
+        // warning's claim ("may skip or repeat items") would be false.
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/feed.xml")
+            .with_status(200)
+            .with_body(feed_with_items(10))
+            .create_async()
+            .await;
+        let (cache, dir) = temp_cache("measured-window-at-zero");
+        let http = test_http();
+        let url = format!("{}/feed.xml", server.url());
+
+        let full = full_response_tokens(&http, &cache, fetch_args(url.clone())).await;
+        let mut args = fetch_args(url.clone());
+        args.max_response_tokens = Some(full / 2);
+        let cursor = cursor_of(&fetch_feed_inner(&http, &cache, args).await)
+            .expect("page 1 must hand back a cursor");
+        let mut c = crate::cursor::Cursor::decode(&cursor).expect("decode cursor");
+        // A measured window (`n`) with nothing yet drained from it (`i`) — unlike the deadline's
+        // `i: 0, n: 0`, which records no measurement at all.
+        c.i = 0;
+        c.n = 10;
+
+        // Roll the window shorter than the cursor recorded. A continuation reads the cache, so
+        // this is what the next page sees.
+        let meta = crate::cache::CacheMeta {
+            feed_url: url.clone(),
+            etag: None,
+            last_modified: None,
+            fetched_at: "2020-01-01T00:00:00Z".to_string(),
+            content_type: Some("application/rss+xml".to_string()),
+        };
+        cache
+            .put(&meta, feed_with_items(8).as_bytes())
+            .expect("shrink the cached body");
+
+        let mut args = fetch_args(url);
+        args.cursor = Some(c.encode());
+        let page = output_of(&fetch_feed_inner(&http, &cache, args).await);
+
+        assert!(
+            !page
+                .warnings
+                .iter()
+                .any(|w| w.code == "CACHE_WINDOW_ROLLED"),
+            "a cursor that drained nothing cannot skip or repeat, so the roll is not reported \
+             even though the window really did change: {:?}",
+            page.warnings
+        );
+        assert_eq!(
+            page.total_items, 8,
+            "the whole (shorter) window still ships from its head: {:?}",
+            page.truncation
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]

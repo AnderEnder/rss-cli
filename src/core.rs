@@ -56,14 +56,21 @@ pub async fn fetch_feeds_with(
     cache: &Cache,
     http: &HttpClient,
 ) -> FetchOutput {
-    let mut output = FetchOutput::new(now_rfc3339());
+    let output = FetchOutput::new(now_rfc3339());
     let stop_at = params.deadline.map(|d| tokio::time::Instant::now() + d);
 
     // Tag each task with its input index so we can restore request order after the
     // completion-ordered `buffer_unordered` stream — `feeds[]`/`errors[]` are then
     // deterministic within a run (an agent can address feeds by position). See ADR-0012.
-    let mut results: Vec<IndexedFetch> = stream::iter(urls.iter().cloned().enumerate())
+    let results: Vec<IndexedFetch> = stream::iter(urls.iter().cloned().enumerate())
         .map(|(idx, url)| async move {
+            // Known limitation (recorded for ADR-0017): this bounds only when a fetch may
+            // *start*. `buffer_unordered` polls the first `concurrency` futures immediately, so
+            // they all pass this check at t≈0 and then queue on the per-host permit, where no
+            // clock reaches them — a call can outlive the deadline by up to `concurrency - 1`
+            // serialized fetches (see `FetchParams::deadline`). The deeper fix is to thread the
+            // deadline into the gate's permit acquire (`timeout_at` on the semaphore), which
+            // touches `fetch`/`ratelimit` and is deliberately out of scope here.
             if let Some(t) = stop_at
                 && tokio::time::Instant::now() >= t
             {
@@ -84,6 +91,26 @@ pub async fn fetch_feeds_with(
         .collect()
         .await;
 
+    assemble_prefix_in_request_order(output, params.limit, results)
+}
+
+/// Fold the completion-ordered fetch results back into request order, keeping `feeds[]` a
+/// contiguous **prefix** of the requested URLs and reporting whatever the deadline left
+/// unattempted as `truncation.feeds_omitted`.
+///
+/// Pure by design — no clock, no network, no I/O — so the out-of-order case only a deadline can
+/// produce (feeds 0, 2, 3 done, feed 1 never started) is a deterministic unit test instead of a
+/// timing race. `output` is passed in already stamped, so `fetched_at` still marks the *start*
+/// of the batch rather than the moment assembly ran.
+///
+/// `results` must hold exactly one entry per requested URL (which `buffer_unordered` guarantees
+/// — it yields every future's output, only out of order), so its length is the request count.
+fn assemble_prefix_in_request_order(
+    mut output: FetchOutput,
+    applied_limit: Option<usize>,
+    mut results: Vec<IndexedFetch>,
+) -> FetchOutput {
+    let requested = results.len();
     results.sort_by_key(|(idx, _)| *idx);
 
     // Keep `feeds[]` a contiguous prefix of `urls`: stop at the first unattempted feed and
@@ -95,7 +122,7 @@ pub async fn fetch_feeds_with(
     let first_unattempted = results
         .iter()
         .position(|(_, r)| r.is_none())
-        .unwrap_or(results.len());
+        .unwrap_or(requested);
 
     for (_, slot) in results.into_iter().take(first_unattempted) {
         // Unreachable by construction — every slot before the first `None` is `Some` — but
@@ -109,10 +136,10 @@ pub async fn fetch_feeds_with(
     }
     populate_totals(&mut output);
 
-    let omitted = urls.len() - first_unattempted;
+    let omitted = requested - first_unattempted;
     if omitted > 0 {
         output.truncation = Some(TruncationInfo {
-            applied_limit: params.limit,
+            applied_limit,
             items_content_truncated: 0,
             items_omitted: 0,
             feeds_omitted: omitted,
@@ -679,11 +706,108 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// A successful single-item feed result, shaped as [`fetch_one`] would return it.
+    fn ok_feed(url: &str) -> (FeedResult, Vec<Warning>) {
+        let items = vec![item(false)];
+        (
+            FeedResult {
+                feed_url: url.to_string(),
+                status: FeedStatus::Ok,
+                from_cache: false,
+                title: Some("f".to_string()),
+                site_url: None,
+                updated: None,
+                item_count: items.len(),
+                content_tokens_est_total: 1,
+                items,
+                error: None,
+            },
+            Vec::new(),
+        )
+    }
+
+    #[test]
+    fn an_out_of_order_gap_discards_every_later_feed_and_its_errors() {
+        // The branch the whole cursor contract rests on, exercised without a clock: the
+        // deadline can leave feed 1 unattempted while feeds 2 and 3 (started earlier, finished
+        // later) completed. `feeds[]` must stay a contiguous prefix — feeds[j] IS urls[j] for
+        // every consumer, the continuation cursor above all — so the survivors past the gap are
+        // discarded, and the count says so.
+        let urls: Vec<String> = (0..4)
+            .map(|i| format!("https://e.example/{i}.xml"))
+            .collect();
+        let failed = crate::model::ErrorObj::new("FEED_FETCH_FAILED", "boom");
+        let results: Vec<IndexedFetch> = vec![
+            (0, Some(ok_feed(&urls[0]))),
+            // Never started: the deadline had passed by the time this future was polled.
+            (1, None),
+            (2, Some(ok_feed(&urls[2]))),
+            // A *discarded* feed that also errored — the case that pins the rule below.
+            (3, Some((FeedResult::error(&urls[3], failed), Vec::new()))),
+        ];
+
+        let out = assemble_prefix_in_request_order(
+            FetchOutput::new("2026-06-01T00:00:00Z".to_string()),
+            None,
+            results,
+        );
+
+        assert_eq!(
+            out.feeds.len(),
+            1,
+            "only the prefix before the gap ships: {:?}",
+            out.feeds.iter().map(|f| &f.feed_url).collect::<Vec<_>>()
+        );
+        assert_eq!(out.feeds[0].feed_url, urls[0]);
+        assert_eq!(
+            out.total_items, 1,
+            "totals describe the shipped prefix only"
+        );
+        assert_eq!(
+            out.truncation.as_ref().map(|t| t.feeds_omitted),
+            Some(3),
+            "the unattempted feed AND the two survivors discarded with it are all owed"
+        );
+        assert!(
+            out.errors.is_empty(),
+            "a discarded survivor takes its errors[] entry with it — an error whose feed is \
+             absent breaks the feeds[]/errors[] mirror: {:?}",
+            out.errors
+        );
+    }
+
+    #[test]
+    fn results_arriving_out_of_order_are_restored_to_request_order() {
+        // The sort is the other half of the prefix rule: `buffer_unordered` completes in
+        // whatever order the network answers, but `feeds[]` is request-ordered (ADR-0012).
+        let urls: Vec<String> = (0..3)
+            .map(|i| format!("https://e.example/{i}.xml"))
+            .collect();
+        let results: Vec<IndexedFetch> = vec![
+            (2, Some(ok_feed(&urls[2]))),
+            (0, Some(ok_feed(&urls[0]))),
+            (1, Some(ok_feed(&urls[1]))),
+        ];
+
+        let out = assemble_prefix_in_request_order(
+            FetchOutput::new("2026-06-01T00:00:00Z".to_string()),
+            None,
+            results,
+        );
+
+        let ordered: Vec<&String> = out.feeds.iter().map(|f| &f.feed_url).collect();
+        assert_eq!(ordered, urls.iter().collect::<Vec<_>>());
+        assert!(
+            out.truncation.is_none(),
+            "nothing was omitted, so there is no marker to emit"
+        );
+    }
+
     #[tokio::test]
     async fn no_deadline_fetches_every_feed() {
         // Guards the default path: the CLI passes deadline: None and must be unaffected.
         let mut server = mockito::Server::new_async().await;
-        let _m = server
+        let m = server
             .mock("GET", mockito::Matcher::Any)
             .with_status(200)
             .with_body(
@@ -713,6 +837,9 @@ mod tests {
             out.truncation.is_none(),
             "no deadline means no omission marker"
         );
+        // `expect_at_least` is only enforced by an explicit assert: three feeds in `feeds[]`
+        // could in principle be three cache hits, so check the requests actually went out.
+        m.assert_async().await;
 
         std::fs::remove_dir_all(&dir).ok();
     }
