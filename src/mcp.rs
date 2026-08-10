@@ -170,13 +170,27 @@ where
                 }
                 return Ok(clean(out));
             }
-            // Otherwise: newline- or comma-separated, or a single bare URL.
-            Ok(clean(
-                trimmed
-                    .split(['\n', ','])
-                    .map(|s| s.to_string())
-                    .collect::<Vec<_>>(),
-            ))
+            // Otherwise: newline-separated, comma-separated, or a single bare URL.
+            // Newlines can never appear inside a URL, so splitting on them is always safe.
+            let lines: Vec<String> = trimmed.split('\n').map(|s| s.to_string()).collect();
+            // Commas *can* appear inside a URL's query string (`?ids=1,2,3`), so only treat
+            // a comma as a separator when every resulting piece is itself an absolute
+            // http(s) URL. Otherwise the comma belongs to the URL and splitting would
+            // silently fetch a truncated one.
+            let comma_split: Vec<String> = lines
+                .iter()
+                .flat_map(|line| line.split(',').map(|s| s.trim().to_string()))
+                .filter(|s| !s.is_empty())
+                .collect();
+            let all_absolute = comma_split.iter().all(|s| {
+                let lower = s.to_ascii_lowercase();
+                lower.starts_with("http://") || lower.starts_with("https://")
+            });
+            if all_absolute && !comma_split.is_empty() {
+                Ok(clean(comma_split))
+            } else {
+                Ok(clean(lines))
+            }
         }
         Some(other) => Err(Error::custom(format!(
             "expected an array of URLs or a delimited string, got {other}"
@@ -1080,6 +1094,24 @@ mod tests {
         assert_eq!(
             one.urls.as_deref(),
             Some(["https://a/f".to_string()].as_slice())
+        );
+
+        // A comma inside a URL's query string is part of the URL, not a separator.
+        let commas_in_query: FetchFeedArgs =
+            serde_json::from_str(r#"{"urls":"https://a/f?ids=1,2,3"}"#).unwrap();
+        assert_eq!(
+            commas_in_query.urls.as_deref(),
+            Some(["https://a/f?ids=1,2,3".to_string()].as_slice()),
+            "a comma inside a query string must not split the URL"
+        );
+
+        // Newlines still separate even when a line contains an in-URL comma.
+        let mixed: FetchFeedArgs =
+            serde_json::from_str(r#"{"urls":"https://a/f?ids=1,2\nhttps://b/f"}"#).unwrap();
+        assert_eq!(
+            mixed.urls.as_deref(),
+            Some(["https://a/f?ids=1,2".to_string(), "https://b/f".to_string()].as_slice()),
+            "newlines separate; the in-URL comma is preserved"
         );
 
         // Absent, null, and empty all mean "not supplied".
