@@ -437,3 +437,80 @@ fn max_content_chars_truncates_and_marks() {
         "exactly one item's content was truncated"
     );
 }
+
+/// `--query` keyword-filters items before `--limit`, and `applied_filters` reports what it
+/// removed. End-to-end through the compiled binary, so the CLI wiring (not just `parse_feed`
+/// directly) is pinned.
+#[test]
+fn query_filters_items_before_limit_and_reports_applied_filters() {
+    let feed = r#"<?xml version="1.0"?>
+<rss version="2.0"><channel>
+  <title>Feed</title>
+  <link>https://example.com/</link>
+  <item><title>Rust news</title><link>https://example.com/1</link>
+        <pubDate>Wed, 03 Jun 2026 00:00:00 GMT</pubDate></item>
+  <item><title>Python news</title><link>https://example.com/2</link>
+        <pubDate>Tue, 02 Jun 2026 00:00:00 GMT</pubDate></item>
+  <item><title>More rust</title><link>https://example.com/3</link>
+        <pubDate>Mon, 01 Jun 2026 00:00:00 GMT</pubDate></item>
+</channel></rss>"#;
+
+    let (server, _m) = mock_server("/query.xml", RSS_CT, feed);
+    let feed_url = format!("{}/query.xml", server.url());
+    let cache = TempCache::new("query");
+
+    let output = rss()
+        .arg("--quiet")
+        .arg("--cache-dir")
+        .arg(cache.path())
+        .arg("fetch")
+        .arg(feed_url.as_str())
+        .arg("--query")
+        .arg("rust")
+        .arg("--limit")
+        .arg("2")
+        .arg("--format")
+        .arg("json")
+        .output()
+        .expect("spawn rss");
+
+    if is_stub_panic(&output) {
+        skip_note(
+            "query_filters_items_before_limit_and_reports_applied_filters",
+            &output,
+        );
+        return;
+    }
+    assert!(
+        output.status.success(),
+        "a good feed with a query should exit 0; stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let v: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("output should be valid JSON");
+    let items = v["feeds"][0]["items"].as_array().expect("items array");
+    assert_eq!(
+        items.len(),
+        2,
+        "both rust items must ship — limit=2 must mean 2 MATCHING items, not the 2 newest \
+         regardless of match: {items:?}"
+    );
+    for item in items {
+        let title = item["title"].as_str().unwrap_or_default();
+        assert!(
+            title.to_lowercase().contains("rust"),
+            "every shipped item must match the query, got {title:?}"
+        );
+    }
+
+    let applied = &v["applied_filters"];
+    assert!(applied.is_object(), "applied_filters should be present");
+    assert_eq!(applied["query"].as_str(), Some("rust"));
+    assert_eq!(applied["since"], serde_json::Value::Null);
+    assert_eq!(
+        applied["items_filtered_out"].as_u64(),
+        Some(1),
+        "the one non-matching item must be counted"
+    );
+}

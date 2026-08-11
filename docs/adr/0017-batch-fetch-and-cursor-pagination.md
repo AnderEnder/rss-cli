@@ -118,14 +118,16 @@ later cutoff than page 1, silently skipping items in between. The fix: fingerpri
 `since` string, and carry the **resolved** cutoff as the cursor's `s` field (epoch seconds).
 A continuation reuses that exact instant instead of re-resolving.
 
-Two positions in the fingerprinted tuple are reserved for arguments that do not exist yet:
-Phase 3's `query` and `dedupe`. Today they always contribute the fixed bytes `""` and
-`"report"` respectively — every outstanding cursor today depends on those exact bytes, not on
-any real filtering behavior. When Phase 3 adds real `query`/`dedupe` arguments, populating
-these positions with the caller's actual values is intentional and correct, but it changes
-every fingerprint's output — outstanding cursors minted before that change will no longer
-match and will be rejected as "does not match this request," which is the safe failure mode
-(a caller retries without a cursor) rather than a silent mismatch.
+Two positions in the fingerprinted tuple were reserved for arguments that did not exist yet
+at the time this ADR was written: Phase 3's `query` and `dedupe`. Both contributed the fixed
+bytes `""` and `"report"` respectively — every outstanding cursor depended on those exact
+bytes, not on any real filtering behavior. As of the `query` argument landing, the `query`
+position carries the caller's actual value instead of the `""` placeholder; `dedupe` remains
+reserved (fixed `"report"`) until it lands too. This is exactly the predicted transition:
+populating a placeholder position with a real value changes every fingerprint's output, so
+outstanding cursors minted before that change no longer match and are rejected as "does not
+match this request" — the safe failure mode (a caller retries without a cursor) rather than a
+silent mismatch.
 
 ### 5. The batch deadline omits feeds; no new `FeedStatus` variant
 

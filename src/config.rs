@@ -45,6 +45,12 @@ pub struct FetchParams {
     pub max_content_chars: Option<usize>,
     /// Only include items published at or after this instant.
     pub since: Option<DateTime<Utc>>,
+    /// Keyword filter applied to each item's title, summary, and content (see
+    /// [`crate::query::Query`]). Space-separated terms are AND-ed; `"quoted phrases"` match
+    /// as a unit; a leading `-term` excludes. Applied in [`crate::parse::parse_feed`] after
+    /// `since` and before `limit`, so `limit` means "N matching items", not "N items, some
+    /// of which match".
+    pub query: Option<String>,
     /// Maximum number of feeds fetched concurrently.
     pub concurrency: usize,
     pub timeout: Duration,
@@ -78,6 +84,7 @@ impl Default for FetchParams {
             limit: None,
             max_content_chars: None,
             since: None,
+            query: None,
             concurrency: 8,
             timeout: Duration::from_secs(30),
             user_agent: DEFAULT_USER_AGENT.to_string(),

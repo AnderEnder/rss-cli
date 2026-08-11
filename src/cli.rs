@@ -137,6 +137,12 @@ pub struct FetchArgs {
     #[arg(long, value_name = "WHEN")]
     pub since: Option<String>,
 
+    /// Only include items matching this keyword query. Space-separated terms are AND-ed,
+    /// `"quoted phrases"` match as a unit, and `-term` excludes. Applied before `--limit`,
+    /// so `--limit` means "N matching items".
+    #[arg(long, value_name = "QUERY")]
+    pub query: Option<String>,
+
     /// Max feeds fetched concurrently.
     #[arg(long, default_value_t = 8, value_name = "N")]
     pub concurrency: usize,
@@ -183,6 +189,7 @@ impl FetchArgs {
             limit: self.limit,
             max_content_chars: self.max_content_chars,
             since: self.since.as_deref().map(parse_since).transpose()?,
+            query: self.query.clone(),
             concurrency: self.concurrency.max(1),
             timeout: Duration::from_secs(self.timeout),
             user_agent: self

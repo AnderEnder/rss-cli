@@ -11,7 +11,9 @@ use crate::cache::Cache;
 use crate::config::FetchParams;
 use crate::error::RssError;
 use crate::fetch::HttpClient;
-use crate::model::{DiscoverOutput, FeedResult, FeedStatus, FetchOutput, TruncationInfo, Warning};
+use crate::model::{
+    AppliedFilters, DiscoverOutput, FeedResult, FeedStatus, FetchOutput, TruncationInfo, Warning,
+};
 use crate::{discover, parse};
 
 /// Fetch and parse many feeds concurrently, returning the full structured output.
@@ -36,10 +38,11 @@ pub async fn fetch_feeds(urls: &[String], params: &FetchParams, cache: &Cache) -
     fetch_feeds_with(urls, params, cache, &http).await
 }
 
-/// One feed's outcome plus the warnings its parse raised, tagged with the feed's index into the
-/// request URL list so request order survives the completion-ordered stream. `None` marks a feed
-/// that was never attempted because the batch deadline had passed.
-type IndexedFetch = (usize, Option<(FeedResult, Vec<Warning>)>);
+/// One feed's outcome plus the warnings its parse raised and how many items `since`/`query`
+/// filtered out of it, tagged with the feed's index into the request URL list so request
+/// order survives the completion-ordered stream. `None` marks a feed that was never
+/// attempted because the batch deadline had passed.
+type IndexedFetch = (usize, Option<(FeedResult, Vec<Warning>, usize)>);
 
 /// Fetch many feeds concurrently through a **caller-provided** [`HttpClient`]. The MCP server
 /// builds the client once and shares it across tool calls so their per-host pacing coordinates
@@ -77,12 +80,13 @@ pub async fn fetch_feeds_with(
                 return (idx, None);
             }
             match fetch_one(&url, http, params, cache).await {
-                Ok((fr, warnings)) => (idx, Some((fr, warnings))),
+                Ok((fr, warnings, filtered)) => (idx, Some((fr, warnings, filtered))),
                 Err(e) => (
                     idx,
                     Some((
                         FeedResult::error(url.clone(), e.to_error_obj(Some(&url))),
                         Vec::new(),
+                        0,
                     )),
                 ),
             }
@@ -91,7 +95,7 @@ pub async fn fetch_feeds_with(
         .collect()
         .await;
 
-    assemble_prefix_in_request_order(output, params.limit, results)
+    assemble_prefix_in_request_order(output, params, results)
 }
 
 /// Fold the completion-ordered fetch results back into request order, keeping `feeds[]` a
@@ -107,7 +111,7 @@ pub async fn fetch_feeds_with(
 /// — it yields every future's output, only out of order), so its length is the request count.
 fn assemble_prefix_in_request_order(
     mut output: FetchOutput,
-    applied_limit: Option<usize>,
+    params: &FetchParams,
     mut results: Vec<IndexedFetch>,
 ) -> FetchOutput {
     let requested = results.len();
@@ -124,10 +128,18 @@ fn assemble_prefix_in_request_order(
         .position(|(_, r)| r.is_none())
         .unwrap_or(requested);
 
+    // Combined `since`+`query` removals across every feed that made it into this prefix —
+    // the input to `applied_filters_marker` below. Not accumulated for feeds past the gap:
+    // they contributed nothing to `output.feeds`, so their filter counts describe items the
+    // caller never sees this call and would misrepresent what *this* batch filtered.
+    let mut total_filtered = 0usize;
     for (_, slot) in results.into_iter().take(first_unattempted) {
         // Unreachable by construction — every slot before the first `None` is `Some` — but
         // silently keeping the prefix contiguous beats an unwrap on an invariant.
-        let Some((fr, warnings)) = slot else { continue };
+        let Some((fr, warnings, filtered)) = slot else {
+            continue;
+        };
+        total_filtered += filtered;
         if let Some(err) = &fr.error {
             output.errors.push(err.clone());
         }
@@ -135,11 +147,12 @@ fn assemble_prefix_in_request_order(
         output.feeds.push(fr);
     }
     populate_totals(&mut output);
+    output.applied_filters = applied_filters_marker(params, total_filtered);
 
     let omitted = requested - first_unattempted;
     if omitted > 0 {
         output.truncation = Some(TruncationInfo {
-            applied_limit,
+            applied_limit: params.limit,
             items_content_truncated: 0,
             items_omitted: 0,
             feeds_omitted: omitted,
@@ -155,6 +168,34 @@ fn assemble_prefix_in_request_order(
         });
     }
     output
+}
+
+/// Build the [`AppliedFilters`] marker for a batch, or `None` when neither `since` nor a
+/// non-blank `query` was supplied.
+///
+/// `items_filtered_out` is the combined count `since` and `query` removed across every feed
+/// in the prefix that made it into `output.feeds` — see [`AppliedFilters::items_filtered_out`]'s
+/// docs for why the two are not split out. A blank/whitespace-only `query` (e.g. `" "`) does
+/// not itself gate the marker on — it filters nothing (see [`crate::query::Query::is_empty`])
+/// — but `since` alone still does.
+fn applied_filters_marker(
+    params: &FetchParams,
+    items_filtered_out: usize,
+) -> Option<AppliedFilters> {
+    let query_supplied = params
+        .query
+        .as_deref()
+        .is_some_and(|q| !q.trim().is_empty());
+    if params.since.is_none() && !query_supplied {
+        return None;
+    }
+    Some(AppliedFilters {
+        since: params
+            .since
+            .map(|d| d.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
+        query: params.query.clone(),
+        items_filtered_out,
+    })
 }
 
 /// Fill the top-level aggregate counts from the assembled feeds. Called once both feeds and
@@ -188,15 +229,16 @@ pub fn refresh_feed_counts(output: &mut FetchOutput) {
     populate_totals(output);
 }
 
-/// Fetch and parse a single feed, returning the [`FeedResult`] plus any non-fatal
-/// [`Warning`]s the parse surfaced (e.g. a content-extraction fallback). Callers aggregate
-/// the warnings into [`FetchOutput::warnings`].
+/// Fetch and parse a single feed, returning the [`FeedResult`], any non-fatal [`Warning`]s
+/// the parse surfaced (e.g. a content-extraction fallback), and how many items `since`/
+/// `query` filtered out of it. Callers aggregate the warnings into [`FetchOutput::warnings`]
+/// and the filtered count into [`FetchOutput::applied_filters`].
 pub async fn fetch_one(
     url: &str,
     http: &HttpClient,
     params: &FetchParams,
     cache: &Cache,
-) -> Result<(FeedResult, Vec<Warning>), RssError> {
+) -> Result<(FeedResult, Vec<Warning>, usize), RssError> {
     let raw = http.fetch(url, cache, params.cache_policy).await?;
     let parsed = parse::parse_feed(&raw.body, url, params)?;
     let item_count = parsed.items.len();
@@ -234,7 +276,7 @@ pub async fn fetch_one(
         cached_at,
         cache_age_seconds,
     };
-    Ok((fr, parsed.warnings))
+    Ok((fr, parsed.warnings, parsed.items_filtered_out))
 }
 
 /// Discover feeds advertised on a website homepage, through a **caller-provided** client.
@@ -269,7 +311,7 @@ pub async fn show_item_with(
     cache: &Cache,
     http: &HttpClient,
 ) -> Result<Option<crate::model::Item>, RssError> {
-    let (fr, _warnings) = fetch_one(feed_url, http, params, cache).await?;
+    let (fr, _warnings, _filtered) = fetch_one(feed_url, http, params, cache).await?;
     Ok(fr.items.into_iter().find(|it| {
         it.id == key || it.guid.as_deref() == Some(key) || it.url.as_deref() == Some(key)
     }))
@@ -712,7 +754,7 @@ mod tests {
             ..Default::default()
         };
         let http = crate::fetch::HttpClient::new("t", std::time::Duration::from_secs(5)).unwrap();
-        let (fr, _) = fetch_one(FEED, &http, &params, &cache).await.unwrap();
+        let (fr, _, _) = fetch_one(FEED, &http, &params, &cache).await.unwrap();
 
         assert_eq!(fr.cached_at.as_deref(), Some("2020-01-01T00:00:00Z"));
         assert!(
@@ -746,7 +788,7 @@ mod tests {
             ..Default::default()
         };
         let http = crate::fetch::HttpClient::new("t", std::time::Duration::from_secs(5)).unwrap();
-        let (fr, _) = fetch_one(FEED, &http, &params, &cache).await.unwrap();
+        let (fr, _, _) = fetch_one(FEED, &http, &params, &cache).await.unwrap();
 
         assert_eq!(fr.cached_at.as_deref(), Some(future.as_str()));
         assert_eq!(
@@ -803,8 +845,9 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// A successful single-item feed result, shaped as [`fetch_one`] would return it.
-    fn ok_feed(url: &str) -> (FeedResult, Vec<Warning>) {
+    /// A successful single-item feed result, shaped as [`fetch_one`] would return it. `0`
+    /// items filtered out, as if `since`/`query` were never supplied.
+    fn ok_feed(url: &str) -> (FeedResult, Vec<Warning>, usize) {
         let items = vec![item(false)];
         (
             FeedResult {
@@ -822,6 +865,7 @@ mod tests {
                 cache_age_seconds: None,
             },
             Vec::new(),
+            0,
         )
     }
 
@@ -842,12 +886,15 @@ mod tests {
             (1, None),
             (2, Some(ok_feed(&urls[2]))),
             // A *discarded* feed that also errored — the case that pins the rule below.
-            (3, Some((FeedResult::error(&urls[3], failed), Vec::new()))),
+            (
+                3,
+                Some((FeedResult::error(&urls[3], failed), Vec::new(), 0)),
+            ),
         ];
 
         let out = assemble_prefix_in_request_order(
             FetchOutput::new("2026-06-01T00:00:00Z".to_string()),
-            None,
+            &FetchParams::default(),
             results,
         );
 
@@ -890,7 +937,7 @@ mod tests {
 
         let out = assemble_prefix_in_request_order(
             FetchOutput::new("2026-06-01T00:00:00Z".to_string()),
-            None,
+            &FetchParams::default(),
             results,
         );
 
@@ -900,6 +947,144 @@ mod tests {
             out.truncation.is_none(),
             "nothing was omitted, so there is no marker to emit"
         );
+    }
+
+    #[test]
+    fn applied_filters_is_none_when_neither_since_nor_query_supplied() {
+        let out = assemble_prefix_in_request_order(
+            FetchOutput::new("2026-06-01T00:00:00Z".to_string()),
+            &FetchParams::default(),
+            vec![(0, Some(ok_feed("https://e.example/0.xml")))],
+        );
+        assert!(
+            out.applied_filters.is_none(),
+            "neither filter was supplied, so the marker must stay null: {:?}",
+            out.applied_filters
+        );
+    }
+
+    #[test]
+    fn applied_filters_reports_since_removals_even_without_a_query() {
+        // Defect check: `since` alone (no `query`) must still surface a non-zero
+        // `items_filtered_out` — the field is not query-only. A caller that saw `since`
+        // remove real items must not be told `0`, which would read as "the feed had
+        // nothing new" rather than "since filtered it out".
+        let params = FetchParams {
+            since: Some(Utc::now()),
+            ..Default::default()
+        };
+        let mut fr = ok_feed("https://e.example/0.xml");
+        fr.2 = 3; // `since` dropped 3 items while parsing this feed.
+        let out = assemble_prefix_in_request_order(
+            FetchOutput::new("2026-06-01T00:00:00Z".to_string()),
+            &params,
+            vec![(0, Some(fr))],
+        );
+        let applied = out
+            .applied_filters
+            .expect("since was supplied, so the marker must be present");
+        assert!(applied.since.is_some());
+        assert!(applied.query.is_none());
+        assert_eq!(
+            applied.items_filtered_out, 3,
+            "since's removals must be counted, not left at 0"
+        );
+    }
+
+    #[test]
+    fn applied_filters_reports_the_query_as_supplied() {
+        let params = FetchParams {
+            query: Some("rust".to_string()),
+            ..Default::default()
+        };
+        let mut fr = ok_feed("https://e.example/0.xml");
+        fr.2 = 2;
+        let out = assemble_prefix_in_request_order(
+            FetchOutput::new("2026-06-01T00:00:00Z".to_string()),
+            &params,
+            vec![(0, Some(fr))],
+        );
+        let applied = out.applied_filters.expect("query was supplied");
+        assert!(applied.since.is_none());
+        assert_eq!(applied.query.as_deref(), Some("rust"));
+        assert_eq!(applied.items_filtered_out, 2);
+    }
+
+    #[test]
+    fn applied_filters_sums_the_filtered_count_across_every_shipped_feed() {
+        let params = FetchParams {
+            query: Some("rust".to_string()),
+            ..Default::default()
+        };
+        let mut a = ok_feed("https://e.example/a.xml");
+        a.2 = 1;
+        let mut b = ok_feed("https://e.example/b.xml");
+        b.2 = 4;
+        let out = assemble_prefix_in_request_order(
+            FetchOutput::new("2026-06-01T00:00:00Z".to_string()),
+            &params,
+            vec![(0, Some(a)), (1, Some(b))],
+        );
+        assert_eq!(
+            out.applied_filters
+                .expect("query supplied")
+                .items_filtered_out,
+            5
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_feeds_with_reports_since_removals_end_to_end() {
+        // The same defect check as above, exercised through the real network+parse path
+        // rather than the pure helper, so the whole pipeline (fetch_one -> parse_feed ->
+        // assemble_prefix_in_request_order) is pinned, not just one seam of it.
+        let mut server = mockito::Server::new_async().await;
+        let now = Utc::now();
+        let body = format!(
+            "<?xml version=\"1.0\"?><rss version=\"2.0\"><channel><title>f</title>\
+             <item><title>Fresh</title><link>https://example.com/fresh</link>\
+             <pubDate>{}</pubDate></item>\
+             <item><title>Stale</title><link>https://example.com/stale</link>\
+             <pubDate>{}</pubDate></item>\
+             </channel></rss>",
+            now.to_rfc2822(),
+            (now - chrono::Duration::days(400)).to_rfc2822(),
+        );
+        let _m = server
+            .mock("GET", "/f.xml")
+            .with_status(200)
+            .with_body(body)
+            .create_async()
+            .await;
+
+        let dir = std::env::temp_dir().join(format!("rss-appliedfilters-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache = Cache::open(Some(dir.clone())).unwrap();
+        let http = crate::fetch::HttpClient::new("t", std::time::Duration::from_secs(5)).unwrap();
+        let params = FetchParams {
+            since: Some(now - chrono::Duration::hours(1)),
+            cache_policy: CachePolicy::NoCache,
+            ..Default::default()
+        };
+
+        let urls = vec![format!("{}/f.xml", server.url())];
+        let out = fetch_feeds_with(&urls, &params, &cache, &http).await;
+
+        assert_eq!(
+            out.feeds[0].items.len(),
+            1,
+            "only the fresh item survives since"
+        );
+        let applied = out
+            .applied_filters
+            .expect("since was supplied, so applied_filters must be present");
+        assert_eq!(applied.query, None);
+        assert_eq!(
+            applied.items_filtered_out, 1,
+            "the stale item since dropped must be counted end-to-end, not left at 0"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
@@ -1429,5 +1614,33 @@ mod tests {
         let exact = estimate_response_tokens(&out);
         assert!(paginate(&mut out, exact).expect("fits").is_none());
         assert_eq!(out.feeds[0].items.len(), 2);
+    }
+
+    #[test]
+    fn paginate_charges_applied_filters_against_the_budget() {
+        // `applied_filters` is a top-level `FetchOutput` field, so `paginate`'s skeleton
+        // (`output.clone()` with `feeds` cleared, per `estimate_response_tokens`) picks it up
+        // for free via `serde` — no special-casing needed in `paginate` itself. Pin that: a
+        // budget that exactly fits a bare output must reject once a real `applied_filters`
+        // payload is attached and there is nothing left to shed but the sole item.
+        let mut bare = output_with(vec![item(false)]);
+        let budget = estimate_response_tokens(&bare);
+
+        bare.applied_filters = Some(AppliedFilters {
+            since: None,
+            query: Some("a ".repeat(200)), // long enough to blow the same budget
+            items_filtered_out: 3,
+        });
+        assert!(
+            estimate_response_tokens(&bare) > budget,
+            "attaching applied_filters must grow the measured payload"
+        );
+
+        let err = paginate(&mut bare, budget).unwrap_err();
+        assert!(
+            matches!(err, RssError::ResponseTooLarge { .. }),
+            "the envelope (now including applied_filters) plus the one item must not fit, \
+             got {err:?}"
+        );
     }
 }

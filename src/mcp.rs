@@ -408,6 +408,13 @@ struct FetchFeedArgs {
     /// ISO-8601 date/datetime (`2026-06-01`). Applied before `limit`.
     #[serde(default)]
     since: Option<String>,
+    /// Keyword filter over each item's title, summary, and content. Space-separated terms
+    /// are AND-ed, `"quoted phrases"` match as a unit, `-term` excludes. Applied before
+    /// `limit`, so `limit` means "N matching items". A plain `Option<String>` is fine here
+    /// (unlike the numeric fields below): MCP clients that stringify every argument already
+    /// send a string for this one.
+    #[serde(default)]
+    query: Option<String>,
     /// Maximum number of items to return (most recent first). Omit to use the default cap
     /// of 25; pass a larger number to fetch more (subject to the response budget).
     #[serde(default, deserialize_with = "de_lenient_opt_usize")]
@@ -492,7 +499,7 @@ impl RssServer {
     /// Fetch and parse RSS/Atom feeds. Returns the full `FetchOutput` (one entry per URL in
     /// `feeds`), so feed-level errors (including a rate-limit or HTTP failure on one feed of
     /// a batch) surface as a `FeedStatus::Error` entry in `feeds[]`/`errors[]` rather than a
-    /// tool failure — args are `{ url | urls[], content_format?, since?, limit?,
+    /// tool failure — args are `{ url | urls[], content_format?, since?, query?, limit?,
     /// max_content_chars?, max_response_tokens?, cache_policy?, cursor? }`.
     #[tool(
         description = "Fetch and parse RSS/Atom feeds. Pass one `url` OR a `urls` array (max \
@@ -500,7 +507,11 @@ impl RssServer {
         FetchOutput as structured content plus a one-line summary; schema: get_schema \
         command=fetch. content_format is markdown|text|html|none. `limit` caps items PER \
         FEED, newest first (DEFAULT 25); `since` accepts a duration (2h, 7d) or an ISO-8601 \
-        date and is applied before limit. max_content_chars truncates each body (flagged \
+        date and, like `query`, is applied before limit. `query` keyword-filters each item's \
+        title/summary/content: space-separated terms AND, \"quoted phrases\" match as a \
+        unit, `-term` excludes. Either filter's removals are reported in \
+        structuredContent.applied_filters (null when neither was supplied). \
+        max_content_chars truncates each body (flagged \
         content_truncated). `cache_policy` is revalidate (default; re-checks with cached \
         validators, cheap when unchanged, but a cold cache or validator-less origin is a \
         full fetch) | no-cache | cache-first (serves any cached copy, regardless of age) | \
@@ -663,6 +674,7 @@ async fn fetch_feed_with_deadline(
     // Apply a default item cap so a single huge feed doesn't blow the response budget.
     params.limit = Some(args.limit.unwrap_or(MCP_DEFAULT_LIMIT));
     params.max_content_chars = args.max_content_chars;
+    params.query = args.query.clone();
     // Bound the batch in wall-clock time as well as in tokens, so a slow same-host run returns
     // the feeds that finished plus a cursor instead of timing out with nothing.
     params.deadline = Some(deadline);
@@ -677,9 +689,11 @@ async fn fetch_feed_with_deadline(
     // instant on every call, so a resolved fingerprint would never match on page 2 (the
     // resolved cutoff rides in the cursor's `s` field instead).
     //
-    // The two trailing placeholders stand in for Phase 3's `query` / `dedupe`; their exact
-    // bytes are part of every fingerprint, so changing them invalidates every outstanding
-    // cursor.
+    // `query` is now real and part of the fingerprint below: a cursor minted under one query
+    // must not validate a continuation call under a different one, since the two would walk
+    // different item sequences. The trailing placeholder still stands in for the
+    // not-yet-implemented `dedupe` (Task 16); both placeholders' exact bytes are part of
+    // every fingerprint, so changing either invalidates every outstanding cursor.
     let canonical_format = match params.content_format {
         ContentFormat::Markdown => "markdown",
         ContentFormat::Text => "text",
@@ -696,8 +710,8 @@ async fn fetch_feed_with_deadline(
                 .max_content_chars
                 .map(|n| n.to_string())
                 .unwrap_or_default(),
-            "",       // query — populated in Phase 3
-            "report", // dedupe — populated in Phase 3
+            args.query.as_deref().unwrap_or(""),
+            "report", // dedupe — populated in Task 16
         ],
     );
 
@@ -1308,6 +1322,7 @@ pub async fn fetch_page_for_test(
         max_content_chars: None,
         max_response_tokens: Some(max_response_tokens),
         since: None,
+        query: None,
         cache_policy: None,
         cursor,
     };
@@ -1452,6 +1467,7 @@ mod tests {
             urls: None,
             content_format: None,
             since: None,
+            query: None,
             limit: None,
             max_content_chars: None,
             max_response_tokens: None,
@@ -2038,6 +2054,112 @@ mod tests {
         let (is_error, payload) = decode(&fetch_feed_inner(&test_http(), &cache, args).await);
         assert!(is_error);
         assert_eq!(payload["code"], "USAGE_ERROR");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A feed whose items are distinguishable by keyword, for `query` tests.
+    fn feed_with_keyword_items() -> String {
+        "<?xml version=\"1.0\"?><rss version=\"2.0\"><channel><title>Feed</title>\
+         <link>https://example.com/</link>\
+         <item><title>Rust news</title><link>https://example.com/1</link></item>\
+         <item><title>Python news</title><link>https://example.com/2</link></item>\
+         <item><title>More rust</title><link>https://example.com/3</link></item>\
+         </channel></rss>"
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn fetch_feed_query_argument_filters_items_before_limit() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/feed.xml")
+            .with_status(200)
+            .with_body(feed_with_keyword_items())
+            .create_async()
+            .await;
+        let (cache, dir) = temp_cache("query-filter");
+
+        let mut args = fetch_args(format!("{}/feed.xml", server.url()));
+        args.query = Some("rust".to_string());
+        args.limit = Some(2);
+        let out = output_of(&fetch_feed_inner(&test_http(), &cache, args).await);
+
+        let titles: Vec<&str> = out.feeds[0]
+            .items
+            .iter()
+            .filter_map(|i| i.title.as_deref())
+            .collect();
+        assert_eq!(
+            titles.len(),
+            2,
+            "both rust items must ship, not 2 of the newest regardless of match: {titles:?}"
+        );
+        assert!(
+            titles.iter().all(|t| t.to_lowercase().contains("rust")),
+            "every shipped item must match the query: {titles:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn fetch_feed_reports_applied_filters_for_a_query() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/feed.xml")
+            .with_status(200)
+            .with_body(feed_with_keyword_items())
+            .create_async()
+            .await;
+        let (cache, dir) = temp_cache("query-applied-filters");
+
+        let mut args = fetch_args(format!("{}/feed.xml", server.url()));
+        args.query = Some("rust".to_string());
+        let out = output_of(&fetch_feed_inner(&test_http(), &cache, args).await);
+
+        let applied = out
+            .applied_filters
+            .expect("query was supplied, so applied_filters must be present");
+        assert_eq!(applied.query.as_deref(), Some("rust"));
+        assert!(applied.since.is_none());
+        assert_eq!(
+            applied.items_filtered_out, 1,
+            "the one non-matching item must be counted"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn cursor_from_a_different_query_is_rejected() {
+        // Same shape as `cursor_from_a_different_request_is_rejected`, but for `query`: a
+        // cursor minted under one keyword filter must not validate a continuation call under
+        // a different one, since the two filter different item sequences (defect check for
+        // the fingerprint placeholder that used to sit here — see cursor.rs's `fingerprint`).
+        let mut server = mockito::Server::new_async().await;
+        let (http, cache, dir, urls, full) = paging_fixture(&mut server, "page-fp-query").await;
+
+        let mut args = batch_args(urls.clone());
+        args.max_response_tokens = Some(full / 2);
+        args.query = Some("post".to_string());
+        let cursor = cursor_of(&fetch_feed_inner(&http, &cache, args).await)
+            .expect("page 1 must hand back a cursor");
+
+        let mut args = batch_args(urls);
+        args.max_response_tokens = Some(full / 2);
+        args.query = Some("something else".to_string()); // changes the request shape
+        args.cursor = Some(cursor);
+        let (is_error, payload) = decode(&fetch_feed_inner(&http, &cache, args).await);
+
+        assert!(is_error, "a mismatched cursor must not be honored");
+        assert_eq!(payload["code"], "USAGE_ERROR");
+        assert!(
+            payload["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("does not match")),
+            "the error must say the cursor belongs to another request: {payload}"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

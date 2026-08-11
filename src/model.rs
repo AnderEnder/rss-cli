@@ -35,6 +35,9 @@ pub struct FetchOutput {
     /// Primarily populated by the MCP server, which bounds responses (see the `rss mcp`
     /// docs); the CLI populates it only when `--max-content-chars` truncates content.
     pub truncation: Option<TruncationInfo>,
+    /// What filtering ran (`since` and/or `query`) and what it removed, combined across
+    /// every feed in this batch. `null` when neither was supplied.
+    pub applied_filters: Option<AppliedFilters>,
 }
 
 impl FetchOutput {
@@ -48,8 +51,25 @@ impl FetchOutput {
             errors: Vec::new(),
             warnings: Vec::new(),
             truncation: None,
+            applied_filters: None,
         }
     }
+}
+
+/// What filtering was applied to a fetch and what it removed. Present (non-`null`) only
+/// when `since` and/or `query` was actually supplied, so an empty (or shorter-than-expected)
+/// result is diagnosable: "the feed had nothing new" and "my filter was too narrow" look
+/// identical without it.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AppliedFilters {
+    /// The `since` cutoff as an RFC-3339 UTC instant, or `null` if `since` was not supplied.
+    pub since: Option<String>,
+    /// The keyword query as supplied, or `null` if `query` was not supplied.
+    pub query: Option<String>,
+    /// Items removed by `since` and/or `query`, combined across every feed in this batch
+    /// (no per-filter breakdown). `0` means the filter(s) that ran removed nothing — not
+    /// proof that neither ran; check `since`/`query` above for that.
+    pub items_filtered_out: usize,
 }
 
 /// A non-fatal data-quality note about a feed (the feed still parsed and produced items).
