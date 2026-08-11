@@ -103,13 +103,12 @@ pub async fn fetch_feeds_with(
 /// contiguous **prefix** of the requested URLs and reporting whatever the deadline left
 /// unattempted as `truncation.feeds_omitted`.
 ///
-/// Pure by design — no clock, no network, no I/O — so the out-of-order case only a deadline can
-/// produce (feeds 0, 2, 3 done, feed 1 never started) is a deterministic unit test instead of a
-/// timing race. `output` is passed in already stamped, so `fetched_at` still marks the *start*
-/// of the batch rather than the moment assembly ran.
+/// Pure by design — no clock, no network, no I/O — so the out-of-order case only a deadline
+/// produces (feeds 0, 2, 3 done, 1 never started) is a deterministic unit test, not a timing
+/// race. `output` arrives already stamped, so `fetched_at` marks the batch *start*.
 ///
-/// `results` must hold exactly one entry per requested URL (which `buffer_unordered` guarantees
-/// — it yields every future's output, only out of order), so its length is the request count.
+/// `results` must hold one entry per requested URL — `buffer_unordered` yields every future's
+/// output, only out of order — so its length is the request count.
 fn assemble_prefix_in_request_order(
     mut output: FetchOutput,
     params: &FetchParams,
@@ -174,15 +173,13 @@ fn assemble_prefix_in_request_order(
 /// Build the [`AppliedFilters`] marker for a batch, or `None` when neither `since` nor a
 /// query that actually constrains anything was supplied.
 ///
-/// `items_filtered_out` is the combined count `since` and `query` removed across every feed
-/// in the prefix that made it into `output.feeds` — see [`AppliedFilters::items_filtered_out`]'s
-/// docs for why the two are not split out.
+/// `items_filtered_out` combines what `since` and `query` removed across the shipped prefix;
+/// [`AppliedFilters::items_filtered_out`] says why they aren't split out.
 ///
-/// The gate is [`crate::query::Query::is_empty`] on the *parsed* query, deliberately the same
-/// predicate `parse_feed` uses to decide whether to filter at all. Anything looser (a
-/// `trim().is_empty()` test on the raw string, say) disagrees with the filter for inputs that
-/// are non-blank but parse to no terms — `"-"` and `""""` both do — and would emit a marker
-/// claiming a query ran when none did. `since` alone still gates the marker on.
+/// The gate is [`crate::query::Query::is_empty`] on the *parsed* query — the same predicate
+/// `parse_feed` uses to decide whether to filter. Anything looser (a `trim().is_empty()` on the
+/// raw string) disagrees for input that is non-blank but parses to no terms (`"-"`, `""""`),
+/// emitting a marker for a query that never ran. `since` alone still gates it on.
 fn applied_filters_marker(
     params: &FetchParams,
     items_filtered_out: usize,
@@ -304,27 +301,18 @@ fn dedup_key(item: &Item) -> Option<(String, DuplicateKeyKind)> {
         .map(|h| (h.to_string(), DuplicateKeyKind::ContentHash))
 }
 
-/// Collapse each group in `groups` to its first occurrence, and refresh every derived count
-/// so `item_count`/`content_tokens_est_total`/`total_items`/`total_content_tokens_est` stay
-/// consistent with what remains.
-///
-/// Opt-in only: [`find_duplicates`] never mutates; this is the removal path a caller reaches
-/// for explicitly (e.g. `dedupe: "drop"`, added in a later task).
+/// Collapse each group to its first occurrence and refresh every derived count. Opt-in only
+/// (`dedupe: "drop"`); [`find_duplicates`] never mutates.
 ///
 /// **`groups` selects which keys to collapse, not which ids to delete.** Each item's key is
-/// re-derived here with [`dedup_key`] and the first occurrence of each targeted key in
-/// `feeds[]`/`items[]` order survives. That is deliberate, because `item.id` is not a usable
-/// removal handle: `identity.rs` derives `id` from link → guid → title|published while
-/// `dedup_key` prefers guid → url → content_hash, so the two disagree. A feed whose entries
-/// all carry the same `<link>` gives every one of its items the same `id` while their guids
-/// place them in different groups — deleting "the ids after the first" would then delete an
-/// item no group named and leave the real duplicate behind. Re-deriving the key cannot make
-/// that mistake, and for anything [`find_duplicates`] produced the survivor is exactly the
-/// `item_ids[0]` it designated canonical.
+/// re-derived with [`dedup_key`] and the first occurrence of a targeted key survives, because
+/// `item.id` is not a usable removal handle: `identity.rs` keys on link → guid →
+/// title|published while `dedup_key` prefers guid → url → content_hash, so a feed whose
+/// entries share one `<link>` gives every item the same `id` across different groups. Deleting
+/// "the ids after the first" would then delete an item no group named. For anything
+/// `find_duplicates` produced the survivor is still its canonical `item_ids[0]`.
 ///
-/// A stale group (computed against a different snapshot) is harmless: a key with no
-/// occurrence in `output` matches nothing, and a key with exactly one occurrence keeps it.
-/// An empty `groups` slice is a no-op.
+/// A stale group is harmless: an unmatched key collapses nothing, a single occurrence stays.
 pub fn drop_duplicates(output: &mut FetchOutput, groups: &[DuplicateGroup]) {
     use std::collections::HashSet;
 
@@ -358,14 +346,12 @@ pub fn drop_duplicates(output: &mut FetchOutput, groups: &[DuplicateGroup]) {
 /// (invariant 6). Front-ends parse their argument with [`crate::config::parse_dedupe`] and
 /// call this; they do not re-implement the match.
 ///
-/// Under [`DedupeMode::Drop`] the groups stay on the output *after* the removal: they are the
-/// audit trail naming the copies that are gone, which is the only record a caller has of what
-/// was collapsed. That is also why the groups are computed once and reused rather than
-/// recomputed after the removal — a second pass over the survivors would find nothing.
+/// Under [`DedupeMode::Drop`] the groups stay on the output after the removal — they are the
+/// caller's only record of what was collapsed, which is also why they are computed once rather
+/// than recomputed afterwards over the survivors, where a second pass would find nothing.
 ///
-/// Callers that bound a response afterwards must run this **first**: `duplicates[]` is a
-/// top-level field, so a size estimate taken before it is attached under-counts, and `Drop`
-/// changes how many items there are left to budget for.
+/// Callers that bound a response must run this **first**: `duplicates[]` is a top-level field,
+/// so an estimate taken before it under-counts, and `Drop` changes the item count.
 pub fn apply_dedupe(output: &mut FetchOutput, mode: DedupeMode) {
     match mode {
         // Clear rather than no-op: the postcondition is that `duplicates` reflects *this*
@@ -511,12 +497,11 @@ pub fn estimate_response_tokens(output: &FetchOutput) -> usize {
 /// Deliberately approximate and low: [`paginate`]'s greedy pass adds these up and a real
 /// [`estimate_response_tokens`] measurement corrects the residue afterwards.
 ///
-/// **This must never over-estimate.** Nesting actually costs far more than the `+ 2` here
-/// (indentation alone runs ~12 tokens per feed envelope and ~38 per item), and that gap is
-/// load-bearing: it is what makes the greedy total a lower bound on the real payload, so a
-/// greedy rejection implies a real one. Raise this constant to "improve accuracy" and a
-/// greedy total can exceed the real cost — which rejects pages that would have fit, the
-/// false `RESPONSE_TOO_LARGE` this accounting exists to prevent.
+/// **This must never over-estimate.** Nesting really costs far more than the `+ 2` (~12 tokens
+/// per feed envelope, ~38 per item), and that gap is load-bearing: it keeps the greedy total a
+/// lower bound on the real payload, so a greedy rejection implies a real one. Raising it to
+/// "improve accuracy" rejects pages that would have fit — the false `RESPONSE_TOO_LARGE` this
+/// accounting exists to prevent.
 fn pretty_tokens<T: serde::Serialize>(value: &T) -> usize {
     serde_json::to_string_pretty(value)
         .map(|s| s.chars().count().div_ceil(4))
@@ -597,24 +582,18 @@ pub struct PageStop {
 
 /// Trim `output` in place to fit `budget_tokens`, returning where the next page resumes.
 ///
-/// This is the **fill** counterpart to [`enforce_response_budget`]'s **reject**. With a
-/// batch of URLs, rejecting would discard every successful network fetch because one
-/// trailing item overflowed, and the retry would re-hit every host (ADR-0017).
+/// The **fill** counterpart to [`enforce_response_budget`]'s **reject**: with a batch,
+/// rejecting would discard every successful fetch over one trailing item (ADR-0017).
 ///
-/// Returns `Ok(None)` when everything fits and `Ok(Some(stop))` when the page was trimmed.
-/// `Err(ResponseTooLarge)` means, exactly, that **zero items shipped**: a request that
-/// carried items could not place a single one inside the budget (one oversized item, or an
-/// envelope that leaves no room), or there were no items to place to begin with. That is the
-/// invariant a cursor loop depends on — a stop that shipped nothing would mint a cursor no
-/// further along than the request that produced it and loop the caller forever.
+/// `Ok(None)` = everything fit, `Ok(Some(stop))` = trimmed. `Err(ResponseTooLarge)` means
+/// exactly that **zero items shipped** — the invariant a cursor loop needs, since a stop that
+/// shipped nothing would mint a cursor no further along and loop forever.
 ///
-/// On `Err`, `output` **may** have been partially trimmed already (the trim, shed, and husk
-/// passes run before the last checks); discard it and surface the error alone. This is
-/// unlike the sibling [`enforce_response_budget`], which never mutates.
+/// On `Err`, `output` may already be partially trimmed; discard it. Unlike
+/// [`enforce_response_budget`], which never mutates.
 ///
-/// Precondition on `budget_tokens`: the page is measured *as it stands*. Anything the caller
-/// attaches afterwards — a `next_cursor`, a [`TruncationInfo`] marker — is not counted, so
-/// pass a budget already reduced by that headroom (order tens of tokens).
+/// `budget_tokens` must already exclude headroom for what the caller attaches afterwards (the
+/// `next_cursor` and [`TruncationInfo`]) — the page is measured as it stands.
 pub fn paginate(
     output: &mut FetchOutput,
     budget_tokens: usize,

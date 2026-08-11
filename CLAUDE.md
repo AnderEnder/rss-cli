@@ -1,37 +1,39 @@
 # CLAUDE.md
 
-Operational guidance for working in this repo (Claude Code and other contributors).
+How to work in this repo. **What it does:** [README.md](./README.md). **Why it's built this
+way:** [docs/adr/](./docs/adr/) — read the relevant ADR before changing anything load-bearing;
+several designs look simplifiable until you know what they avoid.
 
-- **What it does / how to use it:** [README.md](./README.md) (user-facing).
-- **Why it's built this way:** [docs/adr/](./docs/adr/) (decision records). Read these
-  before changing anything load-bearing — several designs look "simplifiable" until you
-  know what they're avoiding.
-- This file is the **how to work here** layer: commands, invariants, and the gotchas that
-  already bit during the build.
+`rss-cli` is a cache-backed, AI-friendly RSS/Atom/JSON-Feed CLI (binary `rss`) that also runs
+as an MCP server (`rss mcp`). **Data-on-request, not a feed reader** — no subscriptions, no
+read/unread state ([ADR-0002](./docs/adr/0002-data-on-request-not-a-subscription-manager.md)).
+Rust **edition 2024**.
 
-## What this is
+## House rule: be concise
 
-`rss-cli` is a lightweight, cache-backed, AI-friendly RSS/Atom/JSON-Feed CLI (binary name
-`rss`) that also runs as an MCP server (`rss mcp`). It is **data-on-request**, not a feed
-reader: no subscriptions, no read/unread state — see
-[ADR-0002](./docs/adr/0002-data-on-request-not-a-subscription-manager.md). Rust **edition
-2024**.
+Applies to this file, ADRs, doc comments, code comments, commit messages, and PR text.
 
-## Build, test, and gates
+- Say it once, in the one place it belongs. Cross-reference instead of repeating.
+- A comment earns its place by saying what the code cannot: **why**, not what. One or two
+  lines. If it needs a paragraph, the reasoning belongs in an ADR and the comment links there.
+- Prefer naming the trap and its pin (`don't X — reintroduces Y; pinned by <test>`) over
+  narrating the history.
+- `model.rs` doc comments become the generated `outputSchema` **shipped to every MCP client on
+  every session** — they cost tokens on the wire. Keep them tight.
 
-These all pass on `feat/rss-cli-v1`. Run them before declaring any change done — `-D
-warnings` is enforced, and CI ([.github/workflows/ci.yml](./.github/workflows/ci.yml))
-runs the same gates in the **dev** profile.
+## Build, test, gates
+
+Run before declaring any change done. `-D warnings` is enforced; CI
+([.github/workflows/ci.yml](./.github/workflows/ci.yml)) runs the same gates in the dev profile.
 
 ```sh
-cargo fmt --all                              # format (CI uses --check)
-cargo clippy --all-targets -- -D warnings    # lint; warnings are errors
-cargo build                                  # dev build
-cargo test                                   # unit + integration tests
-cargo build --release                        # ~1–2 min: lto=fat + codegen-units=1 (ADR-0010)
+cargo fmt --all                              # CI uses --check
+cargo clippy --all-targets -- -D warnings
+cargo test                                   # unit + integration
+cargo build --release                        # ~12 min: lto=fat + codegen-units=1 (ADR-0010)
 ```
 
-Quick smoke checks:
+Smoke checks:
 
 ```sh
 cargo run -- fetch https://news.ycombinator.com/rss --format json | jq '.feeds[0].items[0]'
@@ -41,193 +43,131 @@ cargo run -- discover https://news.ycombinator.com
 
 ## Architecture map
 
-A single core powers both the CLI and the MCP server, so the two front-ends cannot diverge
-(see [ADR-0008](./docs/adr/0008-async-runtime-and-mcp-in-v1.md)).
+One core powers both front-ends, so they cannot diverge
+([ADR-0008](./docs/adr/0008-async-runtime-and-mcp-in-v1.md)).
 
 | File | Responsibility |
 |------|----------------|
-| `src/model.rs` | **The output contract.** Serialized types + `schemars` derives. The AI-facing API — treat field names as stable ([ADR-0006](./docs/adr/0006-ai-facing-output-contract.md)). Includes the additive `FetchOutput.applied_filters` and `FetchOutput.duplicates` ([ADR-0018](./docs/adr/0018-duplicate-reporting-and-keyword-filtering.md)). |
-| `src/error.rs` | `RssError`, stable `code()` strings, and the `exit` code constants. |
-| `src/config.rs` | `FetchParams` + `CachePolicy` + `DedupeMode` (the *runtime* params, not serialized); `parse_since`/`parse_duration`/`parse_cache_policy`/`parse_dedupe` (shared by the CLI and MCP); `FetchParams::deadline` bounds a batch's wall-clock budget ([ADR-0017](./docs/adr/0017-batch-fetch-and-cursor-pagination.md)). |
-| `src/core.rs` | Orchestration: concurrent fetch (`buffer_unordered`) via `fetch_feeds`/`fetch_feeds_with`, `fetch_one`, `discover_feeds`/`discover_feeds_with`, `show_item`/`show_item_with`, `exit_code_for`; `paginate`/`PageStop` fill a `FetchOutput` to a token budget for MCP cursor pagination ([ADR-0017](./docs/adr/0017-batch-fetch-and-cursor-pagination.md)); `find_duplicates`/`drop_duplicates`/`apply_dedupe` implement the `dedupe` modes ([ADR-0018](./docs/adr/0018-duplicate-reporting-and-keyword-filtering.md)). **CLI and MCP both call into here.** |
-| `src/fetch.rs` | `HttpClient`: reqwest + conditional GET, the `CachePolicy` state machine ([ADR-0005](./docs/adr/0005-conditional-get-always-revalidate-default.md)); routes every send through the per-host gate ([ADR-0016](./docs/adr/0016-per-host-request-gate.md)). |
-| `src/ratelimit.rs` | `HostGate`: shared per-host (authority) concurrency cap + adaptive cooldown for concurrent fetches ([ADR-0016](./docs/adr/0016-per-host-request-gate.md)). Lives inside a *reused* `HttpClient`. |
-| `src/cache.rs` | Atomic file cache (`<hash>.json` + `<hash>.body`) ([ADR-0004](./docs/adr/0004-file-based-atomic-cache.md)). |
-| `src/parse.rs` | `feed-rs` → `model` types; date normalize to UTC; relative→absolute URL resolution; filtering in the order `--since` → `--query` → sort → `--limit`; newest-first sort. |
-| `src/query.rs` | Local keyword matching for `--query` / MCP `query`: AND-ed substring terms, `"quoted phrases"`, `-negation` ([ADR-0018](./docs/adr/0018-duplicate-reporting-and-keyword-filtering.md)). |
-| `src/identity.rs` | **The keystone:** deterministic stable item ids ([ADR-0003](./docs/adr/0003-deterministic-content-hash-item-ids.md)). Pinned by a known-answer test. |
+| `src/model.rs` | **The output contract.** Serialized types + `schemars`. Field names are stable ([ADR-0006](./docs/adr/0006-ai-facing-output-contract.md)). |
+| `src/error.rs` | `RssError`, stable `code()` strings, `exit` code constants. |
+| `src/config.rs` | Runtime params (not serialized): `FetchParams`, `CachePolicy`, `DedupeMode`, and the `parse_*` functions both front-ends share. |
+| `src/core.rs` | Orchestration: `fetch_feeds*`, `fetch_one`, `discover_feeds*`, `show_item*`, `exit_code_for`, `paginate`/`PageStop`, `find_duplicates`/`drop_duplicates`/`apply_dedupe`. **CLI and MCP both call in here.** |
+| `src/fetch.rs` | `HttpClient`: reqwest + conditional GET, the `CachePolicy` state machine ([ADR-0005](./docs/adr/0005-conditional-get-always-revalidate-default.md)); every send goes through the per-host gate. |
+| `src/ratelimit.rs` | `HostGate`: per-authority concurrency cap + adaptive cooldown ([ADR-0016](./docs/adr/0016-per-host-request-gate.md)). Lives inside a *reused* `HttpClient`. |
+| `src/cache.rs` | Atomic file cache, `<hash>.json` + `<hash>.body` ([ADR-0004](./docs/adr/0004-file-based-atomic-cache.md)). |
+| `src/parse.rs` | `feed-rs` → `model`; dates to UTC; relative→absolute URLs; filter order `since` → `query` → sort → `limit`. |
+| `src/query.rs` | Keyword matching: AND-ed substring terms, `"quoted phrases"`, `-negation` ([ADR-0018](./docs/adr/0018-duplicate-reporting-and-keyword-filtering.md)). |
+| `src/identity.rs` | **The keystone:** deterministic item ids ([ADR-0003](./docs/adr/0003-deterministic-content-hash-item-ids.md)). Known-answer test. |
 | `src/content.rs` | HTML → markdown/text/html/none + `content_tokens_est` ([ADR-0009](./docs/adr/0009-html-to-markdown-htmd-html2text.md)). |
+| `src/cursor.rs` | Opaque stateless continuation cursors ([ADR-0017](./docs/adr/0017-batch-fetch-and-cursor-pagination.md)). |
 | `src/discover.rs` | `<link rel=alternate>` autodiscovery via `tl`. |
-| `src/output.rs` | `json`/`ndjson`/`text` rendering; `schema_for` (schema emission). |
-| `src/cursor.rs` | Opaque stateless continuation cursors for paginated `fetch_feed` responses ([ADR-0017](docs/adr/0017-batch-fetch-and-cursor-pagination.md)). |
-| `src/mcp.rs` | `rmcp` stdio server; tools delegate to `core`; batches `urls[]`, mints/consumes continuation cursors, and enforces the response-token budget and batch deadline ([ADR-0017](./docs/adr/0017-batch-fetch-and-cursor-pagination.md)). |
+| `src/output.rs` | `json`/`ndjson`/`text` rendering; `schema_for`. |
+| `src/mcp.rs` | `rmcp` stdio server; tools delegate to `core`; batches `urls[]`, mints/consumes cursors, enforces the token budget and batch deadline. |
 | `src/cli.rs` / `src/main.rs` | clap surface; dispatch; exit-code mapping; stderr `tracing`. |
-| `tests/` | Integration tests (`assert_cmd`, `mockito`, `insta`) + `fixtures/`. |
+| `tests/` | Integration (`assert_cmd`, `mockito`, `insta`) + `fixtures/`. |
 
 ## Invariants — do not break these
 
-1. **The schema is generated, never hand-written.** It comes from the `model.rs` structs
-   via `schemars`. Do not write a schema file by hand; update the structs and let `rss
-   schema` emit it. Any breaking change to the structs requires bumping `SCHEMA_VERSION`
-   in `model.rs`.
-2. **Optional fields serialize as `null`, never omitted.** Don't add `#[serde(skip_serializing_if)]`
-   to contract fields — consumers rely on a fixed shape ([ADR-0006](./docs/adr/0006-ai-facing-output-contract.md)).
-3. **stdout is data only; stderr is logs/diagnostics.** Never print logs or progress to
-   stdout. `tracing` is wired to stderr.
-4. **Item ids are deterministic *by construction*, not cache-dependent.** Don't make
-   identity read from the cache or trust raw guids. The known-answer test in
-   `identity.rs` (`1b9107de952289cb`, `a86aced5664c7742`) locks the exact byte layout — if
-   you change `item_id`, you are changing the public id contract.
+1. **The schema is generated, never hand-written.** Update the `model.rs` structs and let
+   `rss schema` emit it. A breaking change to them requires bumping `SCHEMA_VERSION`.
+2. **Optional contract fields serialize as `null`, never omitted.** No
+   `#[serde(skip_serializing_if)]` — consumers rely on a fixed shape (ADR-0006).
+3. **stdout is data only; stderr is logs.** `tracing` is wired to stderr.
+4. **Item ids are deterministic by construction, not cache-dependent.** Don't read identity
+   from the cache or trust raw guids. The known-answer test (`1b9107de952289cb`,
+   `a86aced5664c7742`) locks the byte layout — changing `item_id` changes a public contract.
 5. **Exit codes are a contract:** `0` ok · `1` unexpected · `2` usage · `3` partial · `4`
-   all-failed. Defined in `error.rs::exit`; mapped in `main.rs`.
-6. **CLI and MCP share `core.rs`.** Add behavior in the core and expose it from both
-   front-ends; don't fork logic into `mcp.rs` or `cli.rs`.
-7. **MCP responses are size-bounded.** `fetch_feed` defaults to `limit=25` and *fills* the
-   response up to `max_response_tokens` rather than rejecting outright — an over-budget batch
-   ships whatever fits plus `truncation.next_cursor`, and the caller pages the rest
-   ([ADR-0017](docs/adr/0017-batch-fetch-and-cursor-pagination.md)). `RESPONSE_TOO_LARGE` now
-   fires only when not even one item can be placed in the budget (one oversized item, or an
-   envelope with nothing left to shed) — `get_item`'s single-item guard is unchanged, since
-   there is only ever one item to place there. Every MCP tool error is structured `ErrorObj`
-   JSON, never a bare string. Don't return an unbounded `FetchOutput` or a plain-text tool
-   error. See [ADR-0011](docs/adr/0011-bounded-mcp-responses.md).
-8. **MCP data tools return structured content, not duplicated text.** `fetch_feed` /
-   `get_item` / `discover_feeds` put the payload in `structuredContent` (matching the tool's
-   generated `outputSchema`) with only a one-line summary in text — never the full payload as
-   text too (that doubles tokens and breaks the budget). Errors stay text-only `ErrorObj`
-   with no `structuredContent`. See [ADR-0013](docs/adr/0013-structured-mcp-tool-results.md).
-9. **`feeds[]`/`errors[]` are in request order** (deterministic *within a run* — not
-   byte-reproducible, since `fetched_at`/`status`/`from_cache` vary). `total_items`,
-   `total_content_tokens_est`, per-feed counts, `content_hash`, `applied_filters`,
-   `duplicates`, and `warnings` are **additive**
-   contract fields computed in `core` (so CLI and MCP stay in sync); `warnings` is kept rare
-   on purpose. `feeds[]` is also a contiguous **prefix** of the request URL list — a batch
-   deadline may legitimately shorten it, but must never leave a gap, because the MCP cursor's
-   position indexes into that same list ([ADR-0017](docs/adr/0017-batch-fetch-and-cursor-pagination.md)).
-   See [ADR-0012](docs/adr/0012-deterministic-ordering-and-output-enrichments.md).
-10. **Item lookup is multi-key and cache-first.** `core::show_item` (`rss show` / MCP
-    `get_item`) matches an item by `id` **or** `guid` **or** resolved `url`, and reads
-    cache-first by default so an item the caller already saw survives a rolled feed window
-    ([ADR-0014](docs/adr/0014-get-item-cache-first-multi-key-lookup.md)); `rss show --refresh`
-    opts back into a live revalidate. The transient `403`/`429` single retry surfaces
-    `retry_after` in the error `details`
-    ([ADR-0015](docs/adr/0015-bounded-retry-on-transient-429-403.md)). Both are **additive** —
-    `SCHEMA_VERSION` stays `"1"`.
-11. **MCP pagination is stateless and cache-backed.** A continuation `cursor` carries the
-    position, a fingerprint of the *raw* request arguments, and the *resolved* `since`
-    cutoff; the call forces `CachePolicy::CacheFirst` so the existing body cache is the
-    pagination store. Don't add a server-side result store, and don't fingerprint the
-    resolved `since` — a relative window resolves differently on every call, so every
-    continuation would mismatch ([ADR-0017](docs/adr/0017-batch-fetch-and-cursor-pagination.md)).
-    Because the cache *is* the store, a request that refuses to write it cannot be paged:
-    `cache_policy: "no-cache"` ships a bounded page with `next_cursor: null` and a suggestion
-    rather than a token the next page would redeem against some earlier call's snapshot.
-    `mcp.rs`'s `no_cursor_reason` is the one place that decision lives.
-12. **Cross-feed dedup reports by default; it does not remove.** `duplicates[]` groups items
-    by `guid` → `url` → `content_hash` (never by `id`, which is namespaced by `feed_url` per
-    ADR-0003) and leaves `feeds[]`, request order, and per-feed `item_count` untouched. Only
-    the opt-in `dedupe: "drop"` removes copies — and `drop` cannot be paged **in either
-    direction**, because a continuation page cannot see canonical copies from earlier pages and
-    would ship the same article twice: it is rejected when passed *with* a `cursor`, and an
-    over-budget `drop` page also withholds one (`no_cursor_reason` in `mcp.rs`). Withholding is
-    load-bearing, not belt-and-braces — a first `drop` page is legal, so it reaches the
-    fingerprint stamped `"drop"`, and a token minted from it can never be redeemed by anything.
-    Both front-ends parse the mode with
-    `config::parse_dedupe` and apply it through the one shared `core::apply_dedupe`
-    (invariant 6); grouping runs **before** `core::paginate` (the budget has to measure the
-    `duplicates[]` that ships), so on a paged response `duplicates[]` describes that page's
-    fetch only ([ADR-0018](docs/adr/0018-duplicate-reporting-and-keyword-filtering.md)).
+   all-failed. Defined in `error.rs::exit`, mapped in `main.rs`. They key on feed **errors**,
+   never on item counts (a feed emptied by `--dedupe drop` is still exit 0).
+6. **CLI and MCP share `core.rs`.** Add behavior to the core; don't fork it into a front-end.
+7. **MCP responses are size-bounded and *fill* rather than reject.** An over-budget batch ships
+   what fits plus `truncation.next_cursor`. `RESPONSE_TOO_LARGE` fires only when not even one
+   item fits. Every tool error is structured `ErrorObj` JSON, never a bare string.
+   ([ADR-0011](./docs/adr/0011-bounded-mcp-responses.md),
+   [ADR-0017](./docs/adr/0017-batch-fetch-and-cursor-pagination.md))
+8. **MCP data tools return `structuredContent` plus a one-line text summary** — never the
+   payload as text too, which doubles tokens. Errors are text-only `ErrorObj`, no
+   `structuredContent`. ([ADR-0013](./docs/adr/0013-structured-mcp-tool-results.md))
+9. **`feeds[]`/`errors[]` follow request order, and `feeds[]` is a contiguous *prefix* of the
+   request URL list.** A batch deadline may shorten it but must never leave a gap — the cursor
+   indexes into that same list. Aggregates (`total_items`, per-feed counts, `applied_filters`,
+   `duplicates`, `warnings`) are additive and computed in `core`, so both front-ends agree.
+   ([ADR-0012](./docs/adr/0012-deterministic-ordering-and-output-enrichments.md))
+10. **Item lookup is multi-key and cache-first.** `core::show_item` matches on `id` **or**
+    `guid` **or** resolved `url`, reading cache-first so a rolled window can't lose an item the
+    caller already saw; `--refresh` opts back into a live revalidate.
+    ([ADR-0014](./docs/adr/0014-get-item-cache-first-multi-key-lookup.md))
+11. **MCP pagination is stateless and cache-backed.** The cursor carries the position, a
+    fingerprint of the *raw* arguments, and the *resolved* `since`; the call forces
+    `CacheFirst`, so the body cache is the store. Don't add a server-side store, and don't
+    fingerprint the resolved `since` — a relative window resolves differently every call, so
+    every continuation would mismatch. (ADR-0017)
+12. **Two request shapes cannot be paged**, and both ship `next_cursor: null` with a
+    suggestion. `mcp.rs`'s `no_cursor_reason` is the single place this lives.
+    - `dedupe: "drop"` — a continuation can't see canonical copies from earlier pages. Rejected
+      *with* a cursor, and withheld on mint too: a first `drop` page is legal, so it reaches
+      the fingerprint stamped `"drop"`, and nothing could ever redeem that token.
+    - `cache_policy: "no-cache"` — it writes nothing, so the next page would resume against
+      some earlier call's snapshot.
+13. **Dedup reports by default; only `drop` removes.** `duplicates[]` groups on `guid` → `url`
+    → `content_hash` and leaves `feeds[]`, order, and `item_count` untouched. Grouping runs
+    *before* `paginate` (the budget must measure what ships), so on a paged response
+    `duplicates[]` describes that page's fetch only.
+    ([ADR-0018](./docs/adr/0018-duplicate-reporting-and-keyword-filtering.md))
 
-## Gotchas (these already bit — don't relearn them)
+## Gotchas (these already bit)
 
-- **`reqwest` 0.13 TLS feature is `rustls`, not `rustls-tls`.** The 0.12-era
-  `rustls-tls` name does not resolve in 0.13. Current features:
+- **`reqwest` 0.13 TLS feature is `rustls`, not `rustls-tls`.** Features:
   `["rustls", "gzip", "charset", "http2"]`.
-- **`sha2` 0.11 `finalize()` output has no `LowerHex` impl.** Hex it manually:
-  `digest.iter().map(|b| format!("{b:02x}")).collect()` (see `cache.rs` / `identity.rs`).
-- **Edition 2024** — let-chains (`if let Some(x) = a && cond`) are used (e.g. `fetch.rs`,
-  `cache.rs`); fine on this edition. Keep clippy happy (`is_none_or`, no
-  `collapsible_if`).
-- **Verify crate names on crates.io before adding them.** The research swarm hallucinated
-  a `readdown` crate that does not exist ([ADR-0009](./docs/adr/0009-html-to-markdown-htmd-html2text.md));
-  we use `htmd` + `html2text`. Confirm any AI-suggested dependency is real.
-- **Parallel edits collide on the shared crate.** This was built by multiple agents owning
-  disjoint files over frozen `model.rs`/`error.rs` interfaces; a typo in one module breaks
-  the whole-crate build for everyone. If you fan out work, freeze the shared types first
-  and keep ownership by file.
-- **MCP clients stringify numeric tool args.** Many MCP clients serialize *every* tool
-  argument as a JSON string, so a bare `Option<usize>` field rejects `"25"` with
-  `invalid type: string "25", expected usize` — which makes `limit` / `max_content_chars` /
-  `max_response_tokens` unusable from those clients. `mcp.rs` deserializes those fields with
-  `de_lenient_opt_usize` (accepts number **or** numeric string; advertises `integer` in the
-  schema regardless). Don't "simplify" them back to `Option<usize>` — that reintroduces the
-  bug. The `fetch_args_coerce_stringified_integers` test pins it.
-- **`CachePolicy::CacheFirst` exists specifically for item lookup** (`rss show` / MCP
-  `get_item`); do not "simplify" it back to `Revalidate` — that reintroduces the rolled-window
-  `NOT_FOUND` the policy was added to fix ([ADR-0014](docs/adr/0014-get-item-cache-first-multi-key-lookup.md)).
-  Pinned by `tests/get_item_window_roll.rs` and
-  `fetch::tests::cache_first_serves_stale_cache_without_network`.
-- **The 403/429 retry is single and bounded** (one retry, capped wait); do not turn it into an
-  unbounded loop — that would be impolite and could mask a persistent outage
-  ([ADR-0015](docs/adr/0015-bounded-retry-on-transient-429-403.md)). Pinned by
-  `fetch::tests::retries_once_on_403_then_succeeds` /
-  `fetch::tests::persistent_403_surfaces_status_in_error`.
-- **The MCP server reuses ONE `HttpClient` across tool calls** — do not "simplify" it back to
-  a per-call `HttpClient::new`. The shared client is what lets concurrent `fetch_feed` calls
-  coordinate their per-host pacing (and share the connection pool); a fresh client per call
-  reintroduces the concurrent-call 429 burst ([ADR-0016](docs/adr/0016-per-host-request-gate.md)).
-  Pinned by `mcp::tests::concurrent_fetches_share_one_client_and_gate`.
-- **The rate-limit gate has TWO distinct caps — don't merge them.** `RETRY_MAX_DELAY` (5 s)
-  bounds the ADR-0015 *in-flight* retry (which holds its host permit); `HOST_MAX_COOLDOWN` /
-  `MAX_GATE_WAIT` (60 s) bound the *sibling-facing* gate wait (ADR-0016). Raising
-  `RETRY_MAX_DELAY` to match would block siblings for 60 s behind a retrying request — the very
-  thing the split avoids.
+- **`sha2` 0.11 `finalize()` has no `LowerHex`.** Hex manually:
+  `digest.iter().map(|b| format!("{b:02x}")).collect()`.
+- **Edition 2024 let-chains** are used. Keep clippy happy (`is_none_or`, no `collapsible_if`).
+- **Verify crate names on crates.io.** An AI-suggested `readdown` crate did not exist; we use
+  `htmd` + `html2text`.
+- **Parallel edits collide on the shared crate.** If you fan work out, freeze the shared types
+  first and keep ownership by file — one typo breaks everyone's build.
+- **MCP clients stringify *every* argument.** Numbers go through `de_lenient_opt_usize`, lists
+  through `de_lenient_url_list` (JSON array, stringified array, or delimited string). Don't
+  "simplify" either back to a plain type. Pinned by `fetch_args_coerce_stringified_integers`
+  and `urls_arg_accepts_every_stringified_form`.
+- **`CachePolicy::CacheFirst` exists for item lookup.** Reverting it to `Revalidate`
+  reintroduces the rolled-window `NOT_FOUND` (ADR-0014). Pinned by
+  `tests/get_item_window_roll.rs`.
+- **The 403/429 retry is single and bounded.** An unbounded loop is impolite and masks outages
+  ([ADR-0015](./docs/adr/0015-bounded-retry-on-transient-429-403.md)). Pinned by
+  `fetch::tests::retries_once_on_403_then_succeeds`.
+- **The MCP server reuses ONE `HttpClient`.** A per-call client reintroduces the concurrent-call
+  429 burst (ADR-0016). Pinned by `mcp::tests::concurrent_fetches_share_one_client_and_gate`.
+- **The rate limiter has three separate bounds — don't merge them.** `RETRY_MAX_DELAY` (5 s)
+  bounds one *in-flight* retry holding its host permit; `HOST_MAX_COOLDOWN`/`MAX_GATE_WAIT`
+  (60 s) bound a *sibling's* gate wait; `FetchParams::deadline` bounds when a fetch may
+  **start**. Raising the first to match the second blocks siblings behind a retrying request.
 - **Never hold the `HostGate` slot-map lock across an `.await`.** `slot_for` locks only to
-  insert-and-clone the `Arc<HostSlot>`, then drops the guard; all waiting uses the per-slot
-  semaphore + atomic deadlines. Holding the `std::sync::Mutex` across a sleep would stall the
-  runtime. (Also: `tokio` needs the `"sync"` feature for `Semaphore`.)
-- **MCP clients stringify array arguments too.** `urls` accepts a JSON array, a stringified
-  JSON array, or a delimited string via `de_lenient_url_list` — the same liberality
-  `de_lenient_opt_usize` gives numbers. Pinned by `urls_arg_accepts_every_stringified_form`.
-- **`fetch_feed`'s `limit` is per feed, not per batch.** A 10-URL call assembles up to
-  10 x limit candidates and lets the response budget page them. Don't "fix" this by scaling
-  the cap down by feed count — that silently returns fewer items than the same single-URL
-  call would.
-- **`core::pretty_tokens` must never over-estimate.** It deliberately under-counts (a flat
-  `+ 2` regardless of real nesting cost) so `paginate`'s greedy running total stays a
-  provable *lower bound* on the real serialized payload — a greedy rejection then implies a
-  real one. Raising the constant to "improve accuracy" lets the greedy total exceed the real
-  cost and rejects pages that would actually have fit
-  ([ADR-0017](docs/adr/0017-batch-fetch-and-cursor-pagination.md)). Pinned by
-  `paginate_ships_a_page_that_fits_even_when_a_later_feed_is_dropped` and
-  `paginate_still_errors_below_the_first_feeds_envelope_and_item`.
-- **`query` is applied before `limit`, on purpose.** So `limit` means "N matching items", not
-  "N items, some of which match". Moving the filter after the limit silently returns fewer
-  results than asked for. The order in `parse::parse_feed` is `since` → `query` → sort →
-  `limit`. Pinned by `parse::tests::query_filters_before_limit`.
+  insert-and-clone the `Arc<HostSlot>`; all waiting uses the per-slot semaphore.
+- **`fetch_feed`'s `limit` is per feed, not per batch.** Scaling it down by feed count would
+  silently return fewer items than the same single-URL call.
+- **`core::pretty_tokens` must never over-estimate.** Its flat `+ 2` deliberately under-counts
+  so `paginate`'s running total is a provable *lower bound* on the real payload — then a greedy
+  rejection implies a real one. "Improving accuracy" rejects pages that would have fit
+  (ADR-0017). Pinned by `paginate_ships_a_page_that_fits_even_when_a_later_feed_is_dropped`.
+- **`query` runs before `limit`, on purpose,** so `limit` means "N matching items". Pinned by
+  `parse::tests::query_filters_before_limit`.
 - **`item.id` and the dedup key disagree — never collapse duplicates by id.** `identity.rs`
-  derives `id` from link → guid → title|published; `core::dedup_key` prefers guid → url →
-  content_hash. A feed whose entries all carry the same `<link>` gives every one of its items
-  the *same* `id` while their guids put them in *different* groups. So `drop_duplicates` takes
-  the groups as a set of **keys to collapse** and re-derives each surviving item's key — it
-  does not delete `item_ids`. "Simplifying" it back to id-set membership (or a per-id removal
-  budget) deletes an item no group named and leaves the real duplicate in place; every derived
-  count is refreshed afterwards, so the output stays internally consistent and no count
-  assertion catches it. Pinned by
+  keys on link → guid → title|published; `core::dedup_key` on guid → url → content_hash. A feed
+  whose entries share one `<link>` gives every item the same `id` while their guids put them in
+  different groups, so id-based removal deletes an item no group named and leaves the real
+  duplicate — with every count refreshed afterwards, so nothing catches it. `drop_duplicates`
+  therefore re-derives each item's key. Pinned by
   `core::tests::drop_duplicates_removes_by_key_not_by_id_when_ids_collide`.
 
 ## Non-goals (v1)
 
-Subscription management (add/list/remove), persisted read/unread/star state, full-text
-search, scheduled/daemon refresh, and built-in LLM summarization
-([ADR-0007](./docs/adr/0007-no-builtin-llm-summarization.md)). Don't add these without a
-new ADR — they were deliberately excluded.
+Subscription management, persisted read/unread/star state, full-text search, scheduled refresh,
+built-in LLM summarization ([ADR-0007](./docs/adr/0007-no-builtin-llm-summarization.md)). Don't
+add these without a new ADR.
 
 ## Repo state
 
-- Default branch is `main`; `origin` is `git@github.com:AnderEnder/rss-cli.git`. (An earlier
-  version of this section said the project was local-only with no remote and named
-  `feat/rss-cli-v1` as the branch — both stale.)
-- **Feature work merges into local `main`; publishing is a separate, explicit decision.**
-  Don't `git push` or open a PR unless the owner asks for it in that turn. Dependabot PRs
-  arrive on their own; the branches under `origin/dependabot/*` are not ours to manage.
+- Default branch `main`; `origin` is `git@github.com:AnderEnder/rss-cli.git`.
+- **Feature work merges into local `main`; publishing is a separate, explicit decision.** Don't
+  push or open a PR unless asked in that turn. `origin/dependabot/*` is not ours to manage.

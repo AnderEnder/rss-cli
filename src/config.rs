@@ -82,15 +82,10 @@ pub struct FetchParams {
     pub max_content_chars: Option<usize>,
     /// Only include items published at or after this instant.
     pub since: Option<DateTime<Utc>>,
-    /// Keyword filter applied to each item's title, summary, and content (see
-    /// [`crate::query::Query`]). Space-separated terms are AND-ed; `"quoted phrases"` match
-    /// as a unit; a leading `-term` excludes. Applied in [`crate::parse::parse_feed`] after
-    /// `since` and before `limit`, so `limit` means "N matching items", not "N items, some
-    /// of which match".
-    ///
-    /// It matches the item as it will be *returned*, so `content_format` and
-    /// `max_content_chars` narrow what is searchable: a term that only appears past the
-    /// truncation point, or anywhere in the body under `--content none`, will not match.
+    /// Keyword filter over each item's title, summary, and content ([`crate::query::Query`]).
+    /// Applied in [`crate::parse::parse_feed`] after `since` and before `limit`, so `limit`
+    /// means "N matching items". It matches the item as it will be *returned*, so
+    /// `content_format` and `max_content_chars` narrow what is searchable.
     pub query: Option<String>,
     /// Maximum number of feeds fetched concurrently.
     pub concurrency: usize,
@@ -102,19 +97,15 @@ pub struct FetchParams {
     /// returns a usable partial page instead of outliving the caller's timeout. `None`
     /// (the CLI default) means no deadline.
     ///
-    /// A third, independent bound — deliberately *not* folded into either rate-limit cap:
-    /// `RETRY_MAX_DELAY` bounds one in-flight retry, `MAX_GATE_WAIT` bounds a sibling's pacing
-    /// wait, and this bounds when a fetch may **start**.
+    /// A third, independent bound, deliberately not folded into either rate-limit cap:
+    /// `RETRY_MAX_DELAY` bounds one in-flight retry, `MAX_GATE_WAIT` a sibling's pacing wait,
+    /// and this one when a fetch may **start**.
     ///
-    /// What it therefore does *not* bound is a fetch already admitted. The first `concurrency`
-    /// futures are polled at once, all pass the check at t≈0, and then queue on the per-host
-    /// permit, where no clock reaches them. So the real bound on a batch is the deadline **plus
-    /// up to `concurrency - 1` already-admitted fetches** draining serially behind
-    /// `HOST_MAX_CONCURRENCY`, each of which can additionally sit out a cooldown escalating
-    /// toward `HOST_MAX_COOLDOWN` (and is itself capped by `timeout`). Permit contention is
-    /// exactly what `MAX_GATE_WAIT` does not cover — and this does not cover it either; the
-    /// deeper fix (a deadline threaded into the gate's permit acquire) is recorded as a known
-    /// limitation in ADR-0017.
+    /// It therefore does *not* bound a fetch already admitted: the first `concurrency` futures
+    /// all pass the check at t≈0, then queue on the per-host permit where no clock reaches
+    /// them. The real bound is the deadline plus up to `concurrency - 1` admitted fetches
+    /// draining serially, each able to sit out a cooldown (itself capped by `timeout`). Known
+    /// limitation in ADR-0017, with the deeper fix named.
     pub deadline: Option<Duration>,
 }
 

@@ -123,13 +123,9 @@ const BATCH_DEADLINE_ENV: &str = "RSS_MCP_BATCH_DEADLINE_SECS";
 /// remove the bound. `0` is a *valid* value meaning "already expired" — to run without a
 /// deadline, unset the variable rather than zeroing it.
 ///
-/// An operator who sets an already-expired deadline should know what it costs continuation
-/// callers: page 1 attempts nothing, so it hands back a cursor at feed 0 having delivered no
-/// data — and the continuation that cursor points at attempts nothing either. With `feeds[]`
-/// empty there is no fetched prefix to resume past, so the mint is gated off and that page
-/// reports `feeds_omitted > 0` with `next_cursor: null`, leaving the caller only the
-/// "request them separately" advice. Zero is for tests and for shedding load, not for
-/// paginating.
+/// Zero is for tests and load-shedding, not for paginating: page 1 attempts nothing, so with
+/// `feeds[]` empty there is no fetched prefix to resume past and the caller gets
+/// `feeds_omitted > 0` with `next_cursor: null`.
 fn parse_batch_deadline(raw: Option<&str>) -> std::time::Duration {
     raw.and_then(|s| s.trim().parse::<u64>().ok()).map_or_else(
         || std::time::Duration::from_secs(MCP_BATCH_DEADLINE_SECS),
@@ -755,25 +751,15 @@ async fn fetch_feed_with_deadline(
     // the feeds that finished plus a cursor instead of timing out with nothing.
     params.deadline = Some(deadline);
 
-    // Fingerprint the *normalized* arguments — the effective limit after defaulting and the
-    // parsed content format — so a client that echoes a response's resolved values back on
-    // page 2 (`limit: 25`, `"Markdown"`) is not told mid-pagination that its cursor belongs to
-    // another request. The fingerprint only has to separate requests that produce *different
-    // items*, and these do not.
+    // Every argument that changes which items a continuation walks belongs here. Values are
+    // *normalized* (defaulted limit, canonical format and dedupe spelling) so a client echoing
+    // a response's resolved values back on page 2 isn't told its cursor is foreign.
     //
-    // `since` is the deliberate exception and stays RAW: `since: "2h"` resolves to a new
-    // instant on every call, so a resolved fingerprint would never match on page 2 (the
-    // resolved cutoff rides in the cursor's `s` field instead).
+    // `since` is the deliberate exception and stays RAW: `"2h"` resolves anew every call, so a
+    // resolved fingerprint would never match. The resolved cutoff rides in the cursor's `s`.
     //
-    // `query` and `dedupe` are both real now and both part of the fingerprint below: a cursor
-    // minted under one must not validate a continuation call under the other, since the two
-    // would walk different item sequences (or report different duplicates). `dedupe` is
-    // fingerprinted in its *canonical* spelling for the same normalization reason as the
-    // format and the limit — and because that spelling is `"report"` by default, it is
-    // byte-identical to the placeholder it replaced, so cursors minted before it landed still
-    // validate. `drop` does reach here (only a *continuation* under `drop` is rejected above),
-    // which is exactly why `may_mint_cursor` withholds the token: a `drop` fingerprint could
-    // never be validated by any later call.
+    // `drop` does reach here — only a *continuation* under `drop` is rejected above — which is
+    // why `may_mint_cursor` withholds the token no later call could validate.
     let canonical_format = match params.content_format {
         ContentFormat::Markdown => "markdown",
         ContentFormat::Text => "text",
@@ -811,17 +797,11 @@ async fn fetch_feed_with_deadline(
     let start_feed = resume.as_ref().map_or(0, |c| c.f);
     let requested = &urls[start_feed..];
     let mut out = core::fetch_feeds_with(requested, &params, cache, http).await;
-    // Load-bearing for the cursor arithmetic below: `feeds[]` is a **prefix** of the requested
-    // URLs, so `feeds[j]` is `requested[j]` — which is what lets `PageStop::feed_idx` (an index
-    // into the pre-trim feed list) become an index into `urls` by adding `start_feed`.
-    //
-    // A prefix, not a one-for-one mapping: the batch deadline leaves the feeds it never
-    // attempted out of `feeds[]` entirely (they are counted in `truncation.feeds_omitted`
-    // instead), so the list is legitimately shorter than the request. What must never happen is
-    // a *gap* — a missing feed with delivered feeds after it — which would shift every later
-    // position by one. Checking the URLs pairwise tests that directly, and is cheap at
-    // `MCP_MAX_URLS = 50`. The `debug_assert` fails the dev build loudly; the boolean is the
-    // release-mode belt — no cursor at all is lossy, a cursor at the wrong feed is wrong.
+    // Cursor arithmetic rests on `feeds[]` being a prefix of `requested` (invariant 9), so
+    // `feeds[j] == requested[j]` and `PageStop::feed_idx + start_feed` indexes `urls`. Shorter
+    // is fine — the deadline drops trailing feeds — but a *gap* would shift every later
+    // position. `debug_assert` reds the dev build; the boolean is the release belt, since no
+    // cursor is merely lossy while a cursor at the wrong feed is wrong.
     let mismatch = first_position_mismatch(&out.feeds, requested);
     let positions_line_up = mismatch.is_none();
     debug_assert!(
@@ -833,23 +813,10 @@ async fn fetch_feed_with_deadline(
         requested.len()
     );
 
-    // Two request shapes cannot be paged at all, and for both the honest answer is a truncated
-    // page with no cursor plus advice — never a token that can only ever mislead.
-    //
-    // `dedupe='drop'`: rejected *with* a cursor by the guard above, which covers only
-    // redemption. A first `drop` page reaches the fingerprint stamped `"drop"`, so a token
-    // minted from it is unredeemable by construction — as `drop` it hits that guard, as
-    // anything else it fails the fingerprint check — and its `i`/`n` index the *post-removal*
-    // item list while a continuation refetches without the removal.
-    //
-    // `cache_policy='no-cache'`: pagination is cache-backed (ADR-0017) — a continuation forces
-    // `CacheFirst` and walks the body the cache holds. `NoCache` fetches fresh bytes and
-    // deliberately does not write them, so the next page would read whatever entry an *earlier*
-    // call happened to leave behind (the default policy writes on both 200 and 304, so one
-    // usually exists) and drain the cursor's `i` off a different snapshot: items silently
-    // skipped and repeated. The roll warning cannot catch it either, since a feed pinned at its
-    // window cap has the same item count in both snapshots. Callers who want fresh bytes *and*
-    // paging already have `revalidate`, the default, which refetches and persists.
+    // The two unpageable request shapes (invariant 12). Both get a bounded page plus advice
+    // rather than a token nothing could redeem: a `drop` cursor is rejected by the guard above
+    // and its `i`/`n` index the post-removal list anyway, and a `no-cache` cursor would resume
+    // against whatever snapshot an earlier call left in the cache.
     let no_cursor_reason: Option<&'static str> = if dedupe == crate::config::DedupeMode::Drop {
         Some(DROP_NOT_PAGEABLE_SUGGESTION)
     } else if params.cache_policy == CachePolicy::NoCache {
@@ -866,22 +833,15 @@ async fn fetch_feed_with_deadline(
     if let Some(c) = &resume
         && let Some(feed) = out.feeds.first_mut()
     {
-        // Only a *successful* fetch can tell us the window moved. A feed that errored here
-        // (cache evicted between pages, then a failing refetch) has zero items for a reason
-        // already reported in `feeds[].error` / `errors[]`; calling that a rolled window
-        // would be misdirection.
+        // Only a *successful* fetch can say the window moved: a feed that errored has zero
+        // items for a reason already in `feeds[].error`, and calling that a roll misdirects.
         //
-        // `c.i > 0` for the same reason: resuming at the head of a feed drains nothing, so no
-        // count can make this page skip or repeat an item. It also keeps the batch deadline's
-        // cursor quiet — that one records `i: 0, n: 0` for a feed no page has *attempted*,
-        // where the `0` means "unknown", not "the window was empty".
-        //
-        // What this deliberately gives up: a budget cursor can carry `i: 0, n: 10` — a feed the
-        // page dropped whole, whose window *was* measured — and a genuine roll on that feed goes
-        // unreported. Accepted, because the warning only ever claims "resuming here may skip or
-        // repeat items", and at `i == 0` it cannot: the next page re-delivers that feed from its
-        // head whatever its window now holds. Pinned by
-        // `a_cursor_that_measured_a_window_but_resumes_at_zero_stays_quiet`.
+        // `c.i > 0` likewise — resuming at a feed's head drains nothing, so no count can make
+        // this page skip or repeat. It also keeps the deadline's `i: 0, n: 0` cursor quiet,
+        // where the zeros mean "unattempted", not "empty window". The cost is that a genuine
+        // roll goes unreported on a feed dropped whole at `i: 0, n: 10`; accepted, since the
+        // warning only claims "resuming here may skip or repeat", which at `i == 0` it cannot.
+        // Pinned by `a_cursor_that_measured_a_window_but_resumes_at_zero_stays_quiet`.
         if feed.error.is_none() && c.i > 0 && feed.items.len() != c.n {
             out.warnings.push(crate::model::Warning {
                 feed_url: Some(feed.feed_url.clone()),
@@ -901,18 +861,11 @@ async fn fetch_feed_with_deadline(
         core::refresh_feed_counts(&mut out);
     }
 
-    // Before `core::paginate`, and after the resume-skip: `duplicates[]` is a top-level field
-    // that `paginate`'s skeleton measures, so computing it later would let the page ship over
-    // budget — and under `drop` there would be fewer items to budget for than were counted.
-    //
-    // The consequence, recorded in ADR-0018: on a paged response `duplicates[]` describes the
-    // batch *that page fetched*, so a reported group can name an item the page budget then
-    // trimmed off. That item ships on the next page but is NOT grouped again — the page-2 call
-    // fetches only `urls[start_feed..]` and drains the items already delivered, so the copy it
-    // would be grouped with is not in view. The page that reports a group is the only page that
-    // reports it. Recomputing after `paginate` would not fix that (it would lose the group
-    // entirely) and would break `drop`, whose groups are deliberately an audit trail of items
-    // that are already gone.
+    // Before `paginate` (whose skeleton measures `duplicates[]`, so grouping later would ship
+    // the page over budget) and after the resume-skip. The consequence is that groups describe
+    // what *this page* fetched — see ADR-0018 and `FetchOutput::duplicates` for how a caller
+    // reconciles them across pages. Moving it after `paginate` would also break `drop`, whose
+    // groups are an audit trail of items already gone.
     core::apply_dedupe(&mut out, dedupe);
 
     // A continuation with nothing left to ship is *finished*, not over budget. It happens when
@@ -924,23 +877,18 @@ async fn fetch_feed_with_deadline(
     // here, so every error still has its feed. This is the one page that may exceed
     // `max_response_tokens` — there is no item left to drop.
     if resume.is_some() && core::item_count(&out) == 0 {
-        // "Finished" only as far as the *roll* goes: the batch deadline may still have left
-        // feeds unattempted behind the drained one, and they are real data the caller has not
-        // seen. Hand back a cursor for them rather than ending the loop on a roll the caller
-        // did not cause. Without a deadline this cannot arise — every later feed would be here
-        // carrying items, so `item_count` would not be zero.
+        // "Finished" as far as the *roll* goes — but the deadline may have left feeds
+        // unattempted behind the drained one, and those are data the caller hasn't seen. Only
+        // reachable with a deadline; without one every later feed would be here with items.
         //
-        // Gated on a non-empty `feeds[]`, which says the resumed feed *was* fetched (the drain
-        // is what emptied it), so resuming past it is right. An empty `feeds[]` means the
-        // deadline attempted nothing at all — reachable only with a zero override — and there
-        // the caller's own cursor is still the correct place to resume from, so leave it be
-        // rather than mint one that would re-deliver the items page 1 already sent.
+        // Non-empty `feeds[]` means the resumed feed *was* fetched (the drain emptied it), so
+        // resuming past it is right. Empty means the deadline attempted nothing, and the
+        // caller's own cursor is still the place to resume — minting here would re-deliver
+        // page 1.
         //
-        // `may_mint_cursor`, not the bare `positions_line_up`, so all three mint sites read the
-        // same gate. Reaching here needs `resume.is_some()`, and both unpageable shapes are
-        // already excluded on that path — `drop` is rejected outright with a cursor, and a
-        // continuation's policy is forced to `CacheFirst` — so the extra clause changes nothing
-        // today. It is here so nobody has to re-derive that when adding the next reason.
+        // `may_mint_cursor` for consistency with the other two mint sites; on this path
+        // (`resume.is_some()`) both unpageable shapes are already excluded, so it changes
+        // nothing today.
         if may_mint_cursor
             && !out.feeds.is_empty()
             && let Some(m) = out.truncation.as_mut()
@@ -1813,49 +1761,19 @@ mod tests {
 
     #[tokio::test]
     async fn get_item_and_discover_serialize_through_one_gate_on_the_same_host() {
-        // This is the property the signature change above only *enables* — it does not prove
-        // it. A `*_with` that compiles, accepts `http`, and quietly builds its own
-        // `HttpClient::new(...)` inside instead of using it would still pass every assertion
-        // above (NOT_FOUND / a discovered feed), because those don't depend on which gate the
-        // request went through.
+        // The assertions above don't prove the gate is *shared* — a `*_with` that accepts
+        // `http` and quietly builds its own `HttpClient` inside would still pass them.
         //
-        // Proved the same way `ratelimit::tests::cap_one_serializes_same_authority` proves
-        // blocking: hold a permit open indefinitely (no timer) and race the contender against
-        // a short `tokio::time::timeout`, rather than comparing elapsed wall time against a
-        // threshold. `feed_hold_server` holds `/feed.xml`'s response until released, while
-        // `/site` answers immediately.
+        // Formulated as a hold-and-timeout race, like
+        // `ratelimit::tests::cap_one_serializes_same_authority`, not a wall-clock threshold:
+        // `/feed.xml` is held open while `/site` answers instantly. Sharing the gate means
+        // `discover` blocks in `HostGate::acquire` with no timer to lose to, so scheduling
+        // delay cannot red this on correct code; a fresh client skips the permit entirely and
+        // returns in ~10ms against the 300ms window.
         //
-        // ADR-0016 caps same-authority concurrency at 1. Assumes the default env (unset
-        // `RSS_HOST_CONCURRENCY` / `RSS_MAX_GATE_WAIT_SECS`) — see `HostGate::from_env`; a
-        // loosened cap lets `discover_fut` take the second permit and fail the assertion below
-        // even on correct code.
-        //
-        // One residual timing dependency: the 100ms "drive `item_fut`" step below exists only
-        // to make `get_item_inner` acquire the one permit *before* `discover_fut` starts racing
-        // for it — on a runner so starved that 100ms isn't enough for a loopback connect+acquire
-        // to run, `discover_fut` could win the permit first and the assertion below would fail
-        // on correct code (a false red, not the silent false green this replaces).
-        //
-        // - Correct (shared gate): `get_item_inner`'s request to `/feed.xml` acquires the
-        //   host's one permit and blocks in-process waiting for the held response.
-        //   `discover_feeds_with`'s request to `/site` (same authority) then blocks *before*
-        //   it ever reaches the socket, in `HostGate::acquire` — it cannot complete within any
-        //   timeout while the hold is up, no matter how long we wait or how loaded the runner
-        //   is, because nothing is timer-driven on this side.
-        // - Regression (a fresh `HttpClient`/gate built inside `discover_feeds_with`): its
-        //   request to `/site` never contends for the held permit at all, reaches the server's
-        //   immediate-answer path, and completes almost instantly — well inside the race
-        //   window below, on any runner.
-        //
-        // This removes the wall-clock margin question for the *correct* side entirely: there
-        // is no timer to race against while the hold is up, so a false red (this test failing
-        // on genuinely correct code) cannot happen from scheduling delay, full stop. The
-        // *regression* side still has to finish inside the 300ms window to be caught — a false
-        // green is not impossible in principle, only far less likely than before: the
-        // regression's round trip is a no-delay localhost request (measured ~10ms against the
-        // 300ms budget under the mutation check below, a ~30x margin), versus the old
-        // formulation's ~150ms server delay racing an ~240ms threshold (~1.25x margin, per the
-        // review finding this replaces).
+        // Assumes the default env (unset `RSS_HOST_CONCURRENCY`/`RSS_MAX_GATE_WAIT_SECS`): a
+        // cap above ADR-0016's 1 hands `discover_fut` a second permit and reds this.
+        // The 100ms drive step below just lets `get_item_inner` take the permit first.
         let (base, hold) = feed_hold_server(feed_with_items(1), site_with_alternate_link());
         let (cache, dir) = temp_cache("shared-gate-probe");
         let http = test_http();
@@ -1996,20 +1914,13 @@ mod tests {
             );
         }
 
-        // Every argument fetch_feed advertises must be named somewhere in the docs, so adding
-        // a new one (e.g. a future `query`/`dedupe`) without documenting it fails this test
-        // rather than shipping silently undiscoverable, same as the fixed needles above.
+        // Every advertised argument must be named in the docs, so a new one ships documented
+        // or reds here.
         //
-        // Near-miss caveat: this is a substring check, so some of these pass only because they
-        // are a substring of a *different*, unrelated word that happens to already be
-        // documented -- not because the argument itself was named. Verified by hand for the
-        // current nine properties: `limit` ← `suggested_limit`, `cursor` ← `next_cursor`,
-        // `max_content_chars` ← `suggested_max_content_chars`, and `url` ← `urls` are all
-        // near-misses (each also has an independent, genuine mention elsewhere in the text, but
-        // the loop below cannot tell the difference and would still pass without one). A
-        // property whose *only* real-world mention is coincidentally a substring of another
-        // property's name would pass this loop while remaining genuinely undocumented -- do not
-        // over-trust a green run here as proof every argument has its own explanation.
+        // Weaker than it looks: it is a substring check, and `limit`/`cursor`/
+        // `max_content_chars`/`url` each also occur inside a longer name
+        // (`suggested_limit`, `next_cursor`, …). All four do have genuine mentions, verified
+        // by hand, but the loop can't tell — green here is not proof of a real explanation.
         let props = fetch
             .input_schema
             .get("properties")

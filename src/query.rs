@@ -9,35 +9,22 @@ use crate::model::Item;
 
 /// A parsed keyword query: every `required` term must appear and no `excluded` term may.
 ///
-/// A few semantics are real design choices, spelled out here rather than left implicit:
+/// Semantics that are real choices, not accidents:
 ///
-/// - **Substring, not word-boundary.** Matching is `str::contains` on a lowercased
-///   haystack, so a query for `"ai"` matches an item whose only relevant word is "said".
-///   Callers that need whole-word matching must post-process; this module stays
-///   mechanical on purpose (see the module docs).
-/// - **Case-insensitive via `str::to_lowercase()`** — full Unicode lowercasing (`ÜBER`
-///   matches `über`), but not full Unicode case *folding* (`STRASSE` will not match
-///   `straße`). Good enough for keyword search, not a collation-aware matcher.
-/// - **An all-exclusions query is not the same as an empty one.** `-spam` with no
-///   required terms has an empty `required` list (vacuously satisfied) and a non-empty
-///   `excluded` list, so [`Query::is_empty`] is `false` and every item that lacks "spam"
-///   matches. Only a query with *no* terms at all — required and excluded both empty —
-///   is `is_empty()`.
-/// - **[`Query::matches_item`] searches `title`, `summary`, and `content` only** — not
-///   `authors`, `url`, `categories`, or `guid`. It sees the item as it will be *returned*,
-///   after content rendering and truncation, so the searchable surface shrinks with the
-///   content settings: under `--content none` the body is gone entirely, and under
-///   `--max-content-chars N` a term appearing only past character N will not match. The
-///   same query can therefore match fewer items under a narrower content setting.
-/// - **Each field is matched on its own; fields are never concatenated**, so a quoted
-///   phrase cannot span a field boundary — a title ending in "breaking" followed by a
-///   summary starting with "news" does not satisfy `"breaking news"`. There is no
-///   separator character for a term to straddle, so this holds for *every* term,
-///   including one that itself contains a newline. Within a field the text is matched
-///   verbatim, so a phrase can't span a line break *inside* `content` either —
-///   `"new async"` will not match a body containing `"the new\nasync runtime"`. A phrase
-///   matches contiguously, within one field, or not at all. Required terms are still
-///   ANDed *across* fields: one term in the title and another in the content is a match.
+/// - **Substring, not word-boundary** — a query for `"ai"` matches "said". Post-process if
+///   you need whole words.
+/// - **Case-insensitive via `to_lowercase`**: full Unicode lowercasing (`ÜBER` matches
+///   `über`) but not case *folding* (`STRASSE` will not match `straße`).
+/// - **All-exclusions is not empty.** `-spam` leaves `required` empty (vacuously satisfied)
+///   and `excluded` non-empty, so [`Query::is_empty`] is `false`. Only a query with no terms
+///   at all is empty.
+/// - **[`Query::matches_item`] searches `title`, `summary`, `content`** — not `authors`,
+///   `url`, `categories`, `guid`. It sees the item as it will be *returned*, so
+///   `--content none` and `--max-content-chars` shrink what is searchable.
+/// - **Fields are matched separately, never concatenated**, so a phrase cannot span a field
+///   boundary — no separator exists for a term to straddle, even one containing a newline.
+///   Within a field the text is matched verbatim, so a phrase can't span a line break in
+///   `content` either. Required terms still AND *across* fields.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Query {
     required: Vec<String>,

@@ -68,14 +68,13 @@ impl Cursor {
 /// Fingerprint the request shape a cursor belongs to: the first 16 hex chars of a SHA-256
 /// over the URL list (in order) followed by `parts`.
 ///
-/// `parts` carries the **raw argument strings as the client sent them** — in order:
-/// `content_format`, `since`, `limit`, `max_content_chars`, `query`, `dedupe`. Raw, not
-/// resolved: `since: "2h"` resolves to a different instant on every call, so fingerprinting
-/// the resolved value would make every continuation mismatch. The resolved cutoff travels
-/// in [`Cursor::s`] instead.
+/// `parts` is, in order: `content_format`, `since`, `limit`, `max_content_chars`, `query`,
+/// `dedupe`. Callers pass them **normalized** (defaulted limit, canonical format and dedupe
+/// spelling) so a client echoing a response's resolved values back isn't told its cursor is
+/// foreign. `since` is the exception and stays **raw**: `"2h"` resolves anew every call, so a
+/// resolved fingerprint would never match. The resolved cutoff travels in [`Cursor::s`].
 ///
-/// `max_response_tokens` is deliberately **excluded** — a caller may legitimately request a
-/// smaller page 2.
+/// `max_response_tokens` is deliberately excluded — page 2 may legitimately be smaller.
 pub fn fingerprint(urls: &[String], parts: &[&str]) -> String {
     let mut hasher = Sha256::new();
     for url in urls {

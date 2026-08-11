@@ -38,24 +38,18 @@ pub struct FetchOutput {
     /// What filtering ran (`since` and/or `query`) and what it removed, combined across
     /// every feed in this batch. `null` when neither was supplied.
     pub applied_filters: Option<AppliedFilters>,
-    /// Groups of items in this batch that resolve to the same underlying entry — most
-    /// often the same article syndicated through two feeds, but also a single feed that
-    /// repeats an entry (see [`DuplicateGroup`]). Empty `[]` when nothing matched. Reporting
-    /// only: nothing is removed unless a caller opts into `dedupe: "drop"`
-    /// ([`crate::core::apply_dedupe`]), so request order and per-feed `item_count` stay intact
-    /// by default. Empty `[]` also when `dedupe: "off"` skipped detection — that is
-    /// indistinguishable from "detection ran and found nothing", by design (ADR-0018).
+    /// Items in this batch that resolve to the same underlying entry — usually one article
+    /// syndicated by two feeds, but also a feed repeating an entry (see [`DuplicateGroup`]).
+    /// Report-only: nothing is removed unless the caller asks for `dedupe: "drop"`. Empty `[]`
+    /// both when nothing matched and when `dedupe: "off"` skipped detection — those are
+    /// indistinguishable by design (ADR-0018).
     ///
-    /// **Per response, not cumulative** (like `applied_filters`). Grouping runs over everything
-    /// the *call* fetched, before an MCP page is trimmed to its token budget — the groups are
-    /// part of the payload being measured. Two consequences when paging, both under `report`:
-    /// a group can name an item the budget then omitted (it ships on a later page), and a group
-    /// whose copies all sit at or after the resume feed is refetched and **reported again** on
-    /// that page. So collect groups across pages by `key`/`key_kind` rather than appending
-    /// them, and expect a group to vanish once paging moves past one of its copies. Under
-    /// `dedupe: "drop"` the groups are deliberately an audit trail of items that are already
-    /// gone, so they name ids no longer present in `feeds[]` at all — and none of this applies,
-    /// because `drop` is never paged: such a response always carries `next_cursor: null`.
+    /// **Per response, not cumulative.** Grouping runs over what the call fetched, before the
+    /// page is trimmed to its token budget. So when paging under `report`, a group may name an
+    /// item this page omitted, and a group whose copies all sit past the resume point is
+    /// reported again on the next page: merge across pages by `key`/`key_kind`, don't append.
+    /// Under `drop` the groups are an audit trail of items already gone, and there is no next
+    /// page — `drop` always returns `next_cursor: null`.
     pub duplicates: Vec<DuplicateGroup>,
 }
 
@@ -92,32 +86,22 @@ pub enum DuplicateKeyKind {
     Url,
     /// The content hash, used only when neither a guid nor a url is available.
     ///
-    /// **Lossy.** [`Item::content_hash`] is a hash of the *body text* alone — it carries no
-    /// title, url, or date. Two genuinely different items that happen to share body text
-    /// (an empty body, a shared boilerplate stub, a "read more on our site" placeholder)
-    /// hash identically and are reported as a false-positive duplicate. This kind is only
-    /// reached when both `guid` and `url` are absent/empty, so it is rare in practice, but
-    /// callers that care about precision should treat a `ContentHash`-kind group as a hint
-    /// to verify, not a certainty — this crate does not add heuristics to filter these out;
-    /// it reports the ambiguity and lets the caller decide.
+    /// **Lossy.** [`Item::content_hash`] covers the *body text* alone — no title, url, or
+    /// date — so items sharing a boilerplate or empty body group falsely. Rare, since it needs
+    /// both `guid` and `url` absent, but treat a `ContentHash` group as a hint to verify. This
+    /// crate reports the ambiguity rather than filtering it heuristically.
     ContentHash,
 }
 
-/// A group of items that share a [`DuplicateKeyKind`] key.
+/// A group of items sharing a [`DuplicateKeyKind`] key.
 ///
-/// Despite the name, grouping is **not** restricted to items in *different* feeds: the key
-/// is computed over every item in the batch, so two items sharing a guid inside the same
-/// feed (a feed that repeats an entry) form a group too — that repetition is worth
-/// reporting on its own. The common case remains the same article syndicated through two
-/// feeds, which is exactly the case `item.id` cannot catch: `id` is namespaced by
-/// `feed_url` (ADR-0003), so the same article delivered by two feeds gets two different
-/// ids and can never be grouped by `id`.
+/// Grouping is **not** restricted to items in *different* feeds — a feed that repeats an entry
+/// forms a group too. But the cross-feed case is the one `item.id` cannot catch: `id` is
+/// namespaced by `feed_url` (ADR-0003), so one article from two feeds has two ids.
 ///
-/// `item_ids` and `feed_urls` are index-parallel: `item_ids[i]` came from `feed_urls[i]`.
-/// [`crate::core::find_duplicates`] builds both from a single vector of `(item_id,
-/// feed_url)` pairs and unzips it at the end, so it never desyncs them. The fields are
-/// public and the type is `Deserialize`, so that is a producer-side guarantee, not one the
-/// type can enforce on a hand-built value.
+/// `item_ids` and `feed_urls` are index-parallel. [`crate::core::find_duplicates`] unzips them
+/// from one vector of pairs, so it never desyncs them — a producer-side guarantee, not one the
+/// type enforces on a hand-built value.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct DuplicateGroup {
     /// The shared key value (a guid, a url, or a content hash, per `key_kind`).
@@ -191,12 +175,11 @@ pub struct TruncationInfo {
     /// resume cache-first: a feed already fetched costs nothing, but a feed the batch deadline
     /// never reached still needs a live fetch.
     ///
-    /// `null` usually means the response is complete — but **not always**, so check
-    /// `items_omitted`/`feeds_omitted` rather than treating `null` as "nothing left". Two
-    /// request shapes cannot be paged at all and so ship bounded with no token:
-    /// `dedupe: "drop"` (a continuation cannot see canonical copies from earlier pages) and
-    /// `cache_policy: "no-cache"` (paging reads the body cache, which `no-cache` does not
-    /// write). Both cases say so in `suggestion`.
+    /// `null` usually means complete — but **not always**, so check
+    /// `items_omitted`/`feeds_omitted` instead of reading `null` as "nothing left". Two request
+    /// shapes cannot be paged and ship bounded without a token, saying so in `suggestion`:
+    /// `dedupe: "drop"` (a continuation can't see canonical copies from earlier pages) and
+    /// `cache_policy: "no-cache"` (paging reads the cache, which `no-cache` won't write).
     pub next_cursor: Option<String>,
     /// Rough token estimate of the (possibly reduced) serialized response, if computed.
     pub estimated_tokens: Option<usize>,
