@@ -27,13 +27,15 @@ use crate::model::Item;
 ///   `authors`, `url`, `categories`, or `guid`. When `content` is `None` (e.g.
 ///   `--content none`), the searchable surface shrinks accordingly, so the same query
 ///   can match fewer items under a different content setting.
-/// - **Fields are joined with `\n`, not a space, before matching**, so a quoted phrase
-///   cannot span a field boundary — a title ending in "breaking" followed by a summary
-///   starting with "news" does not satisfy `"breaking news"`. A legitimate term never
-///   contains a newline, so this join cannot split one. The same mechanism means a
-///   phrase already can't span a line break *inside* `content` either — `"new async"`
-///   will not match a body containing `"the new\nasync runtime"`, matching this type's
-///   own claim that a phrase must match contiguously.
+/// - **Each field is matched on its own; fields are never concatenated**, so a quoted
+///   phrase cannot span a field boundary — a title ending in "breaking" followed by a
+///   summary starting with "news" does not satisfy `"breaking news"`. There is no
+///   separator character for a term to straddle, so this holds for *every* term,
+///   including one that itself contains a newline. Within a field the text is matched
+///   verbatim, so a phrase can't span a line break *inside* `content` either —
+///   `"new async"` will not match a body containing `"the new\nasync runtime"`. A phrase
+///   matches contiguously, within one field, or not at all. Required terms are still
+///   ANDed *across* fields: one term in the title and another in the content is a match.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Query {
     required: Vec<String>,
@@ -118,28 +120,26 @@ impl Query {
     }
 
     /// Match against an item's `title`, `summary`, and `content` (see the type docs for
-    /// why those three fields and not the others). Joins the present fields with `\n`
-    /// and delegates to [`Query::matches_text`], so the lowercase allocation happens once
-    /// per item, not once per term.
+    /// why those three fields and not the others). Each present field is lowercased once
+    /// and searched on its own — no concatenation, so no synthetic separator exists for a
+    /// term to match across. Cost is O(total item text) regardless of how many terms the
+    /// query has; call this once per item, never once per term.
     pub fn matches_item(&self, item: &Item) -> bool {
         if self.is_empty() {
             return true;
         }
-        let mut hay = String::new();
-        for part in [
+        let fields: Vec<String> = [
             item.title.as_deref(),
             item.summary.as_deref(),
             item.content.as_deref(),
         ]
         .into_iter()
         .flatten()
-        {
-            if !hay.is_empty() {
-                hay.push('\n');
-            }
-            hay.push_str(part);
-        }
-        self.matches_text(&hay)
+        .map(str::to_lowercase)
+        .collect();
+        let in_some_field = |term: &str| fields.iter().any(|f| f.contains(term));
+        self.required.iter().all(|t| in_some_field(t))
+            && !self.excluded.iter().any(|t| in_some_field(t))
     }
 }
 
@@ -308,7 +308,24 @@ mod tests {
     }
 
     #[test]
-    fn matches_item_ignores_none_content() {
+    fn a_phrase_containing_a_newline_still_cannot_span_a_field_boundary() {
+        // A quoted phrase can legitimately carry a literal newline (an MCP caller sends
+        // `"foo\nbar"` in JSON). Matching each field separately is what makes the
+        // no-cross-field-match guarantee hold for those terms too, rather than resting
+        // on an assumption that terms never contain the join character.
+        let q = Query::parse("\"foo\nbar\"");
+        assert!(
+            !q.matches_item(&make_item(Some("foo"), Some("bar"), None)),
+            "the newline is in the query, not in either field"
+        );
+        assert!(
+            q.matches_item(&make_item(Some("unrelated"), None, Some("foo\nbar"))),
+            "but it still matches when the newline is genuinely inside one field"
+        );
+    }
+
+    #[test]
+    fn matches_item_searches_only_the_fields_that_are_present() {
         let item = make_item(Some("title only"), None, None);
         assert!(Query::parse("title").matches_item(&item));
         assert!(!Query::parse("missing").matches_item(&item));
