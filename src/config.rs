@@ -34,6 +34,43 @@ pub enum CachePolicy {
     NoCache,
 }
 
+/// How cross-feed duplicates are handled for a fetch (ADR-0018).
+///
+/// Not a field of [`FetchParams`]: duplicate detection runs over the *assembled*
+/// [`crate::model::FetchOutput`], after every feed has been fetched and parsed, so it is a
+/// post-processing step ([`crate::core::apply_dedupe`]) rather than a per-feed parameter.
+/// Both front-ends parse their argument with [`parse_dedupe`] and hand the result to that
+/// one function, so `rss fetch --dedupe` and the MCP `dedupe` argument cannot diverge
+/// (invariant 6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DedupeMode {
+    /// Default. Group duplicates into [`crate::model::FetchOutput::duplicates`] and change
+    /// nothing else: `feeds[]`, request order, and per-feed `item_count` are untouched.
+    #[default]
+    Report,
+    /// Skip detection entirely; `duplicates` stays `[]`. Indistinguishable in the output
+    /// from a `Report` run that found nothing — deliberately, see ADR-0018.
+    Off,
+    /// Report *and* remove: keep the first (canonical) copy of each group and drop the rest,
+    /// which changes per-feed `item_count` and the top-level totals. Opt-in only.
+    Drop,
+}
+
+impl DedupeMode {
+    /// The canonical argument spelling, and the one form callers may rely on.
+    ///
+    /// Load-bearing beyond display: the MCP cursor fingerprint hashes this string, so these
+    /// exact bytes are part of every continuation token (ADR-0017 §4). `Report` must stay
+    /// `"report"` — that is the placeholder value outstanding cursors were minted against.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DedupeMode::Report => "report",
+            DedupeMode::Off => "off",
+            DedupeMode::Drop => "drop",
+        }
+    }
+}
+
 /// Parameters shared by the CLI and the MCP server for a fetch operation.
 #[derive(Debug, Clone)]
 pub struct FetchParams {
@@ -165,6 +202,24 @@ pub fn parse_cache_policy(s: &str) -> Result<CachePolicy, RssError> {
     }
 }
 
+/// Parse a `--dedupe` / `dedupe` argument into a [`DedupeMode`].
+///
+/// Shared by both front-ends for the same reason [`parse_cache_policy`] is: the grammar and
+/// its error message are part of the tool surface, and two copies would drift. Blank input is
+/// the default rather than an error, so a client that fills every advertised optional string
+/// with `""` still gets a working call (the same liberality `parse_cache_policy` grants).
+pub fn parse_dedupe(s: &str) -> Result<DedupeMode, RssError> {
+    let s = s.trim().to_ascii_lowercase();
+    match s.as_str() {
+        "" | "report" => Ok(DedupeMode::Report),
+        "off" => Ok(DedupeMode::Off),
+        "drop" => Ok(DedupeMode::Drop),
+        other => Err(RssError::Usage(format!(
+            "invalid dedupe '{other}' (expected report | off | drop)"
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,6 +267,43 @@ mod tests {
         );
         assert!(parse_cache_policy("max-age:").is_err());
         assert!(parse_cache_policy("max-age:2y").is_err());
+    }
+
+    #[test]
+    fn parse_dedupe_covers_the_documented_grammar() {
+        assert_eq!(parse_dedupe("report").unwrap(), DedupeMode::Report);
+        assert_eq!(parse_dedupe("off").unwrap(), DedupeMode::Off);
+        assert_eq!(parse_dedupe("drop").unwrap(), DedupeMode::Drop);
+        // Absent / blank means the default, exactly as `parse_cache_policy` treats `""`.
+        assert_eq!(parse_dedupe("").unwrap(), DedupeMode::Report);
+        assert_eq!(parse_dedupe("   ").unwrap(), DedupeMode::Report);
+        assert_eq!(
+            parse_dedupe(&String::default()).unwrap(),
+            DedupeMode::default()
+        );
+        // Case- and whitespace-insensitive, since clients vary.
+        assert_eq!(parse_dedupe("  DROP ").unwrap(), DedupeMode::Drop);
+
+        // An unknown mode must name every accepted one, so an agent can self-correct.
+        let err = parse_dedupe("maybe").unwrap_err().to_string();
+        for mode in ["report", "off", "drop"] {
+            assert!(err.contains(mode), "error should list '{mode}': {err}");
+        }
+        assert!(
+            err.contains("maybe"),
+            "error should echo what was rejected: {err}"
+        );
+    }
+
+    #[test]
+    fn dedupe_mode_as_str_round_trips_through_parse_dedupe() {
+        // The MCP cursor fingerprint hashes `as_str()`, so a drift between the two spellings
+        // would mint cursors that no later call can reproduce.
+        for mode in [DedupeMode::Report, DedupeMode::Off, DedupeMode::Drop] {
+            assert_eq!(parse_dedupe(mode.as_str()).unwrap(), mode);
+        }
+        // Pinned literally: outstanding cursors were minted against these exact bytes.
+        assert_eq!(DedupeMode::default().as_str(), "report");
     }
 
     #[test]

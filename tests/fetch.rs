@@ -514,3 +514,123 @@ fn query_filters_items_before_limit_and_reports_applied_filters() {
         "the one non-matching item must be counted"
     );
 }
+
+/// `--dedupe` reports duplicates by default and only removes on request. End-to-end through
+/// the compiled binary, so the CLI's own wiring into `core::apply_dedupe` is pinned — not
+/// just the MCP front-end's.
+#[test]
+fn dedupe_reports_by_default_and_drops_on_request() {
+    // The same two entries served at two URLs: `<guid>` values shared across "both" feeds,
+    // which is how one article syndicated through two feeds looks.
+    let feed = r#"<?xml version="1.0"?>
+<rss version="2.0"><channel>
+  <title>Feed</title>
+  <link>https://example.com/</link>
+  <item><title>One</title><link>https://example.com/1</link>
+        <guid>urn:one</guid></item>
+  <item><title>Two</title><link>https://example.com/2</link>
+        <guid>urn:two</guid></item>
+</channel></rss>"#;
+
+    let mut server = mockito::Server::new();
+    let _a = server
+        .mock("GET", "/a.xml")
+        .with_status(200)
+        .with_header("content-type", RSS_CT)
+        .with_body(feed)
+        .create();
+    let _b = server
+        .mock("GET", "/b.xml")
+        .with_status(200)
+        .with_header("content-type", RSS_CT)
+        .with_body(feed)
+        .create();
+    let a = format!("{}/a.xml", server.url());
+    let b = format!("{}/b.xml", server.url());
+    let cache = TempCache::new("dedupe");
+
+    let fetch = |mode: Option<&str>| {
+        let mut cmd = rss();
+        cmd.arg("--quiet")
+            .arg("--cache-dir")
+            .arg(cache.path())
+            .arg("fetch")
+            .arg(a.as_str())
+            .arg(b.as_str())
+            .arg("--format")
+            .arg("json");
+        if let Some(mode) = mode {
+            cmd.arg("--dedupe").arg(mode);
+        }
+        cmd.output().expect("spawn rss")
+    };
+
+    // Default: report. Nothing is removed.
+    let output = fetch(None);
+    if is_stub_panic(&output) {
+        skip_note("dedupe_reports_by_default_and_drops_on_request", &output);
+        return;
+    }
+    assert!(
+        output.status.success(),
+        "two good feeds should exit 0; stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let v: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("output should be valid JSON");
+    assert_eq!(v["total_items"], 4, "report must not remove items");
+    let groups = v["duplicates"].as_array().expect("duplicates array");
+    assert_eq!(groups.len(), 2, "both shared guids should group: {v}");
+    assert_eq!(groups[0]["key_kind"], "guid");
+    assert_eq!(v["feeds"][1]["item_count"], 2, "per-feed counts untouched");
+
+    // off: no detection at all.
+    let v: serde_json::Value =
+        serde_json::from_slice(&fetch(Some("off")).stdout).expect("valid JSON");
+    assert_eq!(v["duplicates"].as_array().map(Vec::len), Some(0));
+    assert_eq!(v["total_items"], 4);
+
+    // drop: the later copies go, and the counts follow them.
+    let v: serde_json::Value =
+        serde_json::from_slice(&fetch(Some("drop")).stdout).expect("valid JSON");
+    assert_eq!(v["total_items"], 2, "the later copies must be removed");
+    assert_eq!(v["feeds"][0]["item_count"], 2);
+    assert_eq!(v["feeds"][1]["item_count"], 0);
+    assert_eq!(
+        v["duplicates"].as_array().map(Vec::len),
+        Some(2),
+        "the groups stay as the audit trail of what was removed: {v}"
+    );
+}
+
+/// An unknown `--dedupe` value is a usage error (exit 2), not a silent fallback to the
+/// default. `clap`'s `value_parser` enforces it, so the check is that the flag really is
+/// constrained — a plain `String` argument would happily accept "maybe".
+#[test]
+fn dedupe_rejects_an_unknown_mode() {
+    let cache = TempCache::new("dedupe-bad");
+    let output = rss()
+        .arg("--quiet")
+        .arg("--cache-dir")
+        .arg(cache.path())
+        .arg("fetch")
+        .arg("https://example.com/feed.xml")
+        .arg("--dedupe")
+        .arg("maybe")
+        .output()
+        .expect("spawn rss");
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "an invalid flag value must exit 2 (usage); stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for mode in ["report", "off", "drop"] {
+        assert!(
+            stderr.contains(mode),
+            "the usage error should list '{mode}': {stderr}"
+        );
+    }
+}

@@ -86,10 +86,15 @@ rss fetch https://example.com/feed.xml --since 2d --content text
 
 # Keyword filter: both terms must appear, "python" must not
 rss fetch https://example.com/feed.xml --query 'rust async -python'
+
+# Overlapping sources: collapse the same article to one copy
+rss fetch https://a.com/feed https://b.com/feed --dedupe drop
 ```
 
 When `--since` or `--query` runs, `applied_filters` reports what was applied and
-how many items it removed, so an empty result is diagnosable.
+how many items it removed, so an empty result is diagnosable. `duplicates[]`
+reports entries that arrived from more than one feed; by default they are only
+reported, not removed.
 
 Notable flags:
 
@@ -102,6 +107,7 @@ Notable flags:
 | `--max-content-chars <N>` | — | Truncate each item body to at most N characters (flagged `content_truncated`). Fetch many items while skipping giant bodies. |
 | `--since <WHEN>` | — | Only items at/after a duration (`2h`, `7d`) or ISO date (`2026-06-01`). |
 | `--query <QUERY>` | — | Keyword filter over each item's title, summary, and content. Terms are AND-ed, `"quoted phrases"` match as a unit, `-term` excludes. Applied before `--limit`, so `--limit` means "N matching items". |
+| `--dedupe <report\|off\|drop>` | `report` | How to handle one entry arriving from several feeds. `report` groups the copies in `duplicates[]` and removes nothing; `off` skips detection; `drop` also removes the later copies, lowering each feed's `item_count`. Keyed on `guid`, then `url`, then `content_hash` — never on `id`, which is namespaced by feed URL. |
 | `--concurrency <N>` | `8` | Max feeds fetched in parallel. |
 | `--timeout <SECS>` | `30` | Per-request timeout. |
 | `--no-cache` | — | Bypass the cache entirely (no read, no write). |

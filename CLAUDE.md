@@ -46,14 +46,15 @@ A single core powers both the CLI and the MCP server, so the two front-ends cann
 
 | File | Responsibility |
 |------|----------------|
-| `src/model.rs` | **The output contract.** Serialized types + `schemars` derives. The AI-facing API — treat field names as stable ([ADR-0006](./docs/adr/0006-ai-facing-output-contract.md)). |
+| `src/model.rs` | **The output contract.** Serialized types + `schemars` derives. The AI-facing API — treat field names as stable ([ADR-0006](./docs/adr/0006-ai-facing-output-contract.md)). Includes the additive `FetchOutput.applied_filters` and `FetchOutput.duplicates` ([ADR-0018](./docs/adr/0018-duplicate-reporting-and-keyword-filtering.md)). |
 | `src/error.rs` | `RssError`, stable `code()` strings, and the `exit` code constants. |
-| `src/config.rs` | `FetchParams` + `CachePolicy` (the *runtime* params, not serialized); `parse_since`/`parse_duration`/`parse_cache_policy` (shared by the CLI and MCP); `FetchParams::deadline` bounds a batch's wall-clock budget ([ADR-0017](./docs/adr/0017-batch-fetch-and-cursor-pagination.md)). |
-| `src/core.rs` | Orchestration: concurrent fetch (`buffer_unordered`) via `fetch_feeds`/`fetch_feeds_with`, `fetch_one`, `discover_feeds`/`discover_feeds_with`, `show_item`/`show_item_with`, `exit_code_for`; `paginate`/`PageStop` fill a `FetchOutput` to a token budget for MCP cursor pagination ([ADR-0017](./docs/adr/0017-batch-fetch-and-cursor-pagination.md)). **CLI and MCP both call into here.** |
+| `src/config.rs` | `FetchParams` + `CachePolicy` + `DedupeMode` (the *runtime* params, not serialized); `parse_since`/`parse_duration`/`parse_cache_policy`/`parse_dedupe` (shared by the CLI and MCP); `FetchParams::deadline` bounds a batch's wall-clock budget ([ADR-0017](./docs/adr/0017-batch-fetch-and-cursor-pagination.md)). |
+| `src/core.rs` | Orchestration: concurrent fetch (`buffer_unordered`) via `fetch_feeds`/`fetch_feeds_with`, `fetch_one`, `discover_feeds`/`discover_feeds_with`, `show_item`/`show_item_with`, `exit_code_for`; `paginate`/`PageStop` fill a `FetchOutput` to a token budget for MCP cursor pagination ([ADR-0017](./docs/adr/0017-batch-fetch-and-cursor-pagination.md)); `find_duplicates`/`drop_duplicates`/`apply_dedupe` implement the `dedupe` modes ([ADR-0018](./docs/adr/0018-duplicate-reporting-and-keyword-filtering.md)). **CLI and MCP both call into here.** |
 | `src/fetch.rs` | `HttpClient`: reqwest + conditional GET, the `CachePolicy` state machine ([ADR-0005](./docs/adr/0005-conditional-get-always-revalidate-default.md)); routes every send through the per-host gate ([ADR-0016](./docs/adr/0016-per-host-request-gate.md)). |
 | `src/ratelimit.rs` | `HostGate`: shared per-host (authority) concurrency cap + adaptive cooldown for concurrent fetches ([ADR-0016](./docs/adr/0016-per-host-request-gate.md)). Lives inside a *reused* `HttpClient`. |
 | `src/cache.rs` | Atomic file cache (`<hash>.json` + `<hash>.body`) ([ADR-0004](./docs/adr/0004-file-based-atomic-cache.md)). |
-| `src/parse.rs` | `feed-rs` → `model` types; date normalize to UTC; relative→absolute URL resolution; `--since`/`--limit`; newest-first sort. |
+| `src/parse.rs` | `feed-rs` → `model` types; date normalize to UTC; relative→absolute URL resolution; filtering in the order `--since` → `--query` → sort → `--limit`; newest-first sort. |
+| `src/query.rs` | Local keyword matching for `--query` / MCP `query`: AND-ed substring terms, `"quoted phrases"`, `-negation` ([ADR-0018](./docs/adr/0018-duplicate-reporting-and-keyword-filtering.md)). |
 | `src/identity.rs` | **The keystone:** deterministic stable item ids ([ADR-0003](./docs/adr/0003-deterministic-content-hash-item-ids.md)). Pinned by a known-answer test. |
 | `src/content.rs` | HTML → markdown/text/html/none + `content_tokens_est` ([ADR-0009](./docs/adr/0009-html-to-markdown-htmd-html2text.md)). |
 | `src/discover.rs` | `<link rel=alternate>` autodiscovery via `tl`. |
@@ -97,7 +98,8 @@ A single core powers both the CLI and the MCP server, so the two front-ends cann
    with no `structuredContent`. See [ADR-0013](docs/adr/0013-structured-mcp-tool-results.md).
 9. **`feeds[]`/`errors[]` are in request order** (deterministic *within a run* — not
    byte-reproducible, since `fetched_at`/`status`/`from_cache` vary). `total_items`,
-   `total_content_tokens_est`, per-feed counts, `content_hash`, and `warnings` are **additive**
+   `total_content_tokens_est`, per-feed counts, `content_hash`, `applied_filters`,
+   `duplicates`, and `warnings` are **additive**
    contract fields computed in `core` (so CLI and MCP stay in sync); `warnings` is kept rare
    on purpose. `feeds[]` is also a contiguous **prefix** of the request URL list — a batch
    deadline may legitimately shorten it, but must never leave a gap, because the MCP cursor's
@@ -117,6 +119,16 @@ A single core powers both the CLI and the MCP server, so the two front-ends cann
     pagination store. Don't add a server-side result store, and don't fingerprint the
     resolved `since` — a relative window resolves differently on every call, so every
     continuation would mismatch ([ADR-0017](docs/adr/0017-batch-fetch-and-cursor-pagination.md)).
+12. **Cross-feed dedup reports by default; it does not remove.** `duplicates[]` groups items
+    by `guid` → `url` → `content_hash` (never by `id`, which is namespaced by `feed_url` per
+    ADR-0003) and leaves `feeds[]`, request order, and per-feed `item_count` untouched. Only
+    the opt-in `dedupe: "drop"` removes copies — and `drop` is **rejected together with a
+    `cursor`**, because a continuation page cannot see canonical copies from earlier pages and
+    would ship the same article twice. Both front-ends parse the mode with
+    `config::parse_dedupe` and apply it through the one shared `core::apply_dedupe`
+    (invariant 6); grouping runs **before** `core::paginate` (the budget has to measure the
+    `duplicates[]` that ships), so on a paged response `duplicates[]` describes that page's
+    fetch only ([ADR-0018](docs/adr/0018-duplicate-reporting-and-keyword-filtering.md)).
 
 ## Gotchas (these already bit — don't relearn them)
 
@@ -181,6 +193,20 @@ A single core powers both the CLI and the MCP server, so the two front-ends cann
   ([ADR-0017](docs/adr/0017-batch-fetch-and-cursor-pagination.md)). Pinned by
   `paginate_ships_a_page_that_fits_even_when_a_later_feed_is_dropped` and
   `paginate_still_errors_below_the_first_feeds_envelope_and_item`.
+- **`query` is applied before `limit`, on purpose.** So `limit` means "N matching items", not
+  "N items, some of which match". Moving the filter after the limit silently returns fewer
+  results than asked for. The order in `parse::parse_feed` is `since` → `query` → sort →
+  `limit`. Pinned by `parse::tests::query_filters_before_limit`.
+- **`item.id` and the dedup key disagree — never collapse duplicates by id.** `identity.rs`
+  derives `id` from link → guid → title|published; `core::dedup_key` prefers guid → url →
+  content_hash. A feed whose entries all carry the same `<link>` gives every one of its items
+  the *same* `id` while their guids put them in *different* groups. So `drop_duplicates` takes
+  the groups as a set of **keys to collapse** and re-derives each surviving item's key — it
+  does not delete `item_ids`. "Simplifying" it back to id-set membership (or a per-id removal
+  budget) deletes an item no group named and leaves the real duplicate in place; every derived
+  count is refreshed afterwards, so the output stays internally consistent and no count
+  assertion catches it. Pinned by
+  `core::tests::drop_duplicates_removes_by_key_not_by_id_when_ids_collide`.
 
 ## Non-goals (v1)
 

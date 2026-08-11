@@ -41,8 +41,17 @@ pub struct FetchOutput {
     /// Groups of items in this batch that resolve to the same underlying entry — most
     /// often the same article syndicated through two feeds, but also a single feed that
     /// repeats an entry (see [`DuplicateGroup`]). Empty `[]` when nothing matched. Reporting
-    /// only: nothing is removed unless a caller opts into [`crate::core::drop_duplicates`],
-    /// so request order and per-feed `item_count` stay intact by default.
+    /// only: nothing is removed unless a caller opts into `dedupe: "drop"`
+    /// ([`crate::core::apply_dedupe`]), so request order and per-feed `item_count` stay intact
+    /// by default. Empty `[]` also when `dedupe: "off"` skipped detection — that is
+    /// indistinguishable from "detection ran and found nothing", by design (ADR-0018).
+    ///
+    /// **Per response, not cumulative** (like `applied_filters`). Grouping runs over the batch
+    /// *before* an MCP page is trimmed to its token budget, because the groups are part of the
+    /// payload being measured. Under `report` a group can therefore name an item the page
+    /// budget then omitted; that item ships — and is grouped again — on the next page. Under
+    /// `dedupe: "drop"` the groups are deliberately an audit trail of items that are already
+    /// gone, so they name ids no longer present in `feeds[]` at all.
     pub duplicates: Vec<DuplicateGroup>,
 }
 

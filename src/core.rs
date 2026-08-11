@@ -8,7 +8,7 @@ use chrono::Utc;
 use futures::stream::{self, StreamExt};
 
 use crate::cache::Cache;
-use crate::config::FetchParams;
+use crate::config::{DedupeMode, FetchParams};
 use crate::error::RssError;
 use crate::fetch::HttpClient;
 use crate::model::{
@@ -351,6 +351,34 @@ pub fn drop_duplicates(output: &mut FetchOutput, groups: &[DuplicateGroup]) {
         });
     }
     refresh_feed_counts(output);
+}
+
+/// Apply a [`DedupeMode`] to an assembled `output` — the single place the report/off/drop
+/// behavior lives, so `rss fetch --dedupe` and the MCP `dedupe` argument cannot diverge
+/// (invariant 6). Front-ends parse their argument with [`crate::config::parse_dedupe`] and
+/// call this; they do not re-implement the match.
+///
+/// Under [`DedupeMode::Drop`] the groups stay on the output *after* the removal: they are the
+/// audit trail naming the copies that are gone, which is the only record a caller has of what
+/// was collapsed. That is also why the groups are computed once and reused rather than
+/// recomputed after the removal — a second pass over the survivors would find nothing.
+///
+/// Callers that bound a response afterwards must run this **first**: `duplicates[]` is a
+/// top-level field, so a size estimate taken before it is attached under-counts, and `Drop`
+/// changes how many items there are left to budget for.
+pub fn apply_dedupe(output: &mut FetchOutput, mode: DedupeMode) {
+    match mode {
+        DedupeMode::Off => {}
+        DedupeMode::Report => {
+            let groups = find_duplicates(output);
+            output.duplicates = groups;
+        }
+        DedupeMode::Drop => {
+            let groups = find_duplicates(output);
+            drop_duplicates(output, &groups);
+            output.duplicates = groups;
+        }
+    }
 }
 
 /// Fetch and parse a single feed, returning the [`FeedResult`], any non-fatal [`Warning`]s
@@ -2147,6 +2175,91 @@ mod tests {
             "the duplicate must go and the item no group named must stay — not the reverse"
         );
         assert_eq!(out.total_items, 2);
+    }
+
+    // --- Task 16: the shared `dedupe` mode both front-ends apply -----------------------
+
+    /// Two feeds carrying the same entry, plus one item unique to the second feed.
+    fn overlapping_feeds() -> FetchOutput {
+        n_feeds(vec![
+            vec![item_keyed("aaaa", Some("shared"), None)],
+            vec![
+                item_keyed("bbbb", Some("shared"), None),
+                item_keyed("cccc", Some("only-here"), None),
+            ],
+        ])
+    }
+
+    #[test]
+    fn apply_dedupe_report_groups_without_removing_anything() {
+        let mut out = overlapping_feeds();
+        apply_dedupe(&mut out, DedupeMode::Report);
+        assert_eq!(out.duplicates.len(), 1, "the shared guid groups");
+        assert_eq!(out.duplicates[0].key, "shared");
+        assert_eq!(out.total_items, 3, "reporting must not remove items");
+        assert_eq!(out.feeds[0].item_count, 1);
+        assert_eq!(out.feeds[1].item_count, 2, "per-feed counts stay untouched");
+    }
+
+    #[test]
+    fn apply_dedupe_off_skips_detection_entirely() {
+        let mut out = overlapping_feeds();
+        apply_dedupe(&mut out, DedupeMode::Off);
+        assert!(
+            out.duplicates.is_empty(),
+            "off must not even report: {:?}",
+            out.duplicates
+        );
+        assert_eq!(out.total_items, 3);
+    }
+
+    #[test]
+    fn apply_dedupe_drop_removes_later_copies_and_keeps_the_audit_trail() {
+        let mut out = overlapping_feeds();
+        apply_dedupe(&mut out, DedupeMode::Drop);
+        assert_eq!(out.total_items, 2, "the later copy goes");
+        assert_eq!(out.feeds[0].item_count, 1, "the canonical copy stays");
+        assert_eq!(
+            out.feeds[1]
+                .items
+                .iter()
+                .map(|i| i.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["cccc"],
+            "only the duplicate is removed from the later feed"
+        );
+        // The groups stay on the output *after* removal: they are the audit trail naming
+        // which items are gone, so a caller can still see what was collapsed.
+        assert_eq!(out.duplicates.len(), 1);
+        assert_eq!(
+            out.duplicates[0].item_ids,
+            vec!["aaaa".to_string(), "bbbb".to_string()],
+            "the group must still name the removed copy, not only the survivor"
+        );
+    }
+
+    #[test]
+    fn apply_dedupe_drop_keeps_derived_counts_consistent() {
+        let mut out = overlapping_feeds();
+        apply_dedupe(&mut out, DedupeMode::Drop);
+        let expected: usize = out.feeds.iter().map(|f| f.items.len()).sum();
+        assert_eq!(out.total_items, expected);
+        for feed in &out.feeds {
+            assert_eq!(feed.item_count, feed.items.len());
+            let tokens: u64 = feed
+                .items
+                .iter()
+                .map(|i| u64::from(i.content_tokens_est))
+                .sum();
+            assert_eq!(feed.content_tokens_est_total, tokens);
+        }
+        assert_eq!(
+            out.total_content_tokens_est,
+            out.feeds
+                .iter()
+                .map(|f| f.content_tokens_est_total)
+                .sum::<u64>(),
+        );
     }
 
     #[test]

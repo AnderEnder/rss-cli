@@ -65,6 +65,13 @@ an ISO-8601 date) filters items before `limit`. Judge staleness via \
 cached_at/cache_age_seconds -- a feed revalidated every call holds cache_age_seconds \
 near its poll interval, not the body's true age.\n\
 \n\
+FILTERING AND DUPLICATES. `query` keyword-filters items (AND-ed terms, \"quoted \
+phrases\", -term excludes) before `limit`, and applied_filters reports what it removed. \
+`dedupe` handles one entry arriving from several feeds: report (the default) groups the \
+copies in duplicates[] and removes nothing, off skips detection, drop also removes the \
+later copies and so lowers each feed's item_count -- drop is rejected together with \
+`cursor`, because a continuation page cannot see canonical copies from earlier pages.\n\
+\n\
 SIZE LIMITS AND PAGING. Responses are size-bounded. fetch_feed caps items per feed \
 (default 25) and fills up to max_response_tokens; whatever did not fit is reported in \
 truncation (items_omitted, feeds_omitted -- both PER PAGE, not cumulative: do not sum \
@@ -415,6 +422,13 @@ struct FetchFeedArgs {
     /// send a string for this one.
     #[serde(default)]
     query: Option<String>,
+    /// Cross-feed duplicate handling: `report` (the default — group repeated entries in
+    /// `duplicates[]` and change nothing else), `off` (skip detection), or `drop` (also remove
+    /// the later copies, which lowers each feed's `item_count`). `drop` cannot be combined
+    /// with `cursor`. A plain `Option<String>` for the same reason as `query`: clients that
+    /// stringify every argument already send a string for this one.
+    #[serde(default)]
+    dedupe: Option<String>,
     /// Maximum number of items to return (most recent first). Omit to use the default cap
     /// of 25; pass a larger number to fetch more (subject to the response budget).
     #[serde(default, deserialize_with = "de_lenient_opt_usize")]
@@ -499,8 +513,8 @@ impl RssServer {
     /// Fetch and parse RSS/Atom feeds. Returns the full `FetchOutput` (one entry per URL in
     /// `feeds`), so feed-level errors (including a rate-limit or HTTP failure on one feed of
     /// a batch) surface as a `FeedStatus::Error` entry in `feeds[]`/`errors[]` rather than a
-    /// tool failure — args are `{ url | urls[], content_format?, since?, query?, limit?,
-    /// max_content_chars?, max_response_tokens?, cache_policy?, cursor? }`.
+    /// tool failure — args are `{ url | urls[], content_format?, since?, query?, dedupe?,
+    /// limit?, max_content_chars?, max_response_tokens?, cache_policy?, cursor? }`.
     #[tool(
         description = "Fetch and parse RSS/Atom feeds. Pass one `url` OR a `urls` array (max \
         50) -- batch rather than looping, because the server paces per host for you. Returns \
@@ -510,7 +524,11 @@ impl RssServer {
         date and, like `query`, is applied before limit. `query` keyword-filters each item's \
         title/summary/content: space-separated terms AND, \"quoted phrases\" match as a \
         unit, `-term` excludes. Either filter's removals are reported in \
-        structuredContent.applied_filters (null when neither was supplied). \
+        structuredContent.applied_filters (null when neither was supplied). `dedupe` groups \
+        the same entry arriving from several feeds: report (DEFAULT) lists the copies in \
+        structuredContent.duplicates and removes nothing; off skips detection; drop also \
+        removes the later copies, lowering each feed's item_count, and is REJECTED with a \
+        `cursor` (a continuation page cannot see canonical copies from earlier pages). \
         max_content_chars truncates each body (flagged \
         content_truncated). `cache_policy` is revalidate (default; re-checks with cached \
         validators, cheap when unchanged, but a cold cache or validator-less origin is a \
@@ -671,6 +689,32 @@ async fn fetch_feed_with_deadline(
             Err(e) => return tool_error_obj(&e, Some(&primary)),
         }
     }
+    // Parsed here, with the other scalar arguments, so an unknown mode is rejected before a
+    // single network request goes out — and via the shared `parse_dedupe`, so the CLI cannot
+    // grow a second grammar (invariant 6).
+    let dedupe = match crate::config::parse_dedupe(args.dedupe.as_deref().unwrap_or("")) {
+        Ok(mode) => mode,
+        Err(e) => return tool_error_obj(&e, Some(&primary)),
+    };
+    // Deduping is a whole-result operation, but a continuation page fetches only
+    // `urls[start_feed..]`: a duplicate whose canonical copy lived in an earlier feed is
+    // invisible here, so the survivor would become canonical and ship — putting the same
+    // article on two pages. Rejecting is cheaper and more honest than degrading silently.
+    // `report` pages fine, since it removes nothing.
+    //
+    // Ahead of `resume_from_cursor` below so the mode is judged before the token is: a
+    // malformed cursor would otherwise mask this with its own USAGE_ERROR.
+    if dedupe == crate::config::DedupeMode::Drop
+        && args.cursor.as_deref().is_some_and(|c| !c.trim().is_empty())
+    {
+        return tool_error_code(
+            "USAGE_ERROR",
+            "dedupe='drop' cannot be combined with a cursor: a continuation page cannot see \
+             canonical copies from earlier pages, so the same item could ship twice. Use \
+             dedupe='report' (the default) when paging and drop duplicates on your side.",
+            Some(&primary),
+        );
+    }
     // Apply a default item cap so a single huge feed doesn't blow the response budget.
     params.limit = Some(args.limit.unwrap_or(MCP_DEFAULT_LIMIT));
     params.max_content_chars = args.max_content_chars;
@@ -689,11 +733,14 @@ async fn fetch_feed_with_deadline(
     // instant on every call, so a resolved fingerprint would never match on page 2 (the
     // resolved cutoff rides in the cursor's `s` field instead).
     //
-    // `query` is now real and part of the fingerprint below: a cursor minted under one query
-    // must not validate a continuation call under a different one, since the two would walk
-    // different item sequences. The trailing placeholder still stands in for the
-    // not-yet-implemented `dedupe` (Task 16); both placeholders' exact bytes are part of
-    // every fingerprint, so changing either invalidates every outstanding cursor.
+    // `query` and `dedupe` are both real now and both part of the fingerprint below: a cursor
+    // minted under one must not validate a continuation call under the other, since the two
+    // would walk different item sequences (or report different duplicates). `dedupe` is
+    // fingerprinted in its *canonical* spelling for the same normalization reason as the
+    // format and the limit — and because that spelling is `"report"` by default, it is
+    // byte-identical to the placeholder it replaced, so cursors minted before it landed still
+    // validate. `drop` never reaches here with a cursor (rejected above), so this slot only
+    // ever carries `report` or `off`.
     let canonical_format = match params.content_format {
         ContentFormat::Markdown => "markdown",
         ContentFormat::Text => "text",
@@ -711,7 +758,7 @@ async fn fetch_feed_with_deadline(
                 .map(|n| n.to_string())
                 .unwrap_or_default(),
             args.query.as_deref().unwrap_or(""),
-            "report", // dedupe — populated in Task 16
+            dedupe.as_str(),
         ],
     );
 
@@ -794,6 +841,17 @@ async fn fetch_feed_with_deadline(
         // Per-feed counts *and* the top-level totals now describe items that are gone.
         core::refresh_feed_counts(&mut out);
     }
+
+    // Before `core::paginate`, and after the resume-skip: `duplicates[]` is a top-level field
+    // that `paginate`'s skeleton measures, so computing it later would let the page ship over
+    // budget — and under `drop` there would be fewer items to budget for than were counted.
+    //
+    // The consequence, recorded in ADR-0018: on a paged response `duplicates[]` describes the
+    // batch *that page fetched*, so a reported group can name an item the page budget then
+    // trimmed off (it reappears, and is grouped again, on the next page). Recomputing after
+    // `paginate` would not fix that and would break `drop`, whose groups are deliberately an
+    // audit trail of items that are already gone.
+    core::apply_dedupe(&mut out, dedupe);
 
     // A continuation with nothing left to ship is *finished*, not over budget. It happens when
     // the cached window rolled shorter than the cursor's `i`: the drain empties the resumed
@@ -1323,6 +1381,7 @@ pub async fn fetch_page_for_test(
         max_response_tokens: Some(max_response_tokens),
         since: None,
         query: None,
+        dedupe: None,
         cache_policy: None,
         cursor,
     };
@@ -1468,6 +1527,7 @@ mod tests {
             content_format: None,
             since: None,
             query: None,
+            dedupe: None,
             limit: None,
             max_content_chars: None,
             max_response_tokens: None,
@@ -3679,6 +3739,209 @@ mod tests {
             );
             assert_eq!(payload["total_items"], 3, "and return page 1 in full");
         }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // --- Task 16: the `dedupe` argument --------------------------------------------------
+
+    /// Serve the same body at `/a.xml` and `/b.xml`, so every item is syndicated twice.
+    ///
+    /// [`feed_with_items`] emits no `<guid>`, so `feed-rs` synthesizes each entry's id from
+    /// its link + title — deterministic and identical at both URLs, which is what makes the
+    /// two copies group under `DuplicateKeyKind::Guid`.
+    async fn overlapping_feeds(
+        server: &mut mockito::ServerGuard,
+        items: usize,
+        tag: &str,
+    ) -> (HttpClient, Cache, std::path::PathBuf, Vec<String>) {
+        for path in ["/a.xml", "/b.xml"] {
+            server
+                .mock("GET", path)
+                .with_status(200)
+                .with_body(feed_with_items(items))
+                .create_async()
+                .await;
+        }
+        let (cache, dir) = temp_cache(tag);
+        let urls = vec![
+            format!("{}/a.xml", server.url()),
+            format!("{}/b.xml", server.url()),
+        ];
+        (test_http(), cache, dir, urls)
+    }
+
+    #[tokio::test]
+    async fn dedupe_reports_by_default_and_drops_on_request() {
+        let mut server = mockito::Server::new_async().await;
+        let (http, cache, dir, urls) = overlapping_feeds(&mut server, 2, "dedupe").await;
+
+        // Default: report, do not remove.
+        let (_, payload) = decode(&fetch_feed_inner(&http, &cache, batch_args(urls.clone())).await);
+        assert_eq!(payload["total_items"], 4, "reporting must not remove items");
+        assert_eq!(
+            payload["duplicates"].as_array().map(|a| a.len()),
+            Some(2),
+            "both syndicated entries should be grouped: {payload}"
+        );
+        assert_eq!(
+            payload["duplicates"][0]["key_kind"], "guid",
+            "feed-rs synthesizes an id from link+title, so the key is a guid: {payload}"
+        );
+        assert_eq!(
+            payload["feeds"][1]["item_count"], 2,
+            "report must leave per-feed counts untouched (invariant 9)"
+        );
+
+        // off: no detection at all.
+        let mut args = batch_args(urls.clone());
+        args.dedupe = Some("off".to_string());
+        let (_, payload) = decode(&fetch_feed_inner(&http, &cache, args).await);
+        assert_eq!(payload["total_items"], 4);
+        assert_eq!(
+            payload["duplicates"].as_array().map(|a| a.len()),
+            Some(0),
+            "off must skip detection: {payload}"
+        );
+
+        // drop: keep the canonical first copy only. The blank `cursor` is deliberate — clients
+        // that fill every advertised optional string with `""` mean "no cursor" (see
+        // `resume_from_cursor`), so the drop+cursor guard must read it the same way rather than
+        // rejecting a plain page-1 request.
+        let mut args = batch_args(urls);
+        args.dedupe = Some("drop".to_string());
+        args.cursor = Some("  ".to_string());
+        let (_, payload) = decode(&fetch_feed_inner(&http, &cache, args).await);
+        assert_eq!(
+            payload["total_items"], 2,
+            "drop must remove the later copies"
+        );
+        assert_eq!(payload["feeds"][0]["item_count"], 2);
+        assert_eq!(payload["feeds"][1]["item_count"], 0);
+        assert_eq!(
+            payload["duplicates"].as_array().map(|a| a.len()),
+            Some(2),
+            "the groups stay as the audit trail of what was removed: {payload}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn dedupe_rejects_an_unknown_mode() {
+        // The brief's version of this test only round-tripped the string through serde and
+        // asserted nothing about validation. Call the tool instead: an unknown mode must be a
+        // structured USAGE_ERROR that names every mode the caller could have meant.
+        let (cache, dir) = temp_cache("dedupe-bad-mode");
+        let mut args = fetch_args("https://example.com/f.xml".to_string());
+        args.dedupe = Some("maybe".to_string());
+
+        let (is_error, payload) = decode(&fetch_feed_inner(&test_http(), &cache, args).await);
+        assert!(is_error, "an unknown dedupe mode must fail: {payload}");
+        assert_eq!(payload["code"], "USAGE_ERROR");
+        let message = payload["message"].as_str().unwrap_or_default();
+        for mode in ["report", "off", "drop"] {
+            assert!(
+                message.contains(mode),
+                "the message must name '{mode}' so an agent can self-correct: {payload}"
+            );
+        }
+        assert!(
+            message.contains("maybe"),
+            "the message must echo the rejected value: {payload}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn dedupe_drop_is_rejected_with_a_cursor() {
+        // Deduping is a whole-result operation, but a continuation page only fetches
+        // `urls[start_feed..]`: a duplicate whose canonical copy lived in an earlier feed is
+        // invisible there, so the survivor becomes canonical and the same article ships twice.
+        //
+        // The cursor here is a *well-formed* token on purpose. A garbage one would fail
+        // `Cursor::decode` with its own USAGE_ERROR whose message also contains "cursor", so
+        // this test would pass with the guard deleted. The assertions below name `dedupe`,
+        // which only this guard's message does — the fingerprint-mismatch message says "drop
+        // it to start over", so asserting on "drop" alone would not discriminate either.
+        let (cache, dir) = temp_cache("dedupe-cursor");
+        let token = crate::cursor::Cursor {
+            v: crate::cursor::CURSOR_VERSION,
+            fp: "0123456789abcdef".to_string(),
+            f: 0,
+            i: 1,
+            n: 3,
+            s: None,
+        }
+        .encode();
+
+        let mut args = fetch_args("https://example.com/f.xml".to_string());
+        args.dedupe = Some("drop".to_string());
+        args.cursor = Some(token.clone());
+        let (is_error, payload) = decode(&fetch_feed_inner(&test_http(), &cache, args).await);
+        assert!(is_error);
+        assert_eq!(payload["code"], "USAGE_ERROR");
+        let message = payload["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("dedupe") && message.contains("cursor"),
+            "the message must explain the interaction: {payload}"
+        );
+
+        // Control: the identical cursor without `drop` fails for a different reason (this one
+        // does not match the request), proving the assertion above is the guard's doing and not
+        // any cursor rejection.
+        let mut args = fetch_args("https://example.com/f.xml".to_string());
+        args.cursor = Some(token);
+        let (is_error, payload) = decode(&fetch_feed_inner(&test_http(), &cache, args).await);
+        assert!(is_error);
+        assert!(
+            !payload["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("dedupe"),
+            "only the drop+cursor guard may mention dedupe: {payload}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_cursor_is_bound_to_the_dedupe_mode_that_minted_it() {
+        // `dedupe` occupies the last slot of the cursor fingerprint. `report` (the default)
+        // and `off` produce different item *reporting*, so a continuation must not cross
+        // between them — while the default and an explicit `report` are the same request and
+        // must stay interchangeable, exactly as `limit`/`content_format` do.
+        let mut server = mockito::Server::new_async().await;
+        let (http, cache, dir, urls, full) = paging_fixture(&mut server, "page-fp-dedupe").await;
+
+        let mut args = batch_args(urls.clone());
+        args.max_response_tokens = Some(full / 2);
+        let cursor = cursor_of(&fetch_feed_inner(&http, &cache, args).await)
+            .expect("page 1 must hand back a cursor");
+
+        // Spelling out the default is the same request.
+        let mut args = batch_args(urls.clone());
+        args.max_response_tokens = Some(full / 2);
+        args.dedupe = Some("report".to_string());
+        args.cursor = Some(cursor.clone());
+        let (is_error, payload) = decode(&fetch_feed_inner(&http, &cache, args).await);
+        assert!(
+            !is_error,
+            "an explicit `report` is the default spelled out: {payload}"
+        );
+
+        // A different mode is a different request.
+        let mut args = batch_args(urls);
+        args.max_response_tokens = Some(full / 2);
+        args.dedupe = Some("off".to_string());
+        args.cursor = Some(cursor);
+        let (is_error, payload) = decode(&fetch_feed_inner(&http, &cache, args).await);
+        assert!(
+            is_error,
+            "a different dedupe mode must not resume: {payload}"
+        );
+        assert_eq!(payload["code"], "USAGE_ERROR");
 
         std::fs::remove_dir_all(&dir).ok();
     }

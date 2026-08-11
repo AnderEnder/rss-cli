@@ -10,7 +10,10 @@ use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
-use crate::config::{CachePolicy, DEFAULT_USER_AGENT, FetchParams, parse_duration, parse_since};
+use crate::config::{
+    CachePolicy, DEFAULT_USER_AGENT, DedupeMode, FetchParams, parse_dedupe, parse_duration,
+    parse_since,
+};
 use crate::error::RssError;
 use crate::model::ContentFormat;
 use crate::output::OutputFormat;
@@ -145,6 +148,14 @@ pub struct FetchArgs {
     #[arg(long, value_name = "QUERY")]
     pub query: Option<String>,
 
+    /// How to handle the same entry arriving from more than one feed: `report` groups the
+    /// copies in `duplicates[]` and removes nothing; `off` skips detection; `drop` also
+    /// removes the later copies, which lowers each feed's `item_count`. Items are keyed on
+    /// `guid`, then `url`, then `content_hash` — never on `id`, which is namespaced by feed
+    /// URL and so differs between two feeds carrying the same article.
+    #[arg(long, default_value = "report", value_parser = ["report", "off", "drop"], value_name = "MODE")]
+    pub dedupe: String,
+
     /// Max feeds fetched concurrently.
     #[arg(long, default_value_t = 8, value_name = "N")]
     pub concurrency: usize,
@@ -182,6 +193,15 @@ impl FetchArgs {
             // `--refresh` and the default both revalidate.
             Ok(CachePolicy::Revalidate)
         }
+    }
+
+    /// Resolve `--dedupe` into the shared [`DedupeMode`].
+    ///
+    /// `clap`'s `value_parser` already rejects anything else, so this cannot fail in practice
+    /// — it goes through [`parse_dedupe`] anyway so the CLI and the MCP server read the same
+    /// grammar from the same place (invariant 6) and cannot drift apart on, say, casing.
+    pub fn dedupe_mode(&self) -> Result<DedupeMode, RssError> {
+        parse_dedupe(&self.dedupe)
     }
 
     /// Build the [`FetchParams`] this invocation should use.

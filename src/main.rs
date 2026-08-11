@@ -40,7 +40,14 @@ async fn run() -> i32 {
                 Ok(c) => c,
                 Err(e) => return fail(&e),
             };
+            let dedupe = match args.dedupe_mode() {
+                Ok(m) => m,
+                Err(e) => return fail(&e),
+            };
             let mut out = core::fetch_feeds(&urls, &params, &cache).await;
+            // Before the truncation marker, which counts items: under `drop` the marker must
+            // describe what actually ships, not the copies that were just removed.
+            core::apply_dedupe(&mut out, dedupe);
             // Surface per-item content truncation (from --max-content-chars) at the top level.
             out.truncation = core::truncation_marker(&out, None, None);
             println!(
