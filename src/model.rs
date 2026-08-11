@@ -70,7 +70,10 @@ impl FetchOutput {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum DuplicateKeyKind {
-    /// The feed-supplied guid — feed-window-independent and the reliable cross-feed key.
+    /// The feed-supplied guid — the most reliable key *within one batch*, since two feeds
+    /// syndicating the same entry usually carry the same guid. (That is a different property
+    /// from guid *stability across fetches*, which [`crate::identity`] documents as poor and
+    /// which is exactly why `id` is a content hash rather than the guid.)
     Guid,
     /// The resolved item permalink, used when no guid is available.
     Url,
@@ -99,7 +102,9 @@ pub enum DuplicateKeyKind {
 ///
 /// `item_ids` and `feed_urls` are index-parallel: `item_ids[i]` came from `feed_urls[i]`.
 /// [`crate::core::find_duplicates`] builds both from a single vector of `(item_id,
-/// feed_url)` pairs and unzips it at the end, so the two fields cannot desync.
+/// feed_url)` pairs and unzips it at the end, so it never desyncs them. The fields are
+/// public and the type is `Deserialize`, so that is a producer-side guarantee, not one the
+/// type can enforce on a hand-built value.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct DuplicateGroup {
     /// The shared key value (a guid, a url, or a content hash, per `key_kind`).

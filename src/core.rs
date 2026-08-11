@@ -304,64 +304,50 @@ fn dedup_key(item: &Item) -> Option<(String, DuplicateKeyKind)> {
         .map(|h| (h.to_string(), DuplicateKeyKind::ContentHash))
 }
 
-/// Remove every non-canonical copy named in `groups`, keeping each group's first (canonical)
-/// id, and refresh every derived count so `item_count`/`content_tokens_est_total`/
-/// `total_items`/`total_content_tokens_est` stay consistent with what remains.
+/// Collapse each group in `groups` to its first occurrence, and refresh every derived count
+/// so `item_count`/`content_tokens_est_total`/`total_items`/`total_content_tokens_est` stay
+/// consistent with what remains.
 ///
 /// Opt-in only: [`find_duplicates`] never mutates; this is the removal path a caller reaches
 /// for explicitly (e.g. `dedupe: "drop"`, added in a later task).
 ///
-/// A group naming ids not present in `output` (a stale group, e.g. computed against a
-/// different snapshot) is ignored for those ids — no panic, no corruption of the counts for
-/// what IS present. An empty `groups` slice is a no-op.
+/// **`groups` selects which keys to collapse, not which ids to delete.** Each item's key is
+/// re-derived here with [`dedup_key`] and the first occurrence of each targeted key in
+/// `feeds[]`/`items[]` order survives. That is deliberate, because `item.id` is not a usable
+/// removal handle: `identity.rs` derives `id` from link → guid → title|published while
+/// `dedup_key` prefers guid → url → content_hash, so the two disagree. A feed whose entries
+/// all carry the same `<link>` gives every one of its items the same `id` while their guids
+/// place them in different groups — deleting "the ids after the first" would then delete an
+/// item no group named and leave the real duplicate behind. Re-deriving the key cannot make
+/// that mistake, and for anything [`find_duplicates`] produced the survivor is exactly the
+/// `item_ids[0]` it designated canonical.
+///
+/// A stale group (computed against a different snapshot) is harmless: a key with no
+/// occurrence in `output` matches nothing, and a key with exactly one occurrence keeps it.
+/// An empty `groups` slice is a no-op.
 pub fn drop_duplicates(output: &mut FetchOutput, groups: &[DuplicateGroup]) {
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashSet;
 
-    // Removal must be counted per id, not membership-tested: a feed that emits the exact
-    // same entry twice gives both copies the SAME `id` (ADR-0003 keys `id` on feed_url plus
-    // link/guid/title, so a repeated link/guid repeats the id too). A plain "is this id in
-    // the doomed set" check cannot tell that group's canonical occurrence apart from its
-    // doomed duplicate when they carry the identical id string -- it would match, and
-    // delete, both.
-    let mut canonical_ids: HashSet<&str> = HashSet::new();
-    let mut remove_budget: HashMap<&str, usize> = HashMap::new();
-    for g in groups {
-        if let Some(first) = g.item_ids.first() {
-            canonical_ids.insert(first.as_str());
-        }
-        for id in g.item_ids.iter().skip(1) {
-            *remove_budget.entry(id.as_str()).or_insert(0) += 1;
-        }
-    }
-    if remove_budget.is_empty() {
+    let targets: HashSet<(&str, DuplicateKeyKind)> = groups
+        .iter()
+        .map(|g| (g.key.as_str(), g.key_kind))
+        .collect();
+    if targets.is_empty() {
         return;
     }
-    // How many occurrences of each doomed id to keep before removal budget kicks in: 1 if
-    // that id is ever a group's canonical (first) id, 0 if it is only ever a doomed
-    // duplicate. Consumed by the first matching occurrence encountered, in traversal order,
-    // so exactly one survivor is the one `find_duplicates` designated canonical.
-    let mut keep_budget: HashMap<&str, usize> = remove_budget
-        .keys()
-        .map(|id| (*id, usize::from(canonical_ids.contains(id))))
-        .collect();
 
+    // Every removal decision is made in `feeds[]`/`items[]` traversal order; the sets are
+    // only ever looked up, so no hash iteration order can reach the output (invariant 9).
+    let mut seen: HashSet<(String, DuplicateKeyKind)> = HashSet::new();
     for feed in &mut output.feeds {
         feed.items.retain(|item| {
-            let id = item.id.as_str();
-            let Some(remaining) = remove_budget.get_mut(id) else {
-                return true; // not part of any group: untouched
+            let Some((key, kind)) = dedup_key(item) else {
+                return true; // keyless: never grouped, never dropped
             };
-            if let Some(keep) = keep_budget.get_mut(id)
-                && *keep > 0
-            {
-                *keep -= 1;
-                return true; // this occurrence is the surviving canonical copy
+            if !targets.contains(&(key.as_str(), kind)) {
+                return true; // this key was not one of the groups
             }
-            if *remaining == 0 {
-                return true; // removal budget for this id is exhausted
-            }
-            *remaining -= 1;
-            false
+            seen.insert((key, kind)) // first occurrence survives, the rest go
         });
     }
     refresh_feed_counts(output);
@@ -1830,10 +1816,12 @@ mod tests {
         let mut out = output_with(a);
         let mut second = out.feeds[0].clone();
         second.feed_url = "https://example.com/two.xml".to_string();
-        second.item_count = b.len();
         second.items = b;
         out.feeds.push(second);
-        populate_totals(&mut out);
+        // Refresh rather than only fixing `item_count`: the cloned feed would otherwise
+        // inherit feed 0's `content_tokens_est_total`, leaving the fixture internally
+        // inconsistent before the code under test ever runs.
+        refresh_feed_counts(&mut out);
         out
     }
 
@@ -2121,6 +2109,44 @@ mod tests {
         drop_duplicates(&mut out, &groups);
         assert_eq!(out.feeds[0].items.len(), 1, "exactly one copy survives");
         assert_eq!(out.total_items, 1);
+    }
+
+    #[test]
+    fn drop_duplicates_removes_by_key_not_by_id_when_ids_collide() {
+        // `identity.rs` derives `id` from link -> guid -> title|published; `dedup_key`
+        // prefers guid -> url -> content_hash. The two preferences DISAGREE, so "same id"
+        // and "same duplicate group" are independent properties: a feed whose entries all
+        // link to the same page gives every one of its items the same id, while their guids
+        // put them in different groups (or in none).
+        //
+        // Removal must therefore follow the group key, not the id. Budgeting N removals per
+        // id lets the first item carrying that id absorb the budget — deleting an item no
+        // group ever named, and leaving the real duplicate in place. Counts stay internally
+        // consistent either way, so only an identity assertion catches it.
+        let out = n_feeds(vec![
+            vec![item_keyed("bbbb", Some("shared"), None)],
+            vec![
+                item_keyed("xxxx", Some("unrelated"), None),
+                item_keyed("xxxx", Some("shared"), None),
+            ],
+        ]);
+        let groups = find_duplicates(&out);
+        assert_eq!(groups.len(), 1, "only the shared guid groups");
+        assert_eq!(groups[0].key, "shared");
+
+        let mut out = out;
+        drop_duplicates(&mut out, &groups);
+        assert_eq!(out.feeds[0].items.len(), 1, "the canonical copy stays");
+        assert_eq!(
+            out.feeds[1]
+                .items
+                .iter()
+                .map(|i| i.guid.as_deref().unwrap_or(""))
+                .collect::<Vec<_>>(),
+            vec!["unrelated"],
+            "the duplicate must go and the item no group named must stay — not the reverse"
+        );
+        assert_eq!(out.total_items, 2);
     }
 
     #[test]
