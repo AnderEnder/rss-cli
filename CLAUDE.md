@@ -225,5 +225,9 @@ new ADR — they were deliberately excluded.
 
 ## Repo state
 
-- Branch: `feat/rss-cli-v1`. The project is intentionally **local-only** (no remote, no
-  PR) per the owner's choice.
+- Default branch is `main`; `origin` is `git@github.com:AnderEnder/rss-cli.git`. (An earlier
+  version of this section said the project was local-only with no remote and named
+  `feat/rss-cli-v1` as the branch — both stale.)
+- **Feature work merges into local `main`; publishing is a separate, explicit decision.**
+  Don't `git push` or open a PR unless the owner asks for it in that turn. Dependabot PRs
+  arrive on their own; the branches under `origin/dependabot/*` are not ours to manage.
