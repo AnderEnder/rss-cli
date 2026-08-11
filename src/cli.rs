@@ -138,8 +138,10 @@ pub struct FetchArgs {
     pub since: Option<String>,
 
     /// Only include items matching this keyword query. Space-separated terms are AND-ed,
-    /// `"quoted phrases"` match as a unit, and `-term` excludes. Applied before `--limit`,
-    /// so `--limit` means "N matching items".
+    /// `"quoted phrases"` match as a unit, and `-term` excludes. Matching is a
+    /// case-insensitive substring search over each item's title, summary, and content —
+    /// not its author, URL, or categories. Applied before `--limit`, so `--limit` means
+    /// "N matching items".
     #[arg(long, value_name = "QUERY")]
     pub query: Option<String>,
 

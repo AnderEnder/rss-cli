@@ -50,6 +50,10 @@ pub struct FetchParams {
     /// as a unit; a leading `-term` excludes. Applied in [`crate::parse::parse_feed`] after
     /// `since` and before `limit`, so `limit` means "N matching items", not "N items, some
     /// of which match".
+    ///
+    /// It matches the item as it will be *returned*, so `content_format` and
+    /// `max_content_chars` narrow what is searchable: a term that only appears past the
+    /// truncation point, or anywhere in the body under `--content none`, will not match.
     pub query: Option<String>,
     /// Maximum number of feeds fetched concurrently.
     pub concurrency: usize,

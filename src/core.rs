@@ -171,22 +171,26 @@ fn assemble_prefix_in_request_order(
 }
 
 /// Build the [`AppliedFilters`] marker for a batch, or `None` when neither `since` nor a
-/// non-blank `query` was supplied.
+/// query that actually constrains anything was supplied.
 ///
 /// `items_filtered_out` is the combined count `since` and `query` removed across every feed
 /// in the prefix that made it into `output.feeds` — see [`AppliedFilters::items_filtered_out`]'s
-/// docs for why the two are not split out. A blank/whitespace-only `query` (e.g. `" "`) does
-/// not itself gate the marker on — it filters nothing (see [`crate::query::Query::is_empty`])
-/// — but `since` alone still does.
+/// docs for why the two are not split out.
+///
+/// The gate is [`crate::query::Query::is_empty`] on the *parsed* query, deliberately the same
+/// predicate `parse_feed` uses to decide whether to filter at all. Anything looser (a
+/// `trim().is_empty()` test on the raw string, say) disagrees with the filter for inputs that
+/// are non-blank but parse to no terms — `"-"` and `""""` both do — and would emit a marker
+/// claiming a query ran when none did. `since` alone still gates the marker on.
 fn applied_filters_marker(
     params: &FetchParams,
     items_filtered_out: usize,
 ) -> Option<AppliedFilters> {
-    let query_supplied = params
+    let query_constrains = params
         .query
         .as_deref()
-        .is_some_and(|q| !q.trim().is_empty());
-    if params.since.is_none() && !query_supplied {
+        .is_some_and(|q| !crate::query::Query::parse(q).is_empty());
+    if params.since.is_none() && !query_constrains {
         return None;
     }
     Some(AppliedFilters {
@@ -961,6 +965,30 @@ mod tests {
             "neither filter was supplied, so the marker must stay null: {:?}",
             out.applied_filters
         );
+    }
+
+    #[test]
+    fn applied_filters_gate_agrees_with_the_filter_on_queries_that_constrain_nothing() {
+        // The marker must be gated by the same predicate `parse_feed` uses to decide
+        // whether to filter — `Query::is_empty` on the *parsed* query. A raw
+        // `trim().is_empty()` test would pass `"-"` and `"\"\""` through and emit a marker
+        // announcing a query that removed nothing because it parsed to no terms at all.
+        for q in ["   ", "-", "\"\""] {
+            let params = FetchParams {
+                query: Some(q.to_string()),
+                ..Default::default()
+            };
+            let out = assemble_prefix_in_request_order(
+                FetchOutput::new("2026-06-01T00:00:00Z".to_string()),
+                &params,
+                vec![(0, Some(ok_feed("https://e.example/0.xml")))],
+            );
+            assert!(
+                out.applied_filters.is_none(),
+                "{q:?} parses to no terms, so no filter ran and the marker must stay null: {:?}",
+                out.applied_filters
+            );
+        }
     }
 
     #[test]

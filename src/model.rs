@@ -57,9 +57,10 @@ impl FetchOutput {
 }
 
 /// What filtering was applied to a fetch and what it removed. Present (non-`null`) only
-/// when `since` and/or `query` was actually supplied, so an empty (or shorter-than-expected)
-/// result is diagnosable: "the feed had nothing new" and "my filter was too narrow" look
-/// identical without it.
+/// when `since` and/or a `query` that actually constrains something was supplied, so an
+/// empty (or shorter-than-expected) result is diagnosable: "the feed had nothing new" and
+/// "my filter was too narrow" look identical without it. A `query` that parses to no terms
+/// at all (`" "`, `"-"`) filters nothing and does not produce this marker.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AppliedFilters {
     /// The `since` cutoff as an RFC-3339 UTC instant, or `null` if `since` was not supplied.
@@ -68,7 +69,13 @@ pub struct AppliedFilters {
     pub query: Option<String>,
     /// Items removed by `since` and/or `query`, combined across every feed in this batch
     /// (no per-filter breakdown). `0` means the filter(s) that ran removed nothing — not
-    /// proof that neither ran; check `since`/`query` above for that.
+    /// proof that neither ran; check `since`/`query` above for that. Items dropped by
+    /// `limit` are *not* counted here — that cap is reported by `truncation.applied_limit`.
+    ///
+    /// **Per response, not cumulative.** Under MCP cursor pagination each page reports what
+    /// the feeds *that page fetched* filtered out, so the counts are not disjoint across
+    /// pages (a partially-delivered feed is re-fetched and re-counted on the next page) and
+    /// must not be summed.
     pub items_filtered_out: usize,
 }
 

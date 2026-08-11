@@ -83,7 +83,13 @@ rss fetch --input urls.txt
 
 # Only items from the last 2 days, body as plain text
 rss fetch https://example.com/feed.xml --since 2d --content text
+
+# Keyword filter: both terms must appear, "python" must not
+rss fetch https://example.com/feed.xml --query 'rust async -python'
 ```
+
+When `--since` or `--query` runs, `applied_filters` reports what was applied and
+how many items it removed, so an empty result is diagnosable.
 
 Notable flags:
 
@@ -95,6 +101,7 @@ Notable flags:
 | `--limit <N>` | — | Max items per feed (newest first). |
 | `--max-content-chars <N>` | — | Truncate each item body to at most N characters (flagged `content_truncated`). Fetch many items while skipping giant bodies. |
 | `--since <WHEN>` | — | Only items at/after a duration (`2h`, `7d`) or ISO date (`2026-06-01`). |
+| `--query <QUERY>` | — | Keyword filter over each item's title, summary, and content. Terms are AND-ed, `"quoted phrases"` match as a unit, `-term` excludes. Applied before `--limit`, so `--limit` means "N matching items". |
 | `--concurrency <N>` | `8` | Max feeds fetched in parallel. |
 | `--timeout <SECS>` | `30` | Per-request timeout. |
 | `--no-cache` | — | Bypass the cache entirely (no read, no write). |

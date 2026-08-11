@@ -24,9 +24,11 @@ use crate::model::Item;
 ///   matches. Only a query with *no* terms at all — required and excluded both empty —
 ///   is `is_empty()`.
 /// - **[`Query::matches_item`] searches `title`, `summary`, and `content` only** — not
-///   `authors`, `url`, `categories`, or `guid`. When `content` is `None` (e.g.
-///   `--content none`), the searchable surface shrinks accordingly, so the same query
-///   can match fewer items under a different content setting.
+///   `authors`, `url`, `categories`, or `guid`. It sees the item as it will be *returned*,
+///   after content rendering and truncation, so the searchable surface shrinks with the
+///   content settings: under `--content none` the body is gone entirely, and under
+///   `--max-content-chars N` a term appearing only past character N will not match. The
+///   same query can therefore match fewer items under a narrower content setting.
 /// - **Each field is matched on its own; fields are never concatenated**, so a quoted
 ///   phrase cannot span a field boundary — a title ending in "breaking" followed by a
 ///   summary starting with "news" does not satisfy `"breaking news"`. There is no
