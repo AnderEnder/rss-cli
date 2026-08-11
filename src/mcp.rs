@@ -55,7 +55,9 @@ inside the wall-clock deadline returns what it completed plus truncation.feeds_o
 CACHING. cache_policy controls the network call: revalidate (default) re-checks with \
 whatever validators the cache holds (If-None-Match / If-Modified-Since) -- a 304 comes \
 back as 'not_modified' with from_cache true, but a cold cache or an origin that sends \
-no validators still gets a full fetch; no-cache always refetches in full; cache-first \
+no validators still gets a full fetch; no-cache always refetches in full and writes \
+nothing, so it CANNOT BE PAGED (a bounded no-cache page comes back with next_cursor \
+null -- use the default revalidate if the batch may need paging); cache-first \
 serves any cached copy with no network call at all; max-age:<duration> (e.g. \
 max-age:15m) does the same but only when the cache is younger than that duration. A \
 continuation page (see `cursor`) forces cache-first for the whole page, so a feed \
@@ -72,8 +74,9 @@ copies in duplicates[] and removes nothing, off skips detection, drop also remov
 later copies and so lowers each feed's item_count. drop cannot be paged in either \
 direction -- it is rejected together with `cursor`, and an over-budget drop page returns \
 next_cursor null -- because a continuation page cannot see canonical copies from earlier \
-pages. Page under report and collapse the duplicates on your side. Each duplicates[] \
-group is reported by exactly one page, so keep them all when paging.\n\
+pages. Page under report and collapse the duplicates on your side. duplicates[] covers \
+what THAT page fetched, so across pages a group may appear on several of them or on \
+none -- merge by key/key_kind, never append or sum.\n\
 \n\
 SIZE LIMITS AND PAGING. Responses are size-bounded. fetch_feed caps items per feed \
 (default 25) and fills up to max_response_tokens; whatever did not fit is reported in \
@@ -174,6 +177,13 @@ const MORE_ITEMS_NOTE: &str = " More items or feeds remain: pass truncation.next
 const DROP_NOT_PAGEABLE_SUGGESTION: &str = "dedupe='drop' cannot be paged, so this over-budget page has no cursor; re-run with \
      dedupe='report' and page from there (collapsing duplicates yourself), or keep 'drop' and \
      shrink the batch";
+
+/// Suggestion for a bounded page that gets no cursor because `cache_policy='no-cache'` cannot
+/// be paged: paging reads the body cache, and `no-cache` refuses to write it. Length-bounded
+/// for the same reason as [`DROP_NOT_PAGEABLE_SUGGESTION`].
+const NO_CACHE_NOT_PAGEABLE_SUGGESTION: &str = "cache_policy='no-cache' cannot be paged (paging reads the body cache, which no-cache does \
+     not write), so this bounded page has no cursor; re-run with the default revalidate, which \
+     refetches and persists, or shrink the batch";
 
 /// Append `addition` to whatever suggestion the marker already carries, so a page that is both
 /// content-truncated and bounded keeps both hints instead of losing the earlier one.
@@ -553,7 +563,8 @@ impl RssServer {
         max_content_chars truncates each body (flagged \
         content_truncated). `cache_policy` is revalidate (default; re-checks with cached \
         validators, cheap when unchanged, but a cold cache or validator-less origin is a \
-        full fetch) | no-cache | cache-first (serves any cached copy, regardless of age) | \
+        full fetch) | no-cache (writes nothing, so it CANNOT BE PAGED -- a bounded page comes \
+        back with next_cursor null) | cache-first (serves any cached copy, regardless of age) | \
         max-age:<duration> (serves a copy younger than that duration); every result carries \
         from_cache, cached_at, and cache_age_seconds so you can judge staleness (cached_at and \
         cache_age_seconds are null when not served from cache; a cleanly revalidating feed \
@@ -822,15 +833,31 @@ async fn fetch_feed_with_deadline(
         requested.len()
     );
 
-    // `dedupe='drop'` is rejected *with* a cursor, so it must not mint one either — the guard
-    // above only covers redemption. A `drop` page that overflows the budget would otherwise
-    // hand back a token bound to a `drop` fingerprint: redeeming it as `drop` hits that guard,
-    // and redeeming it as anything else fails the fingerprint check, so the token is
-    // unredeemable by construction. It would also point at the wrong place — `i`/`n` index the
-    // *post-removal* item list while a continuation refetches without the removal. A truncated
-    // page with no cursor is honest and recoverable (the suggestion below says how); a token
-    // that can only ever error is not.
-    let may_mint_cursor = positions_line_up && dedupe != crate::config::DedupeMode::Drop;
+    // Two request shapes cannot be paged at all, and for both the honest answer is a truncated
+    // page with no cursor plus advice — never a token that can only ever mislead.
+    //
+    // `dedupe='drop'`: rejected *with* a cursor by the guard above, which covers only
+    // redemption. A first `drop` page reaches the fingerprint stamped `"drop"`, so a token
+    // minted from it is unredeemable by construction — as `drop` it hits that guard, as
+    // anything else it fails the fingerprint check — and its `i`/`n` index the *post-removal*
+    // item list while a continuation refetches without the removal.
+    //
+    // `cache_policy='no-cache'`: pagination is cache-backed (ADR-0017) — a continuation forces
+    // `CacheFirst` and walks the body the cache holds. `NoCache` fetches fresh bytes and
+    // deliberately does not write them, so the next page would read whatever entry an *earlier*
+    // call happened to leave behind (the default policy writes on both 200 and 304, so one
+    // usually exists) and drain the cursor's `i` off a different snapshot: items silently
+    // skipped and repeated. The roll warning cannot catch it either, since a feed pinned at its
+    // window cap has the same item count in both snapshots. Callers who want fresh bytes *and*
+    // paging already have `revalidate`, the default, which refetches and persists.
+    let no_cursor_reason: Option<&'static str> = if dedupe == crate::config::DedupeMode::Drop {
+        Some(DROP_NOT_PAGEABLE_SUGGESTION)
+    } else if params.cache_policy == CachePolicy::NoCache {
+        Some(NO_CACHE_NOT_PAGEABLE_SUGGESTION)
+    } else {
+        None
+    };
+    let may_mint_cursor = positions_line_up && no_cursor_reason.is_none();
 
     // Skip the items already delivered from the resumed feed, warning if the window rolled.
     // `skipped` is what we *actually* dropped (a rolled window can hold fewer items than the
@@ -1018,16 +1045,13 @@ async fn fetch_feed_with_deadline(
             // Combine, never replace: a page can be both content-truncated and paginated, and
             // dropping the get_item hint would lose the only route to the full body.
             m.suggestion = Some(combined_suggestion(m.suggestion.as_deref()));
-        } else if dedupe == crate::config::DedupeMode::Drop {
+        } else if let Some(reason) = no_cursor_reason {
             // No cursor is coming, so say what to do instead — a truncated page whose marker
             // offers neither a continuation nor advice reads as an unexplained short answer.
             // Appended, not assigned, for the same reason the branch above combines: this page
             // may also be content-truncated, and overwriting would drop the get_item hint that
             // is the only route to a full body.
-            m.suggestion = Some(join_suggestion(
-                m.suggestion.as_deref(),
-                DROP_NOT_PAGEABLE_SUGGESTION,
-            ));
+            m.suggestion = Some(join_suggestion(m.suggestion.as_deref(), reason));
         }
     }
 
@@ -1053,6 +1077,17 @@ async fn fetch_feed_with_deadline(
             0,
             0,
         ));
+    }
+
+    // The same page, when the request shape forbids a cursor. The budget branch above attaches
+    // its own advice, but a page bounded only by the *deadline* never enters it — `stop` is
+    // `None` — and would otherwise ship feeds_omitted > 0, no cursor, and no word on why.
+    if stop.is_none()
+        && let Some(reason) = no_cursor_reason
+        && let Some(m) = marker.as_mut()
+        && m.feeds_omitted > 0
+    {
+        m.suggestion = Some(join_suggestion(m.suggestion.as_deref(), reason));
     }
 
     out.truncation = marker;
@@ -2596,18 +2631,76 @@ mod tests {
     }
 
     #[test]
-    fn the_drop_clause_fits_inside_the_reserved_headroom() {
+    fn the_cursorless_clauses_fit_inside_the_reserved_headroom() {
         // `CURSOR_HEADROOM_TOKENS` is measured from `worst_case_marker`, which carries a full
-        // cursor and `PAGINATION_SUGGESTION`. A `drop` page swaps that clause for this one and
-        // carries no cursor, so it stays inside the reserve as long as the clause is no longer
-        // — which is not automatic, and would silently under-reserve if someone expanded it.
+        // cursor and `PAGINATION_SUGGESTION`. A cursorless page swaps that clause for one of
+        // these and carries no cursor, so it stays inside the reserve as long as the clause is
+        // no longer — not automatic, and it would silently under-reserve if someone expanded
+        // one of them.
+        for (name, clause) in [
+            ("drop", DROP_NOT_PAGEABLE_SUGGESTION),
+            ("no-cache", NO_CACHE_NOT_PAGEABLE_SUGGESTION),
+        ] {
+            assert!(
+                clause.len() <= PAGINATION_SUGGESTION.len(),
+                "the cursorless-{name} clause ({} chars) must not exceed the pagination clause \
+                 it replaces ({} chars), or the headroom reserve stops covering it",
+                clause.len(),
+                PAGINATION_SUGGESTION.len()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn no_cache_never_mints_a_cursor_it_could_not_honor() {
+        // Pagination is cache-backed: a continuation forces `CacheFirst` and walks whatever the
+        // body cache holds. `no-cache` fetches fresh bytes and does not write them, so a cursor
+        // minted here would be redeemed against some *earlier* call's cached snapshot — the
+        // cursor's `i` drained off a different item list, silently skipping and repeating. The
+        // default `revalidate` refetches AND persists, so it pages correctly; `no-cache` gets a
+        // bounded page with no cursor and advice instead.
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("GET", "/one.xml")
+            .with_status(200)
+            .with_body(feed_with_items(10))
+            .create_async()
+            .await;
+        let (cache, dir) = temp_cache("no-cache-no-cursor");
+        let http = test_http();
+        let url = format!("{}/one.xml", server.url());
+        let full = full_response_tokens(&http, &cache, fetch_args(url.clone())).await;
+
+        // Control: the identical over-budget page under the default policy does page.
+        let mut args = fetch_args(url.clone());
+        args.max_response_tokens = Some(full / 2);
+        let (_, payload) = decode(&fetch_feed_inner(&http, &cache, args).await);
         assert!(
-            DROP_NOT_PAGEABLE_SUGGESTION.len() <= PAGINATION_SUGGESTION.len(),
-            "the cursorless-drop clause ({} chars) must not exceed the pagination clause it \
-             replaces ({} chars), or the headroom reserve stops covering it",
-            DROP_NOT_PAGEABLE_SUGGESTION.len(),
-            PAGINATION_SUGGESTION.len()
+            payload["truncation"]["next_cursor"].is_string(),
+            "the control must actually be over budget and pageable: {payload}"
         );
+
+        let mut args = fetch_args(url);
+        args.max_response_tokens = Some(full / 2);
+        args.cache_policy = Some("no-cache".to_string());
+        let (is_error, payload) = decode(&fetch_feed_inner(&http, &cache, args).await);
+        assert!(
+            !is_error,
+            "the page is fine; only the cursor is withheld: {payload}"
+        );
+        assert!(
+            payload["truncation"]["next_cursor"].is_null(),
+            "no-cache must not mint a cursor the next page cannot honor: {payload}"
+        );
+        assert!(
+            payload["truncation"]["suggestion"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("no-cache"),
+            "a bounded page with no cursor must name the way forward: {payload}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

@@ -46,16 +46,16 @@ pub struct FetchOutput {
     /// by default. Empty `[]` also when `dedupe: "off"` skipped detection — that is
     /// indistinguishable from "detection ran and found nothing", by design (ADR-0018).
     ///
-    /// **Per response, not cumulative** (like `applied_filters`), and each group is reported
-    /// exactly once. Grouping runs over the batch *before* an MCP page is trimmed to its token
-    /// budget, because the groups are part of the payload being measured. Under `report` a
-    /// group can therefore name an item the page budget then omitted: that item ships on the
-    /// next page, but *without* its group — a continuation only fetches the feeds from its
-    /// resume point onward and skips the items already delivered, so the copy it would be
-    /// grouped with is no longer in view. Keep the groups from every page if you are
-    /// reconciling a paged batch. Under `dedupe: "drop"` the groups are deliberately an audit
-    /// trail of items that are already gone, so they name ids no longer present in `feeds[]` at
-    /// all — and such a response never carries a `next_cursor`, since `drop` cannot be paged.
+    /// **Per response, not cumulative** (like `applied_filters`). Grouping runs over everything
+    /// the *call* fetched, before an MCP page is trimmed to its token budget — the groups are
+    /// part of the payload being measured. Two consequences when paging, both under `report`:
+    /// a group can name an item the budget then omitted (it ships on a later page), and a group
+    /// whose copies all sit at or after the resume feed is refetched and **reported again** on
+    /// that page. So collect groups across pages by `key`/`key_kind` rather than appending
+    /// them, and expect a group to vanish once paging moves past one of its copies. Under
+    /// `dedupe: "drop"` the groups are deliberately an audit trail of items that are already
+    /// gone, so they name ids no longer present in `feeds[]` at all — and none of this applies,
+    /// because `drop` is never paged: such a response always carries `next_cursor: null`.
     pub duplicates: Vec<DuplicateGroup>,
 }
 
@@ -186,9 +186,16 @@ pub struct TruncationInfo {
     /// reached before the batch deadline. `0` when every requested feed is present.
     /// Per-page like `items_omitted`: do not sum it across pages.
     pub feeds_omitted: usize,
-    /// Opaque token to pass back as `cursor` to retrieve the next page. `null` when this
-    /// response is complete. Continuation pages resume cache-first: a feed already fetched
-    /// costs nothing, but a feed the batch deadline never reached still needs a live fetch.
+    /// Opaque token to pass back as `cursor` to retrieve the next page. Continuation pages
+    /// resume cache-first: a feed already fetched costs nothing, but a feed the batch deadline
+    /// never reached still needs a live fetch.
+    ///
+    /// `null` usually means the response is complete — but **not always**, so check
+    /// `items_omitted`/`feeds_omitted` rather than treating `null` as "nothing left". Two
+    /// request shapes cannot be paged at all and so ship bounded with no token:
+    /// `dedupe: "drop"` (a continuation cannot see canonical copies from earlier pages) and
+    /// `cache_policy: "no-cache"` (paging reads the body cache, which `no-cache` does not
+    /// write). Both cases say so in `suggestion`.
     pub next_cursor: Option<String>,
     /// Rough token estimate of the (possibly reduced) serialized response, if computed.
     pub estimated_tokens: Option<usize>,

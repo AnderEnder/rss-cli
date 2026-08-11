@@ -119,12 +119,20 @@ A single core powers both the CLI and the MCP server, so the two front-ends cann
     pagination store. Don't add a server-side result store, and don't fingerprint the
     resolved `since` — a relative window resolves differently on every call, so every
     continuation would mismatch ([ADR-0017](docs/adr/0017-batch-fetch-and-cursor-pagination.md)).
+    Because the cache *is* the store, a request that refuses to write it cannot be paged:
+    `cache_policy: "no-cache"` ships a bounded page with `next_cursor: null` and a suggestion
+    rather than a token the next page would redeem against some earlier call's snapshot.
+    `mcp.rs`'s `no_cursor_reason` is the one place that decision lives.
 12. **Cross-feed dedup reports by default; it does not remove.** `duplicates[]` groups items
     by `guid` → `url` → `content_hash` (never by `id`, which is namespaced by `feed_url` per
     ADR-0003) and leaves `feeds[]`, request order, and per-feed `item_count` untouched. Only
-    the opt-in `dedupe: "drop"` removes copies — and `drop` is **rejected together with a
-    `cursor`**, because a continuation page cannot see canonical copies from earlier pages and
-    would ship the same article twice. Both front-ends parse the mode with
+    the opt-in `dedupe: "drop"` removes copies — and `drop` cannot be paged **in either
+    direction**, because a continuation page cannot see canonical copies from earlier pages and
+    would ship the same article twice: it is rejected when passed *with* a `cursor`, and an
+    over-budget `drop` page also withholds one (`no_cursor_reason` in `mcp.rs`). Withholding is
+    load-bearing, not belt-and-braces — a first `drop` page is legal, so it reaches the
+    fingerprint stamped `"drop"`, and a token minted from it can never be redeemed by anything.
+    Both front-ends parse the mode with
     `config::parse_dedupe` and apply it through the one shared `core::apply_dedupe`
     (invariant 6); grouping runs **before** `core::paginate` (the budget has to measure the
     `duplicates[]` that ships), so on a paged response `duplicates[]` describes that page's

@@ -349,7 +349,7 @@ Exposed tools:
 
 | Tool | Arguments | Returns |
 |------|-----------|---------|
-| `fetch_feed` | `url` OR `urls` (max 50); optional `content_format`, `since`, `limit` (default 25 per feed), `max_content_chars`, `max_response_tokens`, `cache_policy`, `cursor` | a `FetchOutput` covering every requested feed |
+| `fetch_feed` | `url` OR `urls` (max 50); optional `content_format`, `since`, `query`, `dedupe`, `limit` (default 25 per feed), `max_content_chars`, `max_response_tokens`, `cache_policy`, `cursor` | a `FetchOutput` covering every requested feed |
 | `discover_feeds` | `site_url` | discovered feeds |
 | `get_item` | `feed_url`, `id`; optional `max_content_chars` | a single item, resolved cache-first by its `id`, raw `guid`, or permalink URL |
 | `get_schema` | `command` | the JSON Schema for that command's output |
@@ -376,10 +376,24 @@ instead, because each targets a single feed or site. A batch that cannot finish 
 server's wall-clock deadline returns the feeds it completed plus `truncation.feeds_omitted`
 for the rest.
 
+**Filtering and duplicates.** `query` keyword-filters each item's title, summary, and content
+(space-separated terms are AND-ed, `"quoted phrases"` match as a unit, `-term` excludes) before
+`limit`, so `limit` means "N matching items"; `applied_filters` reports what `query` and `since`
+removed. `dedupe` handles the same entry arriving from several feeds: `report` (the default)
+groups the copies in `duplicates[]` and removes nothing, `off` skips detection, `drop` also
+removes the later copies and so lowers each feed's `item_count`. `drop` cannot be paged in
+either direction — it is rejected together with a `cursor`, and a bounded `drop` page comes
+back with `next_cursor: null` — because a continuation page cannot see canonical copies from
+earlier pages. Page under `report` and collapse the duplicates on your side.
+See [ADR-0018](docs/adr/0018-duplicate-reporting-and-keyword-filtering.md).
+
 **Caching.** `cache_policy` controls the network call: `revalidate` (default) re-checks with
 whatever validators the cache holds (`If-None-Match`/`If-Modified-Since`) — a `304` comes back
 as `status: "not_modified"` with `from_cache: true`, but a cold cache or an origin that sends
-no validators still gets a full fetch; `no-cache` always refetches in full; `cache-first`
+no validators still gets a full fetch; `no-cache` always refetches in full and writes nothing,
+which means it **cannot be paged** (paging reads the body cache, so a bounded `no-cache` page
+comes back with `next_cursor: null` — use `revalidate` if the batch may need paging);
+`cache-first`
 serves any cached copy with no network call at all; `max-age:<duration>` does the same but
 only when the cache is younger than that duration. A continuation page (`cursor`) forces
 `cache-first` for the whole page, so a feed already cached comes back

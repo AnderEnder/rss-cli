@@ -95,6 +95,18 @@ roll detection) are stable across pages because item ids are deterministic by co
 ([ADR-0003](0003-deterministic-content-hash-item-ids.md)) and a cache hit returns
 byte-identical bytes.
 
+The corollary is that **a request which refuses to write the cache cannot be paged.**
+`cache_policy: "no-cache"` fetches fresh bytes and deliberately persists nothing, so a cursor
+minted from such a page would be redeemed — under the forced `CacheFirst` — against whatever
+entry some *earlier* call happened to leave behind. The default policy writes on both `200`
+and `304`, so an entry usually does exist, and the continuation would then drain the cursor's
+`i` off a different snapshot: items silently skipped and repeated, with the roll warning blind
+to it (a feed pinned at its window cap has the same item count in both snapshots). So a bounded
+`no-cache` page ships `next_cursor: null` plus a `suggestion` naming the fix. Nothing is lost:
+callers wanting fresh bytes *and* paging already have `revalidate`, the default, which
+refetches and persists. `mcp.rs`'s `no_cursor_reason` holds this and the `dedupe: "drop"` case
+together, since both are "this request shape has no valid continuation".
+
 A corollary the outline underestimated: `paginate` measures the page **before** the
 `next_cursor` / `TruncationInfo` marker exists to attach to it, so a page filled exactly to
 `max_response_tokens` would ship over budget once the marker (and the result's summary text)

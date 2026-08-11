@@ -181,16 +181,19 @@ outstanding cursor.
   on the guess that some of it will be dropped.
 - **`duplicates[]` on a paged response describes that page's fetch only.** Grouping runs before
   `core::paginate`, because `duplicates[]` is part of the payload the budget measures — computing
-  it after would let a page ship over budget. The consequence is that a `report` group can name
-  an item the page budget then trimmed off. That item ships on the next page **without** its
-  group: a continuation fetches only `urls[start_feed..]` and drains the items already
-  delivered, so the copy it would be grouped with is not in view. Each group is therefore
-  reported by exactly one page — the page that fetched both copies — and a caller reconciling a
-  paged batch must keep the groups from every page, not just the last. Recomputing after
-  `paginate` would not fix this (it would lose the group altogether) and would break `drop`,
-  whose groups are deliberately an audit trail of items that are already gone. Like
-  `truncation.items_omitted` and `applied_filters.items_filtered_out`, these are per-page
-  snapshots and must not be summed across pages.
+  it after would let a page ship over budget. A group is therefore reported by **every page
+  whose fetch window holds at least two of its copies** — which is neither "once" nor "every
+  page". A continuation fetches `urls[start_feed..]` and drains the items already delivered, so
+  a group loses copies as paging advances: one whose copies straddle the resume point is
+  reported on the earlier page only (and names an item that page did not ship), while one whose
+  copies all sit at or after the resume feed is refetched and reported again. A caller
+  reconciling a paged batch should merge groups by `key`/`key_kind` across pages — appending
+  double-counts, and keeping only the last page loses the straddling ones. Recomputing after
+  `paginate` would not fix this (it would lose the straddling groups altogether) and would
+  break `drop`, whose groups are deliberately an audit trail of items that are already gone.
+  Like `truncation.items_omitted` and `applied_filters.items_filtered_out`, these are per-page
+  snapshots and must not be summed across pages. None of it applies to `drop`, which is never
+  paged.
 - **`duplicates[]` is charged against the MCP response budget**, since it is part of the
   measured payload. A group costs on the order of a short item, so a heavily overlapping batch
   (many URLs, each item syndicated several times) pages sooner than the same batch would with
