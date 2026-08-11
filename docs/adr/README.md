@@ -39,3 +39,6 @@ where a real fork existed). Statuses: `Proposed`, `Accepted`, `Superseded by NNN
 | [0013](0013-structured-mcp-tool-results.md) | Structured MCP tool results (`structuredContent` + `outputSchema` + annotations) | Accepted |
 | [0014](0014-get-item-cache-first-multi-key-lookup.md) | get_item cache-first read + multi-key (id/guid/url) lookup | Accepted |
 | [0015](0015-bounded-retry-on-transient-429-403.md) | Bounded single retry on transient 429/403 (honor Retry-After) | Accepted |
+| [0016](0016-per-host-request-gate.md) | Per-host request gate: shared client + adaptive cooldown for concurrent fetches | Accepted |
+| [0017](0017-batch-fetch-and-cursor-pagination.md) | Batch fetch and stateless cursor pagination for `fetch_feed` | Accepted |
+| [0018](0018-duplicate-reporting-and-keyword-filtering.md) | Cross-feed duplicate reporting and local keyword filtering | Accepted |

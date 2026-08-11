@@ -9,8 +9,9 @@
 //! - Resolve relative item links to absolute URLs against `feed_url` (use the `url` crate).
 //! - For each item, compute the stable id via [`crate::identity::item_id`] and the content
 //!   via [`crate::content`], honoring `params.content_format`.
-//! - Apply `params.since` (drop older items) and `params.limit` (keep newest N) — sort by
-//!   `published` (fallback `updated`) descending before limiting.
+//! - Apply `params.since` (drop older items), `params.query` (keyword filter, see
+//!   [`crate::query`]), and `params.limit` (keep newest N) — in that order, so `limit` means
+//!   "N matching items" — then sort by `published` (fallback `updated`) descending.
 //! - Populate `title`, `site_url` (the feed's `<link>`/`homepage`), and `updated`.
 
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -33,6 +34,9 @@ pub struct ParsedFeed {
     pub items: Vec<Item>,
     /// Non-fatal data-quality warnings about this feed (already carry `feed_url`).
     pub warnings: Vec<Warning>,
+    /// How many items `params.since` and `params.query` removed, combined. `0` when neither
+    /// filter changed the result (including when neither was supplied).
+    pub items_filtered_out: usize,
 }
 
 /// Parse raw feed bytes into a [`ParsedFeed`]. `feed_url` is the (post-redirect) URL the
@@ -63,12 +67,28 @@ pub fn parse_feed(
     }
 
     // `--since`: drop items whose known instant is older than the cutoff. Items with no
-    // date are retained (we cannot prove they are older).
+    // date are retained (we cannot prove they are older). Counted into
+    // `items_filtered_out` alongside the keyword filter below — see that field's docs for
+    // why the two are not split out.
+    let before_since = rows.len();
     if let Some(since) = params.since {
         rows.retain(|(_, key, _)| match key {
             Some(dt) => *dt >= since,
             None => true,
         });
+    }
+    let mut items_filtered_out = before_since - rows.len();
+
+    // `--query`: keyword filter over title/summary/content (see `crate::query`). Applied
+    // before the sort and before `--limit`, so `limit` means "N matching items" rather than
+    // "N items, some of which match".
+    if let Some(raw) = params.query.as_deref() {
+        let q = crate::query::Query::parse(raw);
+        if !q.is_empty() {
+            let before = rows.len();
+            rows.retain(|(item, _, _)| q.matches_item(item));
+            items_filtered_out += before - rows.len();
+        }
     }
 
     // Sort newest-first. Reversing the key sorts dated items descending and places undated
@@ -92,6 +112,7 @@ pub fn parse_feed(
         updated,
         items,
         warnings,
+        items_filtered_out,
     })
 }
 
@@ -448,6 +469,102 @@ mod tests {
         let parsed = parse_feed(RSS.as_bytes(), FEED_URL, &p).unwrap();
         assert_eq!(parsed.items.len(), 1);
         assert_eq!(parsed.items[0].title.as_deref(), Some("Second Post"));
+    }
+
+    #[test]
+    fn since_drops_are_counted_in_items_filtered_out() {
+        // `since` alone (no `query`) must still populate `items_filtered_out` — the field
+        // describes everything `since`/`query` removed, not just the query's share. A caller
+        // relying on this count to explain an empty/short result must not see `0` while
+        // `since` quietly dropped items.
+        let mut p = params();
+        p.since = Some(Utc.with_ymd_and_hms(2026, 1, 6, 0, 0, 0).unwrap());
+        let parsed = parse_feed(RSS.as_bytes(), FEED_URL, &p).unwrap();
+        assert_eq!(parsed.items.len(), 1);
+        assert_eq!(
+            parsed.items_filtered_out, 1,
+            "the item since dropped must be counted, not silently left at 0"
+        );
+    }
+
+    #[test]
+    fn query_filters_before_limit() {
+        // Three items; only two mention "rust". With limit=2 the result must be the two
+        // matching items, not "the newest two items, some of which match".
+        let body = r#"<rss version="2.0"><channel><title>f</title>
+            <item><title>Rust news</title><link>https://e.com/1</link>
+                  <pubDate>Wed, 03 Jun 2026 00:00:00 GMT</pubDate></item>
+            <item><title>Python news</title><link>https://e.com/2</link>
+                  <pubDate>Tue, 02 Jun 2026 00:00:00 GMT</pubDate></item>
+            <item><title>More rust</title><link>https://e.com/3</link>
+                  <pubDate>Mon, 01 Jun 2026 00:00:00 GMT</pubDate></item>
+            </channel></rss>"#;
+
+        let p = FetchParams {
+            query: Some("rust".to_string()),
+            limit: Some(2),
+            ..Default::default()
+        };
+        let parsed = parse_feed(body.as_bytes(), "https://e.com/f", &p).expect("parse");
+
+        assert_eq!(parsed.items.len(), 2);
+        assert!(
+            parsed.items.iter().all(|i| i
+                .title
+                .as_deref()
+                .unwrap()
+                .to_lowercase()
+                .contains("rust"))
+        );
+        assert_eq!(
+            parsed.items_filtered_out, 1,
+            "the non-matching item must be counted"
+        );
+    }
+
+    #[test]
+    fn query_negation_excludes_items() {
+        let body = r#"<rss version="2.0"><channel><title>f</title>
+            <item><title>Rust and python</title><link>https://e.com/1</link></item>
+            <item><title>Rust alone</title><link>https://e.com/2</link></item>
+            </channel></rss>"#;
+        let p = FetchParams {
+            query: Some("rust -python".to_string()),
+            ..Default::default()
+        };
+        let parsed = parse_feed(body.as_bytes(), "https://e.com/f", &p).expect("parse");
+        assert_eq!(parsed.items.len(), 1);
+        assert_eq!(parsed.items[0].title.as_deref(), Some("Rust alone"));
+    }
+
+    #[test]
+    fn since_and_query_filtering_combine_in_items_filtered_out() {
+        // Both filters active: the count must reflect the total removed by *either*, since
+        // `items_filtered_out` has no per-filter breakdown.
+        let body = r#"<rss version="2.0"><channel><title>f</title>
+            <item><title>Rust news</title><link>https://e.com/1</link>
+                  <pubDate>Wed, 03 Jun 2026 00:00:00 GMT</pubDate></item>
+            <item><title>Python news</title><link>https://e.com/2</link>
+                  <pubDate>Tue, 02 Jun 2026 00:00:00 GMT</pubDate></item>
+            <item><title>Old rust</title><link>https://e.com/3</link>
+                  <pubDate>Mon, 01 Jan 2020 00:00:00 GMT</pubDate></item>
+            </channel></rss>"#;
+        let p = FetchParams {
+            since: Some(Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap()),
+            query: Some("rust".to_string()),
+            ..Default::default()
+        };
+        let parsed = parse_feed(body.as_bytes(), "https://e.com/f", &p).expect("parse");
+        // `since` drops "Old rust" (2020), `query` drops "Python news" — one survivor.
+        assert_eq!(parsed.items.len(), 1);
+        assert_eq!(parsed.items[0].title.as_deref(), Some("Rust news"));
+        assert_eq!(parsed.items_filtered_out, 2, "since's one plus query's one");
+    }
+
+    #[test]
+    fn no_query_leaves_items_filtered_out_at_zero() {
+        let parsed = parse_feed(RSS.as_bytes(), FEED_URL, &params()).unwrap();
+        assert_eq!(parsed.items_filtered_out, 0);
     }
 
     #[test]

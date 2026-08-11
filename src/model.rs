@@ -35,6 +35,22 @@ pub struct FetchOutput {
     /// Primarily populated by the MCP server, which bounds responses (see the `rss mcp`
     /// docs); the CLI populates it only when `--max-content-chars` truncates content.
     pub truncation: Option<TruncationInfo>,
+    /// What filtering ran (`since` and/or `query`) and what it removed, combined across
+    /// every feed in this batch. `null` when neither was supplied.
+    pub applied_filters: Option<AppliedFilters>,
+    /// Items in this batch that resolve to the same underlying entry — usually one article
+    /// syndicated by two feeds, but also a feed repeating an entry (see [`DuplicateGroup`]).
+    /// Report-only: nothing is removed unless the caller asks for `dedupe: "drop"`. Empty `[]`
+    /// both when nothing matched and when `dedupe: "off"` skipped detection — those are
+    /// indistinguishable by design (ADR-0018).
+    ///
+    /// **Per response, not cumulative.** Grouping runs over what the call fetched, before the
+    /// page is trimmed to its token budget. So when paging under `report`, a group may name an
+    /// item this page omitted, and a group whose copies all sit past the resume point is
+    /// reported again on the next page: merge across pages by `key`/`key_kind`, don't append.
+    /// Under `drop` the groups are an audit trail of items already gone, and there is no next
+    /// page — `drop` always returns `next_cursor: null`.
+    pub duplicates: Vec<DuplicateGroup>,
 }
 
 impl FetchOutput {
@@ -48,8 +64,80 @@ impl FetchOutput {
             errors: Vec::new(),
             warnings: Vec::new(),
             truncation: None,
+            applied_filters: None,
+            duplicates: Vec::new(),
         }
     }
+}
+
+/// Which field matched when grouping duplicate items (see [`DuplicateGroup`]).
+///
+/// Checked in this order — `Guid`, then `Url`, then `ContentHash` — because each is
+/// progressively less reliable as a cross-feed identity signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DuplicateKeyKind {
+    /// The feed-supplied guid — the most reliable key *within one batch*, since two feeds
+    /// syndicating the same entry usually carry the same guid. (That is a different property
+    /// from guid *stability across fetches*, which [`crate::identity`] documents as poor and
+    /// which is exactly why `id` is a content hash rather than the guid.)
+    Guid,
+    /// The resolved item permalink, used when no guid is available.
+    Url,
+    /// The content hash, used only when neither a guid nor a url is available.
+    ///
+    /// **Lossy.** [`Item::content_hash`] covers the *body text* alone — no title, url, or
+    /// date — so items sharing a boilerplate or empty body group falsely. Rare, since it needs
+    /// both `guid` and `url` absent, but treat a `ContentHash` group as a hint to verify. This
+    /// crate reports the ambiguity rather than filtering it heuristically.
+    ContentHash,
+}
+
+/// A group of items sharing a [`DuplicateKeyKind`] key.
+///
+/// Grouping is **not** restricted to items in *different* feeds — a feed that repeats an entry
+/// forms a group too. But the cross-feed case is the one `item.id` cannot catch: `id` is
+/// namespaced by `feed_url` (ADR-0003), so one article from two feeds has two ids.
+///
+/// `item_ids` and `feed_urls` are index-parallel. [`crate::core::find_duplicates`] unzips them
+/// from one vector of pairs, so it never desyncs them — a producer-side guarantee, not one the
+/// type enforces on a hand-built value.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct DuplicateGroup {
+    /// The shared key value (a guid, a url, or a content hash, per `key_kind`).
+    pub key: String,
+    pub key_kind: DuplicateKeyKind,
+    /// Ids of the items sharing the key, in request order. The first is canonical — the
+    /// copy [`crate::core::drop_duplicates`] keeps.
+    ///
+    /// Index-parallel with `feed_urls`: `item_ids[i]` and `feed_urls[i]` describe the same
+    /// occurrence.
+    pub item_ids: Vec<String>,
+    /// The feed each id in `item_ids` came from, index-parallel with it.
+    pub feed_urls: Vec<String>,
+}
+
+/// What filtering was applied to a fetch and what it removed. Present (non-`null`) only
+/// when `since` and/or a `query` that actually constrains something was supplied, so an
+/// empty (or shorter-than-expected) result is diagnosable: "the feed had nothing new" and
+/// "my filter was too narrow" look identical without it. A `query` that parses to no terms
+/// at all (`" "`, `"-"`) filters nothing and does not produce this marker.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AppliedFilters {
+    /// The `since` cutoff as an RFC-3339 UTC instant, or `null` if `since` was not supplied.
+    pub since: Option<String>,
+    /// The keyword query as supplied, or `null` if `query` was not supplied.
+    pub query: Option<String>,
+    /// Items removed by `since` and/or `query`, combined across every feed in this batch
+    /// (no per-filter breakdown). `0` means the filter(s) that ran removed nothing — not
+    /// proof that neither ran; check `since`/`query` above for that. Items dropped by
+    /// `limit` are *not* counted here — that cap is reported by `truncation.applied_limit`.
+    ///
+    /// **Per response, not cumulative.** Under MCP cursor pagination each page reports what
+    /// the feeds *that page fetched* filtered out, so the counts are not disjoint across
+    /// pages (a partially-delivered feed is re-fetched and re-counted on the next page) and
+    /// must not be summed.
+    pub items_filtered_out: usize,
 }
 
 /// A non-fatal data-quality note about a feed (the feed still parsed and produced items).
@@ -72,9 +160,27 @@ pub struct TruncationInfo {
     pub applied_limit: Option<usize>,
     /// Number of items whose `content` was truncated (e.g. by `max_content_chars`).
     pub items_content_truncated: usize,
-    /// Number of items dropped entirely to fit a response budget. `0` unless the server
-    /// shed items (a Tier-2 behavior; always `0` in the cap-and-error path).
+    /// Number of items dropped entirely to fit a response budget. Non-zero when the server
+    /// filled the page to the budget and shed the rest; `0` when nothing was shed — including
+    /// on a page the batch deadline bounded, where whole feeds went unattempted (see
+    /// `feeds_omitted`) but no item was dropped from one that was fetched. Describes only THIS
+    /// page, not a running total — a client that sums it across every page it fetches gets the
+    /// wrong answer.
     pub items_omitted: usize,
+    /// Number of whole feeds not included in this page — shed to fit the budget or not
+    /// reached before the batch deadline. `0` when every requested feed is present.
+    /// Per-page like `items_omitted`: do not sum it across pages.
+    pub feeds_omitted: usize,
+    /// Opaque token to pass back as `cursor` to retrieve the next page. Continuation pages
+    /// resume cache-first: a feed already fetched costs nothing, but a feed the batch deadline
+    /// never reached still needs a live fetch.
+    ///
+    /// `null` usually means complete — but **not always**, so check
+    /// `items_omitted`/`feeds_omitted` instead of reading `null` as "nothing left". Two request
+    /// shapes cannot be paged and ship bounded without a token, saying so in `suggestion`:
+    /// `dedupe: "drop"` (a continuation can't see canonical copies from earlier pages) and
+    /// `cache_policy: "no-cache"` (paging reads the cache, which `no-cache` won't write).
+    pub next_cursor: Option<String>,
     /// Rough token estimate of the (possibly reduced) serialized response, if computed.
     pub estimated_tokens: Option<usize>,
     /// Human/agent-facing hint on how to adjust the request (e.g. which knob to pass).
@@ -110,6 +216,18 @@ pub struct FeedResult {
     pub content_tokens_est_total: u64,
     pub items: Vec<Item>,
     pub error: Option<ErrorObj>,
+    /// RFC-3339 time this cache entry was last written — the original fetch, or the most
+    /// recent successful revalidation preceding this one, whichever is newer. `null` when
+    /// fetched fresh this call. A feed that revalidates cleanly on every call (repeated
+    /// `304`s) will show this drifting forward with the polling interval, not staying
+    /// pinned to when the body was first fetched from origin — it reflects "last confirmed
+    /// with origin," not "age of these bytes." Pair with `cache_age_seconds` to judge
+    /// staleness — `from_cache: true` alone cannot distinguish 5 minutes from 5 days.
+    pub cached_at: Option<String>,
+    /// Age in seconds since `cached_at` was written. `null` when not served from cache.
+    /// Same caveat as `cached_at`: for a feed revalidated every N minutes, this hovers
+    /// around N minutes indefinitely rather than growing toward the body's true age.
+    pub cache_age_seconds: Option<u64>,
 }
 
 impl FeedResult {
@@ -126,6 +244,8 @@ impl FeedResult {
             content_tokens_est_total: 0,
             items: Vec::new(),
             error: Some(error),
+            cached_at: None,
+            cache_age_seconds: None,
         }
     }
 }

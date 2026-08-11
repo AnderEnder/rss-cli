@@ -12,9 +12,11 @@
 //! - [`parse`]   — `feed-rs` → [`model`] conversion, date/URL normalization.
 //! - [`identity`]— deterministic, cache-independent stable item IDs (the keystone).
 //! - [`content`] — HTML → markdown/text extraction + token estimation.
+//! - [`query`]   — local keyword matching for `--query` / MCP `query` (ADR-0018).
 //! - [`discover`]— feed autodiscovery from a website URL.
 //! - [`output`]  — json/ndjson/text rendering + JSON Schema emission.
 //! - [`core`]    — orchestration that the CLI and the MCP server both call.
+//! - [`cursor`]  — opaque stateless continuation cursors for MCP pagination (ADR-0017).
 //! - [`mcp`]     — Model Context Protocol server (stdio transport).
 
 pub mod cache;
@@ -22,6 +24,7 @@ pub mod cli;
 pub mod config;
 pub mod content;
 pub mod core;
+pub mod cursor;
 pub mod discover;
 pub mod error;
 pub mod fetch;
@@ -30,6 +33,7 @@ pub mod mcp;
 pub mod model;
 pub mod output;
 pub mod parse;
+pub mod query;
 pub mod ratelimit;
 
 pub use error::{RssError, exit};

@@ -437,3 +437,208 @@ fn max_content_chars_truncates_and_marks() {
         "exactly one item's content was truncated"
     );
 }
+
+/// `--query` keyword-filters items before `--limit`, and `applied_filters` reports what it
+/// removed. End-to-end through the compiled binary, so the CLI wiring (not just `parse_feed`
+/// directly) is pinned.
+#[test]
+fn query_filters_items_before_limit_and_reports_applied_filters() {
+    let feed = r#"<?xml version="1.0"?>
+<rss version="2.0"><channel>
+  <title>Feed</title>
+  <link>https://example.com/</link>
+  <item><title>Rust news</title><link>https://example.com/1</link>
+        <pubDate>Wed, 03 Jun 2026 00:00:00 GMT</pubDate></item>
+  <item><title>Python news</title><link>https://example.com/2</link>
+        <pubDate>Tue, 02 Jun 2026 00:00:00 GMT</pubDate></item>
+  <item><title>More rust</title><link>https://example.com/3</link>
+        <pubDate>Mon, 01 Jun 2026 00:00:00 GMT</pubDate></item>
+</channel></rss>"#;
+
+    let (server, _m) = mock_server("/query.xml", RSS_CT, feed);
+    let feed_url = format!("{}/query.xml", server.url());
+    let cache = TempCache::new("query");
+
+    let output = rss()
+        .arg("--quiet")
+        .arg("--cache-dir")
+        .arg(cache.path())
+        .arg("fetch")
+        .arg(feed_url.as_str())
+        .arg("--query")
+        .arg("rust")
+        .arg("--limit")
+        .arg("2")
+        .arg("--format")
+        .arg("json")
+        .output()
+        .expect("spawn rss");
+
+    if is_stub_panic(&output) {
+        skip_note(
+            "query_filters_items_before_limit_and_reports_applied_filters",
+            &output,
+        );
+        return;
+    }
+    assert!(
+        output.status.success(),
+        "a good feed with a query should exit 0; stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let v: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("output should be valid JSON");
+    let items = v["feeds"][0]["items"].as_array().expect("items array");
+    assert_eq!(
+        items.len(),
+        2,
+        "both rust items must ship — limit=2 must mean 2 MATCHING items, not the 2 newest \
+         regardless of match: {items:?}"
+    );
+    for item in items {
+        let title = item["title"].as_str().unwrap_or_default();
+        assert!(
+            title.to_lowercase().contains("rust"),
+            "every shipped item must match the query, got {title:?}"
+        );
+    }
+
+    let applied = &v["applied_filters"];
+    assert!(applied.is_object(), "applied_filters should be present");
+    assert_eq!(applied["query"].as_str(), Some("rust"));
+    assert_eq!(applied["since"], serde_json::Value::Null);
+    assert_eq!(
+        applied["items_filtered_out"].as_u64(),
+        Some(1),
+        "the one non-matching item must be counted"
+    );
+}
+
+/// `--dedupe` reports duplicates by default and only removes on request. End-to-end through
+/// the compiled binary, so the CLI's own wiring into `core::apply_dedupe` is pinned — not
+/// just the MCP front-end's.
+#[test]
+fn dedupe_reports_by_default_and_drops_on_request() {
+    // The same two entries served at two URLs: `<guid>` values shared across "both" feeds,
+    // which is how one article syndicated through two feeds looks.
+    let feed = r#"<?xml version="1.0"?>
+<rss version="2.0"><channel>
+  <title>Feed</title>
+  <link>https://example.com/</link>
+  <item><title>One</title><link>https://example.com/1</link>
+        <guid>urn:one</guid></item>
+  <item><title>Two</title><link>https://example.com/2</link>
+        <guid>urn:two</guid></item>
+</channel></rss>"#;
+
+    let mut server = mockito::Server::new();
+    let _a = server
+        .mock("GET", "/a.xml")
+        .with_status(200)
+        .with_header("content-type", RSS_CT)
+        .with_body(feed)
+        .create();
+    let _b = server
+        .mock("GET", "/b.xml")
+        .with_status(200)
+        .with_header("content-type", RSS_CT)
+        .with_body(feed)
+        .create();
+    let a = format!("{}/a.xml", server.url());
+    let b = format!("{}/b.xml", server.url());
+    let cache = TempCache::new("dedupe");
+
+    let fetch = |mode: Option<&str>| {
+        let mut cmd = rss();
+        cmd.arg("--quiet")
+            .arg("--cache-dir")
+            .arg(cache.path())
+            .arg("fetch")
+            .arg(a.as_str())
+            .arg(b.as_str())
+            .arg("--format")
+            .arg("json");
+        if let Some(mode) = mode {
+            cmd.arg("--dedupe").arg(mode);
+        }
+        cmd.output().expect("spawn rss")
+    };
+
+    // Default: report. Nothing is removed.
+    let output = fetch(None);
+    if is_stub_panic(&output) {
+        skip_note("dedupe_reports_by_default_and_drops_on_request", &output);
+        return;
+    }
+    assert!(
+        output.status.success(),
+        "two good feeds should exit 0; stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let v: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("output should be valid JSON");
+    assert_eq!(v["total_items"], 4, "report must not remove items");
+    let groups = v["duplicates"].as_array().expect("duplicates array");
+    assert_eq!(groups.len(), 2, "both shared guids should group: {v}");
+    assert_eq!(groups[0]["key_kind"], "guid");
+    assert_eq!(v["feeds"][1]["item_count"], 2, "per-feed counts untouched");
+
+    // off: no detection at all.
+    let v: serde_json::Value =
+        serde_json::from_slice(&fetch(Some("off")).stdout).expect("valid JSON");
+    assert_eq!(v["duplicates"].as_array().map(Vec::len), Some(0));
+    assert_eq!(v["total_items"], 4);
+
+    // drop: the later copies go, and the counts follow them.
+    let dropped = fetch(Some("drop"));
+    // Exit codes key on feed errors, never on item counts (invariant 5). `drop` can empty a
+    // feed's items entirely — feeds[1] below has zero — and that must still be exit 0, not the
+    // partial-failure 3.
+    assert!(
+        dropped.status.success(),
+        "emptying a feed by deduping is not a failure; stderr:\n{}",
+        String::from_utf8_lossy(&dropped.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&dropped.stdout).expect("valid JSON");
+    assert_eq!(v["total_items"], 2, "the later copies must be removed");
+    assert_eq!(v["feeds"][0]["item_count"], 2);
+    assert_eq!(v["feeds"][1]["item_count"], 0);
+    assert_eq!(
+        v["duplicates"].as_array().map(Vec::len),
+        Some(2),
+        "the groups stay as the audit trail of what was removed: {v}"
+    );
+}
+
+/// An unknown `--dedupe` value is a usage error (exit 2), not a silent fallback to the
+/// default. `clap`'s `value_parser` enforces it, so the check is that the flag really is
+/// constrained — a plain `String` argument would happily accept "maybe".
+#[test]
+fn dedupe_rejects_an_unknown_mode() {
+    let cache = TempCache::new("dedupe-bad");
+    let output = rss()
+        .arg("--quiet")
+        .arg("--cache-dir")
+        .arg(cache.path())
+        .arg("fetch")
+        .arg("https://example.com/feed.xml")
+        .arg("--dedupe")
+        .arg("maybe")
+        .output()
+        .expect("spawn rss");
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "an invalid flag value must exit 2 (usage); stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for mode in ["report", "off", "drop"] {
+        assert!(
+            stderr.contains(mode),
+            "the usage error should list '{mode}': {stderr}"
+        );
+    }
+}

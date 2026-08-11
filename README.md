@@ -83,7 +83,21 @@ rss fetch --input urls.txt
 
 # Only items from the last 2 days, body as plain text
 rss fetch https://example.com/feed.xml --since 2d --content text
+
+# Keyword filter: both terms must appear, "python" must not
+rss fetch https://example.com/feed.xml --query 'rust async -python'
+
+# Overlapping sources: collapse the same article to one copy
+rss fetch https://a.com/feed https://b.com/feed --dedupe drop
 ```
+
+In `--format json`, two top-level fields explain what the fetch did to the
+items: `applied_filters` reports what `--since`/`--query` applied and how many
+items it removed (so an empty result is diagnosable), and `duplicates[]` groups
+entries that arrived from more than one feed. Both are whole-document fields, so
+they appear in `json` output only — `ndjson` streams items, and `text` is a
+human summary. `--dedupe drop` removes items rather than reporting them, so its
+effect is visible in every format.
 
 Notable flags:
 
@@ -95,6 +109,8 @@ Notable flags:
 | `--limit <N>` | — | Max items per feed (newest first). |
 | `--max-content-chars <N>` | — | Truncate each item body to at most N characters (flagged `content_truncated`). Fetch many items while skipping giant bodies. |
 | `--since <WHEN>` | — | Only items at/after a duration (`2h`, `7d`) or ISO date (`2026-06-01`). |
+| `--query <QUERY>` | — | Keyword filter over each item's title, summary, and content. Terms are AND-ed, `"quoted phrases"` match as a unit, `-term` excludes. Applied before `--limit`, so `--limit` means "N matching items". |
+| `--dedupe <report\|off\|drop>` | `report` | How to handle one entry arriving from several feeds. `report` groups the copies in `duplicates[]` and removes nothing; `off` skips detection; `drop` also removes the later copies, lowering each feed's `item_count`. Keyed on `guid`, then `url`, then `content_hash` — never on `id`, which is namespaced by feed URL. |
 | `--concurrency <N>` | `8` | Max feeds fetched in parallel. |
 | `--timeout <SECS>` | `30` | Per-request timeout. |
 | `--no-cache` | — | Bypass the cache entirely (no read, no write). |
@@ -333,7 +349,7 @@ Exposed tools:
 
 | Tool | Arguments | Returns |
 |------|-----------|---------|
-| `fetch_feed` | `url`; optional `content_format`, `limit` (default 25), `max_content_chars`, `max_response_tokens` | a `FetchOutput` for the feed |
+| `fetch_feed` | `url` OR `urls` (max 50); optional `content_format`, `since`, `query`, `dedupe`, `limit` (default 25 per feed), `max_content_chars`, `max_response_tokens`, `cache_policy`, `cursor` | a `FetchOutput` covering every requested feed |
 | `discover_feeds` | `site_url` | discovered feeds |
 | `get_item` | `feed_url`, `id`; optional `max_content_chars` | a single item, resolved cache-first by its `id`, raw `guid`, or permalink URL |
 | `get_schema` | `command` | the JSON Schema for that command's output |
@@ -345,13 +361,57 @@ double the response). Every tool advertises annotations (`readOnlyHint`, `idempo
 and `openWorldHint` for the network-touching tools). See
 [ADR-0013](docs/adr/0013-structured-mcp-tool-results.md).
 
-**Responses are size-bounded.** AI clients reject oversized tool results, so `fetch_feed`
-caps items (default 25) and checks an estimated-token budget (`max_response_tokens`). If a
-result would overflow, the tool returns a structured **`RESPONSE_TOO_LARGE`** error whose
-`details` include `suggested_limit` and `suggested_max_content_chars` — so the agent can
-retry and self-recover instead of failing. Use `max_content_chars` to fetch many items
-while truncating long bodies (each truncated item is flagged `content_truncated`), and
-`get_item` to pull the full body of a specific item. All tool errors are structured JSON
+**Batching and per-host pacing.** Pass several feeds in one `fetch_feed` call via `urls`
+(max 50) instead of looping with your own delays: the server serializes requests to the same
+host and applies an adaptive cooldown that honors the origin's `Retry-After`. The common case
+is the origin itself sending a `429`/`403`: that feed gets a structured
+**`FEED_FETCH_FAILED`** entry in its own `feeds[].error` (`details.http_status`,
+`details.retry_after` — the origin's raw header, `null` when it sent none, so back off
+yourself rather than assume none is needed). Only when the server's own pacing ceiling is hit
+(rare at default settings) does a feed instead get **`RATE_LIMITED`**
+(`details.retry_after_seconds`/`retry_after_ms`, always populated). Either way the
+`fetch_feed` call itself still succeeds, so check each feed's `status`, not just whether the
+call errored. `get_item` and `discover_feeds` surface the same codes as an actual tool error
+instead, because each targets a single feed or site. A batch that cannot finish inside the
+server's wall-clock deadline returns the feeds it completed plus `truncation.feeds_omitted`
+for the rest.
+
+**Filtering and duplicates.** `query` keyword-filters each item's title, summary, and content
+(space-separated terms are AND-ed, `"quoted phrases"` match as a unit, `-term` excludes) before
+`limit`, so `limit` means "N matching items"; `applied_filters` reports what `query` and `since`
+removed. `dedupe` handles the same entry arriving from several feeds: `report` (the default)
+groups the copies in `duplicates[]` and removes nothing, `off` skips detection, `drop` also
+removes the later copies and so lowers each feed's `item_count`. `drop` cannot be paged in
+either direction — it is rejected together with a `cursor`, and a bounded `drop` page comes
+back with `next_cursor: null` — because a continuation page cannot see canonical copies from
+earlier pages. Page under `report` and collapse the duplicates on your side.
+See [ADR-0018](docs/adr/0018-duplicate-reporting-and-keyword-filtering.md).
+
+**Caching.** `cache_policy` controls the network call: `revalidate` (default) re-checks with
+whatever validators the cache holds (`If-None-Match`/`If-Modified-Since`) — a `304` comes back
+as `status: "not_modified"` with `from_cache: true`, but a cold cache or an origin that sends
+no validators still gets a full fetch; `no-cache` always refetches in full and writes nothing,
+which means it **cannot be paged** (paging reads the body cache, so a bounded `no-cache` page
+comes back with `next_cursor: null` — use `revalidate` if the batch may need paging);
+`cache-first`
+serves any cached copy with no network call at all; `max-age:<duration>` does the same but
+only when the cache is younger than that duration. A continuation page (`cursor`) forces
+`cache-first` for the whole page, so a feed already cached comes back
+`not_modified`/`from_cache: true` whether or not it actually changed. Each
+`FeedResult` carries `cached_at` and `cache_age_seconds` (both `null` when not served from
+cache) so a caller can judge staleness (a feed that revalidates cleanly on every call holds
+`cache_age_seconds` near its polling interval, not the body's true age).
+
+**Responses are size-bounded, and paged rather than rejected.** AI clients reject oversized
+tool results, so `fetch_feed` caps items per feed (default 25) and checks an estimated-token
+budget (`max_response_tokens`). An over-budget batch is not failed outright: the tool returns
+the items that fit plus `truncation.next_cursor` — pass that back as `cursor` with the same
+arguments for the next page. `truncation.items_omitted`/`feeds_omitted` describe only that
+one page, not a running total; do not sum them across pages. The structured
+**`RESPONSE_TOO_LARGE`** error (`details.suggested_limit`, `details.suggested_max_content_chars`)
+is now reserved for the case where not even one item fits. Use `max_content_chars` to fetch
+many items while truncating long bodies (each truncated item is flagged `content_truncated`),
+and `get_item` to pull the full body of a specific item. All tool errors are structured JSON
 matching the `ErrorObj` contract (a stable `code` plus `details`). See
 [ADR-0011](docs/adr/0011-bounded-mcp-responses.md).
 

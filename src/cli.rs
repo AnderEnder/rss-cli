@@ -8,10 +8,12 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
-use crate::config::{CachePolicy, DEFAULT_USER_AGENT, FetchParams};
+use crate::config::{
+    CachePolicy, DEFAULT_USER_AGENT, DedupeMode, FetchParams, parse_dedupe, parse_duration,
+    parse_since,
+};
 use crate::error::RssError;
 use crate::model::ContentFormat;
 use crate::output::OutputFormat;
@@ -138,6 +140,22 @@ pub struct FetchArgs {
     #[arg(long, value_name = "WHEN")]
     pub since: Option<String>,
 
+    /// Only include items matching this keyword query. Space-separated terms are AND-ed,
+    /// `"quoted phrases"` match as a unit, and `-term` excludes. Matching is a
+    /// case-insensitive substring search over each item's title, summary, and content —
+    /// not its author, URL, or categories. Applied before `--limit`, so `--limit` means
+    /// "N matching items".
+    #[arg(long, value_name = "QUERY")]
+    pub query: Option<String>,
+
+    /// How to handle the same entry arriving from more than one feed: `report` groups the
+    /// copies in `duplicates[]` and removes nothing; `off` skips detection; `drop` also
+    /// removes the later copies, which lowers each feed's `item_count`. Items are keyed on
+    /// `guid`, then `url`, then `content_hash` — never on `id`, which is namespaced by feed
+    /// URL and so differs between two feeds carrying the same article.
+    #[arg(long, default_value = "report", value_parser = ["report", "off", "drop"], value_name = "MODE")]
+    pub dedupe: String,
+
     /// Max feeds fetched concurrently.
     #[arg(long, default_value_t = 8, value_name = "N")]
     pub concurrency: usize,
@@ -177,6 +195,18 @@ impl FetchArgs {
         }
     }
 
+    /// Resolve `--dedupe` into the shared [`DedupeMode`].
+    ///
+    /// `clap`'s `value_parser` already rejects anything else, so this cannot fail in practice
+    /// — it goes through [`parse_dedupe`] anyway so both front-ends read the same grammar from
+    /// the same place (invariant 6), and a mode added there is reachable from the CLI by
+    /// extending the `value_parser` list alone. The two surfaces are not identical: clap
+    /// rejects `--dedupe DROP` before [`parse_dedupe`] would lowercase it, while the MCP
+    /// argument accepts `"DROP"`. That asymmetry is clap's strictness, not a second grammar.
+    pub fn dedupe_mode(&self) -> Result<DedupeMode, RssError> {
+        parse_dedupe(&self.dedupe)
+    }
+
     /// Build the [`FetchParams`] this invocation should use.
     pub fn to_params(&self) -> Result<FetchParams, RssError> {
         Ok(FetchParams {
@@ -184,6 +214,7 @@ impl FetchArgs {
             limit: self.limit,
             max_content_chars: self.max_content_chars,
             since: self.since.as_deref().map(parse_since).transpose()?,
+            query: self.query.clone(),
             concurrency: self.concurrency.max(1),
             timeout: Duration::from_secs(self.timeout),
             user_agent: self
@@ -191,6 +222,10 @@ impl FetchArgs {
                 .clone()
                 .unwrap_or_else(|| DEFAULT_USER_AGENT.to_string()),
             cache_policy: self.cache_policy()?,
+            // No wall-clock bound on the CLI: an interactive caller can Ctrl-C, and a partial
+            // batch is not more useful than a slow complete one at a terminal. The deadline
+            // exists for the MCP server, whose client enforces a tool timeout of its own.
+            deadline: None,
         })
     }
 
@@ -322,49 +357,4 @@ pub enum CacheAction {
     },
     /// Remove all cache entries.
     Clear,
-}
-
-/// Parse a `--since` value: a relative duration (`2h`, `7d`) or an ISO-8601 instant.
-pub fn parse_since(s: &str) -> Result<DateTime<Utc>, RssError> {
-    let s = s.trim();
-    // Try a relative duration first.
-    if let Ok(d) = parse_duration(s) {
-        let d = chrono::Duration::from_std(d)
-            .map_err(|e| RssError::Usage(format!("duration too large: {e}")))?;
-        return Ok(Utc::now() - d);
-    }
-    // Full RFC-3339 datetime.
-    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
-        return Ok(dt.with_timezone(&Utc));
-    }
-    // Bare date (assume midnight UTC).
-    if let Ok(date) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
-        && let Some(dt) = date.and_hms_opt(0, 0, 0)
-    {
-        return Ok(DateTime::from_naive_utc_and_offset(dt, Utc));
-    }
-    Err(RssError::Usage(format!(
-        "invalid --since value '{s}' (use e.g. '2h', '7d', or '2026-06-01')"
-    )))
-}
-
-/// Parse a simple duration like `30s`, `15m`, `2h`, `7d`, `1w`.
-pub fn parse_duration(s: &str) -> Result<Duration, RssError> {
-    let s = s.trim();
-    let (num, unit) = s.split_at(
-        s.find(|c: char| !c.is_ascii_digit())
-            .ok_or_else(|| RssError::Usage(format!("invalid duration '{s}'")))?,
-    );
-    let n: u64 = num
-        .parse()
-        .map_err(|_| RssError::Usage(format!("invalid duration '{s}'")))?;
-    let secs = match unit {
-        "s" => n,
-        "m" => n * 60,
-        "h" => n * 3600,
-        "d" => n * 86400,
-        "w" => n * 604800,
-        other => return Err(RssError::Usage(format!("unknown duration unit '{other}'"))),
-    };
-    Ok(Duration::from_secs(secs))
 }
