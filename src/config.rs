@@ -48,7 +48,7 @@ pub enum DedupeMode {
     /// nothing else: `feeds[]`, request order, and per-feed `item_count` are untouched.
     #[default]
     Report,
-    /// Skip detection entirely; `duplicates` stays `[]`. Indistinguishable in the output
+    /// Skip detection entirely; `duplicates` is left `[]`. Indistinguishable in the output
     /// from a `Report` run that found nothing — deliberately, see ADR-0018.
     Off,
     /// Report *and* remove: keep the first (canonical) copy of each group and drop the rest,

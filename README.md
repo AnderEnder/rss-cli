@@ -91,10 +91,13 @@ rss fetch https://example.com/feed.xml --query 'rust async -python'
 rss fetch https://a.com/feed https://b.com/feed --dedupe drop
 ```
 
-When `--since` or `--query` runs, `applied_filters` reports what was applied and
-how many items it removed, so an empty result is diagnosable. `duplicates[]`
-reports entries that arrived from more than one feed; by default they are only
-reported, not removed.
+In `--format json`, two top-level fields explain what the fetch did to the
+items: `applied_filters` reports what `--since`/`--query` applied and how many
+items it removed (so an empty result is diagnosable), and `duplicates[]` groups
+entries that arrived from more than one feed. Both are whole-document fields, so
+they appear in `json` output only — `ndjson` streams items, and `text` is a
+human summary. `--dedupe drop` removes items rather than reporting them, so its
+effect is visible in every format.
 
 Notable flags:
 

@@ -368,7 +368,11 @@ pub fn drop_duplicates(output: &mut FetchOutput, groups: &[DuplicateGroup]) {
 /// changes how many items there are left to budget for.
 pub fn apply_dedupe(output: &mut FetchOutput, mode: DedupeMode) {
     match mode {
-        DedupeMode::Off => {}
+        // Clear rather than no-op: the postcondition is that `duplicates` reflects *this*
+        // mode. A bare no-op would leave a previous call's groups in place on an output that
+        // was asked not to report any — no current caller does that, but nothing about the
+        // signature stops one.
+        DedupeMode::Off => output.duplicates.clear(),
         DedupeMode::Report => {
             let groups = find_duplicates(output);
             output.duplicates = groups;
@@ -2211,6 +2215,18 @@ mod tests {
             out.duplicates
         );
         assert_eq!(out.total_items, 3);
+
+        // And `duplicates` reflects the mode it was last given, not whatever was there
+        // before: `off` after a `report` must not leave the earlier groups behind.
+        apply_dedupe(&mut out, DedupeMode::Report);
+        assert_eq!(out.duplicates.len(), 1);
+        apply_dedupe(&mut out, DedupeMode::Off);
+        assert!(
+            out.duplicates.is_empty(),
+            "off must clear a previous report's groups: {:?}",
+            out.duplicates
+        );
+        assert_eq!(out.total_items, 3, "and still remove nothing");
     }
 
     #[test]
