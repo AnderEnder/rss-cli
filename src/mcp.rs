@@ -69,8 +69,11 @@ FILTERING AND DUPLICATES. `query` keyword-filters items (AND-ed terms, \"quoted 
 phrases\", -term excludes) before `limit`, and applied_filters reports what it removed. \
 `dedupe` handles one entry arriving from several feeds: report (the default) groups the \
 copies in duplicates[] and removes nothing, off skips detection, drop also removes the \
-later copies and so lowers each feed's item_count -- drop is rejected together with \
-`cursor`, because a continuation page cannot see canonical copies from earlier pages.\n\
+later copies and so lowers each feed's item_count. drop cannot be paged in either \
+direction -- it is rejected together with `cursor`, and an over-budget drop page returns \
+next_cursor null -- because a continuation page cannot see canonical copies from earlier \
+pages. Page under report and collapse the duplicates on your side. Each duplicates[] \
+group is reported by exactly one page, so keep them all when paging.\n\
 \n\
 SIZE LIMITS AND PAGING. Responses are size-bounded. fetch_feed caps items per feed \
 (default 25) and fills up to max_response_tokens; whatever did not fit is reported in \
@@ -162,13 +165,29 @@ const CONTENT_TRUNCATED_NOTE: &str = " Content truncated (see structuredContent.
 const MORE_ITEMS_NOTE: &str = " More items or feeds remain: pass truncation.next_cursor back \
      as `cursor` for the next page.";
 
+/// Suggestion for an over-budget page that gets no cursor because `dedupe='drop'` cannot be
+/// paged (ADR-0018). Kept shorter than [`PAGINATION_SUGGESTION`] on purpose: it is emitted in
+/// place of that clause, on a marker that also carries no cursor, so
+/// [`CURSOR_HEADROOM_TOKENS`]'s reserve — sized from [`worst_case_marker`], which has both a
+/// full cursor and the longer clause — still covers it. Pinned by
+/// `the_drop_clause_fits_inside_the_reserved_headroom`.
+const DROP_NOT_PAGEABLE_SUGGESTION: &str = "dedupe='drop' cannot be paged, so this over-budget page has no cursor; re-run with \
+     dedupe='report' and page from there (collapsing duplicates yourself), or keep 'drop' and \
+     shrink the batch";
+
+/// Append `addition` to whatever suggestion the marker already carries, so a page that is both
+/// content-truncated and bounded keeps both hints instead of losing the earlier one.
+fn join_suggestion(existing: Option<&str>, addition: &str) -> String {
+    match existing {
+        Some(s) if !s.is_empty() => format!("{s}; {addition}"),
+        _ => addition.to_string(),
+    }
+}
+
 /// Join whatever suggestion the content-truncation marker already carries with the pagination
 /// advice, so a page that is both content-truncated and bounded keeps both hints.
 fn combined_suggestion(existing: Option<&str>) -> String {
-    match existing {
-        Some(s) if !s.is_empty() => format!("{s}; {PAGINATION_SUGGESTION}"),
-        _ => PAGINATION_SUGGESTION.to_string(),
-    }
+    join_suggestion(existing, PAGINATION_SUGGESTION)
 }
 
 /// The widest [`crate::model::TruncationInfo`] a paginated response can carry: every numeric
@@ -527,8 +546,10 @@ impl RssServer {
         structuredContent.applied_filters (null when neither was supplied). `dedupe` groups \
         the same entry arriving from several feeds: report (DEFAULT) lists the copies in \
         structuredContent.duplicates and removes nothing; off skips detection; drop also \
-        removes the later copies, lowering each feed's item_count, and is REJECTED with a \
-        `cursor` (a continuation page cannot see canonical copies from earlier pages). \
+        removes the later copies, lowering each feed's item_count. drop CANNOT BE PAGED at \
+        all: it is REJECTED with a `cursor`, and an over-budget drop page comes back with \
+        truncation.next_cursor null (a continuation page cannot see canonical copies from \
+        earlier pages). Page under report and collapse the duplicates yourself. \
         max_content_chars truncates each body (flagged \
         content_truncated). `cache_policy` is revalidate (default; re-checks with cached \
         validators, cheap when unchanged, but a cold cache or validator-less origin is a \
@@ -1000,13 +1021,13 @@ async fn fetch_feed_with_deadline(
         } else if dedupe == crate::config::DedupeMode::Drop {
             // No cursor is coming, so say what to do instead — a truncated page whose marker
             // offers neither a continuation nor advice reads as an unexplained short answer.
-            m.suggestion = Some(
-                "this page was bounded by max_response_tokens, and dedupe='drop' cannot be \
-                 paged, so no cursor was issued. Re-run with dedupe='report' (the default) and \
-                 follow truncation.next_cursor, removing the reported duplicates yourself; or \
-                 keep 'drop' and shrink the batch (fewer urls, or a lower limit)."
-                    .to_string(),
-            );
+            // Appended, not assigned, for the same reason the branch above combines: this page
+            // may also be content-truncated, and overwriting would drop the get_item hint that
+            // is the only route to a full body.
+            m.suggestion = Some(join_suggestion(
+                m.suggestion.as_deref(),
+                DROP_NOT_PAGEABLE_SUGGESTION,
+            ));
         }
     }
 
@@ -2530,6 +2551,63 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_content_truncated_drop_page_keeps_the_get_item_hint() {
+        // The cursorless-`drop` advice is *appended*, never assigned: a page can be both
+        // content-truncated and over budget, and overwriting the marker's suggestion would
+        // drop the get_item hint — the only route to a full body — exactly the loss the
+        // paginated branch's `combined_suggestion` exists to prevent.
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("GET", "/one.xml")
+            .with_status(200)
+            .with_body(feed_with_items(10))
+            .create_async()
+            .await;
+        let (cache, dir) = temp_cache("dedupe-drop-both-hints");
+        let http = test_http();
+        let url = format!("{}/one.xml", server.url());
+        let full = full_response_tokens(&http, &cache, fetch_args(url.clone())).await;
+
+        let mut args = fetch_args(url);
+        args.max_response_tokens = Some(full / 2);
+        args.max_content_chars = Some(4); // forces content truncation too
+        args.dedupe = Some("drop".to_string());
+        let (_, payload) = decode(&fetch_feed_inner(&http, &cache, args).await);
+
+        assert!(
+            payload["truncation"]["items_content_truncated"]
+                .as_u64()
+                .unwrap_or(0)
+                > 0,
+            "the fixture must actually content-truncate, or this proves nothing: {payload}"
+        );
+        let s = payload["truncation"]["suggestion"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            s.contains("get_item") && s.contains("dedupe='report'"),
+            "both hints must survive: {s}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_drop_clause_fits_inside_the_reserved_headroom() {
+        // `CURSOR_HEADROOM_TOKENS` is measured from `worst_case_marker`, which carries a full
+        // cursor and `PAGINATION_SUGGESTION`. A `drop` page swaps that clause for this one and
+        // carries no cursor, so it stays inside the reserve as long as the clause is no longer
+        // — which is not automatic, and would silently under-reserve if someone expanded it.
+        assert!(
+            DROP_NOT_PAGEABLE_SUGGESTION.len() <= PAGINATION_SUGGESTION.len(),
+            "the cursorless-drop clause ({} chars) must not exceed the pagination clause it \
+             replaces ({} chars), or the headroom reserve stops covering it",
+            DROP_NOT_PAGEABLE_SUGGESTION.len(),
+            PAGINATION_SUGGESTION.len()
+        );
     }
 
     #[test]
