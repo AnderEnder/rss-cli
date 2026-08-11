@@ -198,8 +198,11 @@ impl FetchArgs {
     /// Resolve `--dedupe` into the shared [`DedupeMode`].
     ///
     /// `clap`'s `value_parser` already rejects anything else, so this cannot fail in practice
-    /// — it goes through [`parse_dedupe`] anyway so the CLI and the MCP server read the same
-    /// grammar from the same place (invariant 6) and cannot drift apart on, say, casing.
+    /// — it goes through [`parse_dedupe`] anyway so both front-ends read the same grammar from
+    /// the same place (invariant 6), and a mode added there is reachable from the CLI by
+    /// extending the `value_parser` list alone. The two surfaces are not identical: clap
+    /// rejects `--dedupe DROP` before [`parse_dedupe`] would lowercase it, while the MCP
+    /// argument accepts `"DROP"`. That asymmetry is clap's strictness, not a second grammar.
     pub fn dedupe_mode(&self) -> Result<DedupeMode, RssError> {
         parse_dedupe(&self.dedupe)
     }

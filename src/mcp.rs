@@ -739,8 +739,9 @@ async fn fetch_feed_with_deadline(
     // fingerprinted in its *canonical* spelling for the same normalization reason as the
     // format and the limit — and because that spelling is `"report"` by default, it is
     // byte-identical to the placeholder it replaced, so cursors minted before it landed still
-    // validate. `drop` never reaches here with a cursor (rejected above), so this slot only
-    // ever carries `report` or `off`.
+    // validate. `drop` does reach here (only a *continuation* under `drop` is rejected above),
+    // which is exactly why `may_mint_cursor` withholds the token: a `drop` fingerprint could
+    // never be validated by any later call.
     let canonical_format = match params.content_format {
         ContentFormat::Markdown => "markdown",
         ContentFormat::Text => "text",
@@ -800,6 +801,16 @@ async fn fetch_feed_with_deadline(
         requested.len()
     );
 
+    // `dedupe='drop'` is rejected *with* a cursor, so it must not mint one either — the guard
+    // above only covers redemption. A `drop` page that overflows the budget would otherwise
+    // hand back a token bound to a `drop` fingerprint: redeeming it as `drop` hits that guard,
+    // and redeeming it as anything else fails the fingerprint check, so the token is
+    // unredeemable by construction. It would also point at the wrong place — `i`/`n` index the
+    // *post-removal* item list while a continuation refetches without the removal. A truncated
+    // page with no cursor is honest and recoverable (the suggestion below says how); a token
+    // that can only ever error is not.
+    let may_mint_cursor = positions_line_up && dedupe != crate::config::DedupeMode::Drop;
+
     // Skip the items already delivered from the resumed feed, warning if the window rolled.
     // `skipped` is what we *actually* dropped (a rolled window can hold fewer items than the
     // cursor's `i`), and it is the offset that makes the next cursor absolute again.
@@ -848,9 +859,12 @@ async fn fetch_feed_with_deadline(
     //
     // The consequence, recorded in ADR-0018: on a paged response `duplicates[]` describes the
     // batch *that page fetched*, so a reported group can name an item the page budget then
-    // trimmed off (it reappears, and is grouped again, on the next page). Recomputing after
-    // `paginate` would not fix that and would break `drop`, whose groups are deliberately an
-    // audit trail of items that are already gone.
+    // trimmed off. That item ships on the next page but is NOT grouped again — the page-2 call
+    // fetches only `urls[start_feed..]` and drains the items already delivered, so the copy it
+    // would be grouped with is not in view. The page that reports a group is the only page that
+    // reports it. Recomputing after `paginate` would not fix that (it would lose the group
+    // entirely) and would break `drop`, whose groups are deliberately an audit trail of items
+    // that are already gone.
     core::apply_dedupe(&mut out, dedupe);
 
     // A continuation with nothing left to ship is *finished*, not over budget. It happens when
@@ -960,8 +974,9 @@ async fn fetch_feed_with_deadline(
         m.feeds_omitted = stop.feeds_omitted;
         // Only mint a cursor while feed positions provably line up with `urls` (see above): a
         // truncated page without a continuation is lossy, one pointing at the wrong feed is
-        // silently wrong data.
-        if positions_line_up {
+        // silently wrong data. `may_mint_cursor` additionally withholds one under
+        // `dedupe='drop'`, which cannot be paged at all.
+        if may_mint_cursor {
             // Positions in `stop` are relative to the fetched slice; the cursor is absolute.
             let absolute_feed = start_feed + stop.feed_idx;
             // Items this call already skipped in the resumed feed, so the next cursor's `i`/`n`
@@ -982,6 +997,16 @@ async fn fetch_feed_with_deadline(
             // Combine, never replace: a page can be both content-truncated and paginated, and
             // dropping the get_item hint would lose the only route to the full body.
             m.suggestion = Some(combined_suggestion(m.suggestion.as_deref()));
+        } else if dedupe == crate::config::DedupeMode::Drop {
+            // No cursor is coming, so say what to do instead — a truncated page whose marker
+            // offers neither a continuation nor advice reads as an unexplained short answer.
+            m.suggestion = Some(
+                "this page was bounded by max_response_tokens, and dedupe='drop' cannot be \
+                 paged, so no cursor was issued. Re-run with dedupe='report' (the default) and \
+                 follow truncation.next_cursor, removing the reported duplicates yourself; or \
+                 keep 'drop' and shrink the batch (fewer urls, or a lower limit)."
+                    .to_string(),
+            );
         }
     }
 
@@ -992,9 +1017,9 @@ async fn fetch_feed_with_deadline(
     // The deadline, not the budget, is what bounded this page: resume at the first feed it
     // never attempted, which is exactly where the delivered prefix ends. Gated on `stop` being
     // absent because the budget's cursor points *earlier* in the same list and already covers
-    // these feeds; gated on `positions_line_up` for the same reason as the cursor above.
+    // these feeds; gated on `may_mint_cursor` for the same reasons as the cursor above.
     if stop.is_none()
-        && positions_line_up
+        && may_mint_cursor
         && let Some(m) = marker.as_mut()
         && m.feeds_omitted > 0
     {
@@ -1126,7 +1151,8 @@ fn resume_from_cursor(
         return Err(tool_error_code(
             "USAGE_ERROR",
             "cursor does not match this request; pass the cursor back with the same \
-             urls/content_format/since/limit/max_content_chars, or drop it to start over",
+             urls/content_format/since/limit/max_content_chars/query/dedupe, or drop it to \
+             start over",
             Some(primary),
         ));
     }
@@ -2447,6 +2473,63 @@ mod tests {
         ];
         let full = full_response_tokens(&http, &cache, batch_args(urls.clone())).await;
         (http, cache, dir, urls, full)
+    }
+
+    #[tokio::test]
+    async fn drop_never_mints_a_cursor_it_could_not_redeem() {
+        // The drop+cursor guard covers *redemption*; this covers minting. A first `drop` page
+        // carries no cursor, so the guard does not fire and the request reaches the
+        // fingerprint — stamped `drop`. A continuation token bound to it is unredeemable by
+        // construction: passed back as `drop` it hits the guard, passed back as anything else
+        // it fails the fingerprint check. Its `i`/`n` would also be wrong, indexing the
+        // post-removal item list while a continuation refetches without the removal. So an
+        // over-budget `drop` page must ship with `next_cursor: null` and say what to do.
+        //
+        // One URL on purpose: its items are distinct, so `drop` removes nothing and the page
+        // overflows for exactly the same reason the `report` control does. Two copies of one
+        // feed would let `drop` shed half the batch and fit, testing nothing.
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("GET", "/one.xml")
+            .with_status(200)
+            .with_body(feed_with_items(10))
+            .create_async()
+            .await;
+        let (cache, dir) = temp_cache("dedupe-drop-no-cursor");
+        let http = test_http();
+        let url = format!("{}/one.xml", server.url());
+        let full = full_response_tokens(&http, &cache, fetch_args(url.clone())).await;
+
+        // Control: the identical over-budget page under the default `report` does page.
+        let mut args = fetch_args(url.clone());
+        args.max_response_tokens = Some(full / 2);
+        let (_, payload) = decode(&fetch_feed_inner(&http, &cache, args).await);
+        assert!(
+            payload["truncation"]["next_cursor"].is_string(),
+            "the control must actually be over budget and pageable: {payload}"
+        );
+
+        let mut args = fetch_args(url);
+        args.max_response_tokens = Some(full / 2);
+        args.dedupe = Some("drop".to_string());
+        let (is_error, payload) = decode(&fetch_feed_inner(&http, &cache, args).await);
+        assert!(
+            !is_error,
+            "the page is fine; only the cursor is withheld: {payload}"
+        );
+        assert!(
+            payload["truncation"]["next_cursor"].is_null(),
+            "drop must not mint a token no later call could redeem: {payload}"
+        );
+        assert!(
+            payload["truncation"]["suggestion"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("dedupe='report'"),
+            "a truncated page with no cursor must name the way forward: {payload}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -3784,9 +3867,15 @@ mod tests {
             Some(2),
             "both syndicated entries should be grouped: {payload}"
         );
-        assert_eq!(
-            payload["duplicates"][0]["key_kind"], "guid",
-            "feed-rs synthesizes an id from link+title, so the key is a guid: {payload}"
+        // `feed_with_items` emits no `<guid>`, so this depends on feed-rs synthesizing
+        // `entry.id` from link+title — an internal of that crate, not a contract of ours.
+        // Accept `url` too: without the synthesized id the identical `<link>` at both URLs
+        // still groups these, one rung down the key ladder. `tests/fetch.rs` pins `guid`
+        // against a fixture with real `<guid>`s, which is where that belongs.
+        let kind = payload["duplicates"][0]["key_kind"].as_str().unwrap_or("");
+        assert!(
+            kind == "guid" || kind == "url",
+            "identical entries at two URLs must group on guid or url, got {kind:?}: {payload}"
         );
         assert_eq!(
             payload["feeds"][1]["item_count"], 2,
@@ -3895,12 +3984,15 @@ mod tests {
         args.cursor = Some(token);
         let (is_error, payload) = decode(&fetch_feed_inner(&test_http(), &cache, args).await);
         assert!(is_error);
+        // Discriminate on a phrase unique to the guard, not on the word "dedupe": the
+        // fingerprint-mismatch message legitimately lists `dedupe` among the arguments a
+        // continuation must keep identical.
         assert!(
             !payload["message"]
                 .as_str()
                 .unwrap_or_default()
-                .contains("dedupe"),
-            "only the drop+cursor guard may mention dedupe: {payload}"
+                .contains("cannot be combined"),
+            "only the drop+cursor guard may report the drop/cursor interaction: {payload}"
         );
 
         std::fs::remove_dir_all(&dir).ok();

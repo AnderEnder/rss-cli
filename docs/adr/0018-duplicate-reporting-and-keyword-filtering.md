@@ -149,12 +149,21 @@ outcome the caller asked to prevent. `fetch_feed` returns a `USAGE_ERROR` naming
 interaction; that is cheaper and more honest than silently degrading, and the message points at
 the workaround (`report`, plus the caller's own collapse).
 
-`report` pages without any such problem, because it removes nothing. `dedupe` still occupies a
-slot in the cursor fingerprint even though `drop` can never appear there: a cursor minted under
-`off` must not be served under `report`, since the two produce different responses for the same
-position. Because the fingerprint hashes the **canonical** spelling and the default is
-`"report"`, this slot is byte-identical to the fixed placeholder ADR-0017 reserved for it — so,
-unlike `query`, populating it invalidated no outstanding cursor.
+The rejection is symmetric: `drop` may not *redeem* a cursor, and a `drop` page does not *mint*
+one either. A first `drop` page is a perfectly legal call, so it reaches the fingerprint and
+could otherwise hand back a continuation stamped `drop` — a token no later call can redeem
+(as `drop` it hits the guard, as anything else it fails the fingerprint check), and one whose
+`i`/`n` index the post-removal item list while a continuation would refetch without the
+removal. So an over-budget `drop` page ships with `next_cursor: null` and a `suggestion` naming
+the two ways forward: page under `report` and collapse the duplicates caller-side, or keep
+`drop` and shrink the batch.
+
+`report` pages without any such problem, because it removes nothing. `dedupe` occupies a slot in
+the cursor fingerprint because a cursor minted under `off` must not be served under `report` —
+the two produce different responses for the same position. Because the fingerprint hashes the
+**canonical** spelling and the default is `"report"`, this slot is byte-identical to the fixed
+placeholder ADR-0017 reserved for it — so, unlike `query`, populating it invalidated no
+outstanding cursor.
 
 ## Consequences
 
@@ -173,12 +182,15 @@ unlike `query`, populating it invalidated no outstanding cursor.
 - **`duplicates[]` on a paged response describes that page's fetch only.** Grouping runs before
   `core::paginate`, because `duplicates[]` is part of the payload the budget measures — computing
   it after would let a page ship over budget. The consequence is that a `report` group can name
-  an item the page budget then trimmed off; that item reappears, and is grouped again, on the
-  next page. Recomputing after `paginate` would not fix this (the trimmed item is genuinely a
-  duplicate of one that shipped) and would break `drop`, whose groups are deliberately an audit
-  trail of items that are already gone. Like `truncation.items_omitted` and
-  `applied_filters.items_filtered_out`, these are per-page snapshots and must not be summed
-  across pages.
+  an item the page budget then trimmed off. That item ships on the next page **without** its
+  group: a continuation fetches only `urls[start_feed..]` and drains the items already
+  delivered, so the copy it would be grouped with is not in view. Each group is therefore
+  reported by exactly one page — the page that fetched both copies — and a caller reconciling a
+  paged batch must keep the groups from every page, not just the last. Recomputing after
+  `paginate` would not fix this (it would lose the group altogether) and would break `drop`,
+  whose groups are deliberately an audit trail of items that are already gone. Like
+  `truncation.items_omitted` and `applied_filters.items_filtered_out`, these are per-page
+  snapshots and must not be summed across pages.
 - **`duplicates[]` is charged against the MCP response budget**, since it is part of the
   measured payload. A group costs on the order of a short item, so a heavily overlapping batch
   (many URLs, each item syndicated several times) pages sooner than the same batch would with

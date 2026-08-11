@@ -46,12 +46,16 @@ pub struct FetchOutput {
     /// by default. Empty `[]` also when `dedupe: "off"` skipped detection — that is
     /// indistinguishable from "detection ran and found nothing", by design (ADR-0018).
     ///
-    /// **Per response, not cumulative** (like `applied_filters`). Grouping runs over the batch
-    /// *before* an MCP page is trimmed to its token budget, because the groups are part of the
-    /// payload being measured. Under `report` a group can therefore name an item the page
-    /// budget then omitted; that item ships — and is grouped again — on the next page. Under
-    /// `dedupe: "drop"` the groups are deliberately an audit trail of items that are already
-    /// gone, so they name ids no longer present in `feeds[]` at all.
+    /// **Per response, not cumulative** (like `applied_filters`), and each group is reported
+    /// exactly once. Grouping runs over the batch *before* an MCP page is trimmed to its token
+    /// budget, because the groups are part of the payload being measured. Under `report` a
+    /// group can therefore name an item the page budget then omitted: that item ships on the
+    /// next page, but *without* its group — a continuation only fetches the feeds from its
+    /// resume point onward and skips the items already delivered, so the copy it would be
+    /// grouped with is no longer in view. Keep the groups from every page if you are
+    /// reconciling a paged batch. Under `dedupe: "drop"` the groups are deliberately an audit
+    /// trail of items that are already gone, so they name ids no longer present in `feeds[]` at
+    /// all — and such a response never carries a `next_cursor`, since `drop` cannot be paged.
     pub duplicates: Vec<DuplicateGroup>,
 }
 
