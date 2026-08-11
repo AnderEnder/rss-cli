@@ -935,7 +935,13 @@ async fn fetch_feed_with_deadline(
         // deadline attempted nothing at all — reachable only with a zero override — and there
         // the caller's own cursor is still the correct place to resume from, so leave it be
         // rather than mint one that would re-deliver the items page 1 already sent.
-        if positions_line_up
+        //
+        // `may_mint_cursor`, not the bare `positions_line_up`, so all three mint sites read the
+        // same gate. Reaching here needs `resume.is_some()`, and both unpageable shapes are
+        // already excluded on that path — `drop` is rejected outright with a cursor, and a
+        // continuation's policy is forced to `CacheFirst` — so the extra clause changes nothing
+        // today. It is here so nobody has to re-derive that when adding the next reason.
+        if may_mint_cursor
             && !out.feeds.is_empty()
             && let Some(m) = out.truncation.as_mut()
             && m.feeds_omitted > 0
@@ -990,14 +996,17 @@ async fn fetch_feed_with_deadline(
         }
     };
 
-    // `paginate` trims `feeds` but not `errors`, so a feed it dropped whole would leave an
-    // entry in `errors[]` with no matching `feeds[]` entry, breaking the documented mirror.
-    // Dropping it loses nothing: `paginate` resumes at the first feed this page does not carry
-    // in full — which a dropped feed always is — so the next page reports it again.
+    // `paginate` trims `feeds` but not `errors`/`warnings`, so a feed it dropped whole would
+    // leave an entry in each with no matching `feeds[]` entry — breaking the documented mirror
+    // for errors, and reporting a data-quality note about a feed the page does not carry.
+    // Dropping them loses nothing: `paginate` resumes at the first feed this page does not
+    // carry in full — which a dropped feed always is — so the next page reports it again.
     let present: std::collections::HashSet<String> =
         out.feeds.iter().map(|f| f.feed_url.clone()).collect();
     out.errors
         .retain(|e| e.feed_url.as_ref().is_none_or(|u| present.contains(u)));
+    out.warnings
+        .retain(|w| w.feed_url.as_ref().is_none_or(|u| present.contains(u)));
 
     // A marker is emitted only when the agent is genuinely not seeing everything: content was
     // truncated, or (below) the page was bounded and there is more to fetch.

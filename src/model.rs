@@ -177,10 +177,11 @@ pub struct TruncationInfo {
     /// Number of items whose `content` was truncated (e.g. by `max_content_chars`).
     pub items_content_truncated: usize,
     /// Number of items dropped entirely to fit a response budget. Non-zero when the server
-    /// filled the page to the budget and shed the rest (see `next_cursor`); `0` in the
-    /// cap-and-error path, which rejects an oversized response rather than trimming it.
-    /// Describes only THIS page, not a running total — a client that sums it across every
-    /// page it fetches gets the wrong answer.
+    /// filled the page to the budget and shed the rest; `0` when nothing was shed — including
+    /// on a page the batch deadline bounded, where whole feeds went unattempted (see
+    /// `feeds_omitted`) but no item was dropped from one that was fetched. Describes only THIS
+    /// page, not a running total — a client that sums it across every page it fetches gets the
+    /// wrong answer.
     pub items_omitted: usize,
     /// Number of whole feeds not included in this page — shed to fit the budget or not
     /// reached before the batch deadline. `0` when every requested feed is present.

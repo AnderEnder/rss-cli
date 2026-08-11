@@ -108,7 +108,9 @@ impl Query {
         self.required.is_empty() && self.excluded.is_empty()
     }
 
-    /// Match against an arbitrary haystack (already-joined text). Lowercases the whole
+    /// Match against an arbitrary haystack (already-joined text). The general-purpose entry
+    /// point of the pair — [`Query::matches_item`] is the one the fetch path uses, and this one
+    /// is for callers matching text that is not a feed item. Lowercases the whole
     /// haystack exactly once regardless of how many terms are checked against it, so the
     /// cost is O(haystack length), not O(haystack length * term count) — the caller
     /// should call this once per item, not once per term.
@@ -241,6 +243,23 @@ mod tests {
     fn non_ascii_terms_are_case_folded_via_unicode_lowercasing() {
         assert!(haystack_matches("ÜBER", "the über cool feature"));
         assert!(haystack_matches("über", "ÜBER MODE"));
+        // The documented limit of `to_lowercase`: lowercasing is not case *folding*, so the
+        // ß/ss equivalence is out of reach. Pinned so the doc claim stays honest — if someone
+        // swaps in a folding implementation, this test is where they find out the docs need
+        // updating too.
+        assert!(!haystack_matches("STRASSE", "die straße"));
+    }
+
+    #[test]
+    fn a_quoted_phrase_can_be_negated() {
+        assert!(
+            haystack_matches("-\"breaking news\"", "breaking the news, separately"),
+            "the phrase does not occur contiguously, so the exclusion does not fire"
+        );
+        assert!(!haystack_matches(
+            "-\"breaking news\"",
+            "breaking news at eleven"
+        ));
     }
 
     #[test]

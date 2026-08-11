@@ -30,7 +30,16 @@ fn schema_fetch_is_valid_json_with_defs_and_properties() {
     let props = v["properties"]
         .as_object()
         .expect("properties is an object");
-    for key in ["schema_version", "fetched_at", "feeds", "errors"] {
+    for key in [
+        "schema_version",
+        "fetched_at",
+        "feeds",
+        "errors",
+        "warnings",
+        "truncation",
+        "applied_filters",
+        "duplicates",
+    ] {
         assert!(
             props.contains_key(key),
             "fetch schema missing top-level `{key}`"

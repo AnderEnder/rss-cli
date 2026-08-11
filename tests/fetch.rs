@@ -591,8 +591,16 @@ fn dedupe_reports_by_default_and_drops_on_request() {
     assert_eq!(v["total_items"], 4);
 
     // drop: the later copies go, and the counts follow them.
-    let v: serde_json::Value =
-        serde_json::from_slice(&fetch(Some("drop")).stdout).expect("valid JSON");
+    let dropped = fetch(Some("drop"));
+    // Exit codes key on feed errors, never on item counts (invariant 5). `drop` can empty a
+    // feed's items entirely — feeds[1] below has zero — and that must still be exit 0, not the
+    // partial-failure 3.
+    assert!(
+        dropped.status.success(),
+        "emptying a feed by deduping is not a failure; stderr:\n{}",
+        String::from_utf8_lossy(&dropped.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&dropped.stdout).expect("valid JSON");
     assert_eq!(v["total_items"], 2, "the later copies must be removed");
     assert_eq!(v["feeds"][0]["item_count"], 2);
     assert_eq!(v["feeds"][1]["item_count"], 0);
