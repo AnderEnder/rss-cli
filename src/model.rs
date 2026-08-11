@@ -38,6 +38,12 @@ pub struct FetchOutput {
     /// What filtering ran (`since` and/or `query`) and what it removed, combined across
     /// every feed in this batch. `null` when neither was supplied.
     pub applied_filters: Option<AppliedFilters>,
+    /// Groups of items in this batch that resolve to the same underlying entry — most
+    /// often the same article syndicated through two feeds, but also a single feed that
+    /// repeats an entry (see [`DuplicateGroup`]). Empty `[]` when nothing matched. Reporting
+    /// only: nothing is removed unless a caller opts into [`crate::core::drop_duplicates`],
+    /// so request order and per-feed `item_count` stay intact by default.
+    pub duplicates: Vec<DuplicateGroup>,
 }
 
 impl FetchOutput {
@@ -52,8 +58,61 @@ impl FetchOutput {
             warnings: Vec::new(),
             truncation: None,
             applied_filters: None,
+            duplicates: Vec::new(),
         }
     }
+}
+
+/// Which field matched when grouping duplicate items (see [`DuplicateGroup`]).
+///
+/// Checked in this order — `Guid`, then `Url`, then `ContentHash` — because each is
+/// progressively less reliable as a cross-feed identity signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DuplicateKeyKind {
+    /// The feed-supplied guid — feed-window-independent and the reliable cross-feed key.
+    Guid,
+    /// The resolved item permalink, used when no guid is available.
+    Url,
+    /// The content hash, used only when neither a guid nor a url is available.
+    ///
+    /// **Lossy.** [`Item::content_hash`] is a hash of the *body text* alone — it carries no
+    /// title, url, or date. Two genuinely different items that happen to share body text
+    /// (an empty body, a shared boilerplate stub, a "read more on our site" placeholder)
+    /// hash identically and are reported as a false-positive duplicate. This kind is only
+    /// reached when both `guid` and `url` are absent/empty, so it is rare in practice, but
+    /// callers that care about precision should treat a `ContentHash`-kind group as a hint
+    /// to verify, not a certainty — this crate does not add heuristics to filter these out;
+    /// it reports the ambiguity and lets the caller decide.
+    ContentHash,
+}
+
+/// A group of items that share a [`DuplicateKeyKind`] key.
+///
+/// Despite the name, grouping is **not** restricted to items in *different* feeds: the key
+/// is computed over every item in the batch, so two items sharing a guid inside the same
+/// feed (a feed that repeats an entry) form a group too — that repetition is worth
+/// reporting on its own. The common case remains the same article syndicated through two
+/// feeds, which is exactly the case `item.id` cannot catch: `id` is namespaced by
+/// `feed_url` (ADR-0003), so the same article delivered by two feeds gets two different
+/// ids and can never be grouped by `id`.
+///
+/// `item_ids` and `feed_urls` are index-parallel: `item_ids[i]` came from `feed_urls[i]`.
+/// [`crate::core::find_duplicates`] builds both from a single vector of `(item_id,
+/// feed_url)` pairs and unzips it at the end, so the two fields cannot desync.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct DuplicateGroup {
+    /// The shared key value (a guid, a url, or a content hash, per `key_kind`).
+    pub key: String,
+    pub key_kind: DuplicateKeyKind,
+    /// Ids of the items sharing the key, in request order. The first is canonical — the
+    /// copy [`crate::core::drop_duplicates`] keeps.
+    ///
+    /// Index-parallel with `feed_urls`: `item_ids[i]` and `feed_urls[i]` describe the same
+    /// occurrence.
+    pub item_ids: Vec<String>,
+    /// The feed each id in `item_ids` came from, index-parallel with it.
+    pub feed_urls: Vec<String>,
 }
 
 /// What filtering was applied to a fetch and what it removed. Present (non-`null`) only

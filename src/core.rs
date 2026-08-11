@@ -12,7 +12,8 @@ use crate::config::FetchParams;
 use crate::error::RssError;
 use crate::fetch::HttpClient;
 use crate::model::{
-    AppliedFilters, DiscoverOutput, FeedResult, FeedStatus, FetchOutput, TruncationInfo, Warning,
+    AppliedFilters, DiscoverOutput, DuplicateGroup, DuplicateKeyKind, FeedResult, FeedStatus,
+    FetchOutput, Item, TruncationInfo, Warning,
 };
 use crate::{discover, parse};
 
@@ -231,6 +232,139 @@ pub fn refresh_feed_counts(output: &mut FetchOutput) {
             .sum();
     }
     populate_totals(output);
+}
+
+/// Group items in `output` that resolve to the same underlying entry, keyed on `guid`, then
+/// resolved `url`, then `content_hash` (ADR-0018). Grouping runs over every item in the
+/// batch, not only across feed boundaries — a single feed that repeats an entry produces a
+/// group too, same as two feeds syndicating the same article. See [`DuplicateGroup`] for why
+/// `item.id` cannot serve as the key here.
+///
+/// Report-only: never mutates `output`. [`drop_duplicates`] is the opt-in removal path.
+///
+/// Ordering is a contract (invariant 9): groups come back in first-appearance order over
+/// `feeds[]` then `items[]`, and each group's `item_ids`/`feed_urls` are in that same
+/// encounter order — `HashMap` iteration order must never leak into the result.
+pub fn find_duplicates(output: &FetchOutput) -> Vec<DuplicateGroup> {
+    use std::collections::HashMap;
+
+    // Preserve request order: record each key's first-appearance position, and accumulate
+    // one (item_id, feed_url) pair per occurrence so the two output vectors can never
+    // desync -- they are unzipped from a single vector at the end, not pushed to in
+    // parallel.
+    let mut order: Vec<(String, DuplicateKeyKind)> = Vec::new();
+    let mut occurrences: HashMap<(String, DuplicateKeyKind), Vec<(String, String)>> =
+        HashMap::new();
+
+    for feed in &output.feeds {
+        for item in &feed.items {
+            let Some((key, kind)) = dedup_key(item) else {
+                continue;
+            };
+            let slot = occurrences.entry((key.clone(), kind)).or_insert_with(|| {
+                order.push((key, kind));
+                Vec::new()
+            });
+            slot.push((item.id.clone(), feed.feed_url.clone()));
+        }
+    }
+
+    order
+        .into_iter()
+        .filter_map(|k| {
+            let occ = occurrences.remove(&k)?;
+            // A single occurrence is not a duplicate.
+            if occ.len() <= 1 {
+                return None;
+            }
+            let (item_ids, feed_urls) = occ.into_iter().unzip();
+            Some(DuplicateGroup {
+                key: k.0,
+                key_kind: k.1,
+                item_ids,
+                feed_urls,
+            })
+        })
+        .collect()
+}
+
+/// The dedup key for an item: `guid`, else resolved `url`, else `content_hash` — the first
+/// present, non-empty field in that order. `None` when all three are absent/empty; such an
+/// item is skipped by [`find_duplicates`], never grouped with other keyless items.
+fn dedup_key(item: &Item) -> Option<(String, DuplicateKeyKind)> {
+    if let Some(g) = item.guid.as_deref().filter(|s| !s.is_empty()) {
+        return Some((g.to_string(), DuplicateKeyKind::Guid));
+    }
+    if let Some(u) = item.url.as_deref().filter(|s| !s.is_empty()) {
+        return Some((u.to_string(), DuplicateKeyKind::Url));
+    }
+    item.content_hash
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(|h| (h.to_string(), DuplicateKeyKind::ContentHash))
+}
+
+/// Remove every non-canonical copy named in `groups`, keeping each group's first (canonical)
+/// id, and refresh every derived count so `item_count`/`content_tokens_est_total`/
+/// `total_items`/`total_content_tokens_est` stay consistent with what remains.
+///
+/// Opt-in only: [`find_duplicates`] never mutates; this is the removal path a caller reaches
+/// for explicitly (e.g. `dedupe: "drop"`, added in a later task).
+///
+/// A group naming ids not present in `output` (a stale group, e.g. computed against a
+/// different snapshot) is ignored for those ids — no panic, no corruption of the counts for
+/// what IS present. An empty `groups` slice is a no-op.
+pub fn drop_duplicates(output: &mut FetchOutput, groups: &[DuplicateGroup]) {
+    use std::collections::{HashMap, HashSet};
+
+    // Removal must be counted per id, not membership-tested: a feed that emits the exact
+    // same entry twice gives both copies the SAME `id` (ADR-0003 keys `id` on feed_url plus
+    // link/guid/title, so a repeated link/guid repeats the id too). A plain "is this id in
+    // the doomed set" check cannot tell that group's canonical occurrence apart from its
+    // doomed duplicate when they carry the identical id string -- it would match, and
+    // delete, both.
+    let mut canonical_ids: HashSet<&str> = HashSet::new();
+    let mut remove_budget: HashMap<&str, usize> = HashMap::new();
+    for g in groups {
+        if let Some(first) = g.item_ids.first() {
+            canonical_ids.insert(first.as_str());
+        }
+        for id in g.item_ids.iter().skip(1) {
+            *remove_budget.entry(id.as_str()).or_insert(0) += 1;
+        }
+    }
+    if remove_budget.is_empty() {
+        return;
+    }
+    // How many occurrences of each doomed id to keep before removal budget kicks in: 1 if
+    // that id is ever a group's canonical (first) id, 0 if it is only ever a doomed
+    // duplicate. Consumed by the first matching occurrence encountered, in traversal order,
+    // so exactly one survivor is the one `find_duplicates` designated canonical.
+    let mut keep_budget: HashMap<&str, usize> = remove_budget
+        .keys()
+        .map(|id| (*id, usize::from(canonical_ids.contains(id))))
+        .collect();
+
+    for feed in &mut output.feeds {
+        feed.items.retain(|item| {
+            let id = item.id.as_str();
+            let Some(remaining) = remove_budget.get_mut(id) else {
+                return true; // not part of any group: untouched
+            };
+            if let Some(keep) = keep_budget.get_mut(id)
+                && *keep > 0
+            {
+                *keep -= 1;
+                return true; // this occurrence is the surviving canonical copy
+            }
+            if *remaining == 0 {
+                return true; // removal budget for this id is exhausted
+            }
+            *remaining -= 1;
+            false
+        });
+    }
+    refresh_feed_counts(output);
 }
 
 /// Fetch and parse a single feed, returning the [`FeedResult`], any non-fatal [`Warning`]s
@@ -687,7 +821,7 @@ mod tests {
     use super::*;
     use crate::cache::{Cache, CacheMeta};
     use crate::config::CachePolicy;
-    use crate::model::{ContentFormat, IdSource, Item};
+    use crate::model::{ContentFormat, DuplicateGroup, DuplicateKeyKind, IdSource, Item};
 
     fn seed(cache: &Cache, url: &str, body: &[u8]) {
         let meta = CacheMeta {
@@ -1669,6 +1803,334 @@ mod tests {
             matches!(err, RssError::ResponseTooLarge { .. }),
             "the envelope (now including applied_filters) plus the one item must not fit, \
              got {err:?}"
+        );
+    }
+
+    // --- Task 15: cross-feed duplicate reporting ---------------------------------------
+
+    fn item_keyed(id: &str, guid: Option<&str>, url: Option<&str>) -> Item {
+        Item {
+            id: id.to_string(),
+            guid: guid.map(|s| s.to_string()),
+            url: url.map(|s| s.to_string()),
+            ..item(false)
+        }
+    }
+
+    /// Like [`item_keyed`] but with `content_hash: None` too, so `dedup_key` has nothing to
+    /// fall back to — the "no key at all" case.
+    fn item_keyless(id: &str) -> Item {
+        Item {
+            content_hash: None,
+            ..item_keyed(id, None, None)
+        }
+    }
+
+    fn two_feeds(a: Vec<Item>, b: Vec<Item>) -> FetchOutput {
+        let mut out = output_with(a);
+        let mut second = out.feeds[0].clone();
+        second.feed_url = "https://example.com/two.xml".to_string();
+        second.item_count = b.len();
+        second.items = b;
+        out.feeds.push(second);
+        populate_totals(&mut out);
+        out
+    }
+
+    /// Build one feed per entry in `item_lists`, at `https://example.com/feedN.xml`.
+    fn n_feeds(item_lists: Vec<Vec<Item>>) -> FetchOutput {
+        let mut out = FetchOutput::new("2026-06-01T00:00:00Z".to_string());
+        for (i, items) in item_lists.into_iter().enumerate() {
+            out.feeds.push(FeedResult {
+                feed_url: format!("https://example.com/feed{i}.xml"),
+                status: FeedStatus::Ok,
+                from_cache: false,
+                title: Some("Feed".to_string()),
+                site_url: None,
+                updated: None,
+                item_count: 0,
+                content_tokens_est_total: 0,
+                items,
+                error: None,
+                cached_at: None,
+                cache_age_seconds: None,
+            });
+        }
+        refresh_feed_counts(&mut out);
+        out
+    }
+
+    #[test]
+    fn duplicates_match_on_guid_across_feeds() {
+        // id is namespaced by feed_url (ADR-0003), so the same article syndicated through two
+        // feeds has two different ids. guid is the cross-feed key.
+        let out = two_feeds(
+            vec![item_keyed("aaaa", Some("t3_abc"), Some("https://x/1"))],
+            vec![item_keyed("bbbb", Some("t3_abc"), Some("https://x/1"))],
+        );
+        let groups = find_duplicates(&out);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].key, "t3_abc");
+        assert_eq!(groups[0].key_kind, DuplicateKeyKind::Guid);
+        assert_eq!(
+            groups[0].item_ids,
+            vec!["aaaa".to_string(), "bbbb".to_string()]
+        );
+        assert_eq!(
+            groups[0].feed_urls,
+            vec![
+                "https://example.com/feed.xml".to_string(),
+                "https://example.com/two.xml".to_string(),
+            ],
+            "feed_urls must be the feed each id came from, not the item's own feed_url field"
+        );
+    }
+
+    #[test]
+    fn duplicates_fall_back_to_url_then_content_hash() {
+        let by_url = two_feeds(
+            vec![item_keyed("aaaa", None, Some("https://x/1"))],
+            vec![item_keyed("bbbb", None, Some("https://x/1"))],
+        );
+        assert_eq!(find_duplicates(&by_url)[0].key_kind, DuplicateKeyKind::Url);
+
+        // No guid, no url: content_hash (set by item()) is the last resort.
+        let by_hash = two_feeds(
+            vec![item_keyed("aaaa", None, None)],
+            vec![item_keyed("bbbb", None, None)],
+        );
+        assert_eq!(
+            find_duplicates(&by_hash)[0].key_kind,
+            DuplicateKeyKind::ContentHash
+        );
+    }
+
+    #[test]
+    fn distinct_items_produce_no_groups() {
+        let out = two_feeds(
+            vec![item_keyed("aaaa", Some("g1"), Some("https://x/1"))],
+            vec![item_keyed("bbbb", Some("g2"), Some("https://x/2"))],
+        );
+        assert!(find_duplicates(&out).is_empty());
+    }
+
+    #[test]
+    fn keyless_items_are_never_grouped() {
+        // No guid, no url, no content_hash: dedup_key is None for both. They must not be
+        // grouped with each other just because they share "no key".
+        let out = two_feeds(vec![item_keyless("aaaa")], vec![item_keyless("bbbb")]);
+        assert!(find_duplicates(&out).is_empty());
+    }
+
+    #[test]
+    fn distinct_key_kinds_do_not_collide_on_equal_strings() {
+        // item a's guid string equals item b's url string. If the dedup key were ever
+        // simplified from `(String, DuplicateKeyKind)` to a bare `String`, this would
+        // wrongly group them.
+        let out = two_feeds(
+            vec![item_keyed("aaaa", Some("https://x/1"), None)],
+            vec![item_keyed("bbbb", None, Some("https://x/1"))],
+        );
+        assert!(
+            find_duplicates(&out).is_empty(),
+            "a guid and a url that share the same string must not be treated as the same key"
+        );
+    }
+
+    #[test]
+    fn intra_feed_duplicate_guid_forms_a_group() {
+        // Two items inside the SAME feed sharing a guid (a feed that repeats an entry) are
+        // grouped too -- find_duplicates groups by key over every item in the batch, not
+        // only across feed boundaries. See the doc on `find_duplicates` / `DuplicateGroup`.
+        let out = n_feeds(vec![vec![
+            item_keyed("aaaa", Some("dup"), None),
+            item_keyed("bbbb", Some("dup"), None),
+        ]]);
+        let groups = find_duplicates(&out);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(
+            groups[0].item_ids,
+            vec!["aaaa".to_string(), "bbbb".to_string()]
+        );
+        assert_eq!(
+            groups[0].feed_urls,
+            vec![
+                "https://example.com/feed0.xml".to_string(),
+                "https://example.com/feed0.xml".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn duplicate_group_can_span_three_feeds() {
+        let out = n_feeds(vec![
+            vec![item_keyed("a1", Some("shared"), None)],
+            vec![item_keyed("a2", Some("shared"), None)],
+            vec![item_keyed("a3", Some("shared"), None)],
+        ]);
+        let groups = find_duplicates(&out);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(
+            groups[0].item_ids,
+            vec!["a1".to_string(), "a2".to_string(), "a3".to_string()]
+        );
+        assert_eq!(
+            groups[0].feed_urls,
+            vec![
+                "https://example.com/feed0.xml".to_string(),
+                "https://example.com/feed1.xml".to_string(),
+                "https://example.com/feed2.xml".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn groups_are_ordered_by_first_appearance_not_hash_iteration_order() {
+        // Four distinct groups: a HashMap-iteration-order regression fails this with high
+        // probability (~96%) on a random per-process hasher seed, unlike a 2-group version.
+        let out = n_feeds(vec![
+            vec![
+                item_keyed("a1", Some("gA"), None),
+                item_keyed("b1", Some("gB"), None),
+                item_keyed("c1", Some("gC"), None),
+                item_keyed("d1", Some("gD"), None),
+            ],
+            vec![
+                item_keyed("a2", Some("gA"), None),
+                item_keyed("b2", Some("gB"), None),
+                item_keyed("c2", Some("gC"), None),
+                item_keyed("d2", Some("gD"), None),
+            ],
+        ]);
+        let groups = find_duplicates(&out);
+        let keys: Vec<&str> = groups.iter().map(|g| g.key.as_str()).collect();
+        assert_eq!(keys, vec!["gA", "gB", "gC", "gD"]);
+    }
+
+    #[test]
+    fn find_duplicates_does_not_mutate_output() {
+        let out = two_feeds(
+            vec![item_keyed("aaaa", Some("t3_abc"), None)],
+            vec![item_keyed("bbbb", Some("t3_abc"), None)],
+        );
+        let before = serde_json::to_value(&out).expect("serializable");
+        let _ = find_duplicates(&out);
+        let after = serde_json::to_value(&out).expect("serializable");
+        assert_eq!(before, after, "find_duplicates must be read-only");
+    }
+
+    #[test]
+    fn drop_duplicates_keeps_the_first_and_fixes_counts() {
+        let mut out = two_feeds(
+            vec![item_keyed("aaaa", Some("t3_abc"), None)],
+            vec![item_keyed("bbbb", Some("t3_abc"), None)],
+        );
+        let groups = find_duplicates(&out);
+        drop_duplicates(&mut out, &groups);
+
+        assert_eq!(
+            out.feeds[0].items.len(),
+            1,
+            "the canonical first copy stays"
+        );
+        assert_eq!(out.feeds[1].items.len(), 0, "the later copy is removed");
+        assert_eq!(out.feeds[1].item_count, 0, "per-feed counts must follow");
+        assert_eq!(out.total_items, 1);
+        assert_eq!(
+            out.total_content_tokens_est,
+            out.feeds
+                .iter()
+                .map(|f| f.content_tokens_est_total)
+                .sum::<u64>(),
+            "top-level and per-feed token totals must stay consistent"
+        );
+    }
+
+    #[test]
+    fn drop_duplicates_with_empty_group_list_is_a_noop() {
+        let mut out = two_feeds(
+            vec![item_keyed("aaaa", Some("g1"), None)],
+            vec![item_keyed("bbbb", Some("g2"), None)],
+        );
+        let before = serde_json::to_value(&out).expect("serializable");
+        drop_duplicates(&mut out, &[]);
+        let after = serde_json::to_value(&out).expect("serializable");
+        assert_eq!(before, after, "an empty group list must change nothing");
+    }
+
+    #[test]
+    fn drop_duplicates_ignores_a_stale_group_without_panicking() {
+        // A group naming ids that are no longer present in `output` (e.g. computed against a
+        // stale snapshot) must not panic and must not corrupt the counts of what IS present.
+        let mut out = two_feeds(
+            vec![item_keyed("aaaa", Some("g1"), None)],
+            vec![item_keyed("bbbb", Some("g2"), None)],
+        );
+        let stale_group = DuplicateGroup {
+            key: "ghost".to_string(),
+            key_kind: DuplicateKeyKind::Guid,
+            item_ids: vec!["zzzz".to_string(), "yyyy".to_string()],
+            feed_urls: vec![
+                "https://example.com/gone1.xml".to_string(),
+                "https://example.com/gone2.xml".to_string(),
+            ],
+        };
+        drop_duplicates(&mut out, &[stale_group]);
+
+        assert_eq!(
+            out.total_items, 2,
+            "nothing present should have been removed"
+        );
+        assert_eq!(out.feeds[0].items.len(), 1);
+        assert_eq!(out.feeds[1].items.len(), 1);
+    }
+
+    #[test]
+    fn drop_duplicates_same_id_intra_feed_keeps_one_copy() {
+        // An intra-feed duplicate commonly shares an id too: ADR-0003 keys `id` on
+        // feed_url + (link -> guid -> title|published), so a feed repeating the same entry
+        // (same link/guid) produces two items with the SAME id, not two different ones.
+        let out = n_feeds(vec![vec![
+            item_keyed("same", Some("dup"), None),
+            item_keyed("same", Some("dup"), None),
+        ]]);
+        let groups = find_duplicates(&out);
+        assert_eq!(
+            groups[0].item_ids,
+            vec!["same".to_string(), "same".to_string()]
+        );
+        let mut out = out;
+        drop_duplicates(&mut out, &groups);
+        assert_eq!(out.feeds[0].items.len(), 1, "exactly one copy survives");
+        assert_eq!(out.total_items, 1);
+    }
+
+    #[test]
+    fn drop_duplicates_three_same_id_copies_keeps_exactly_one() {
+        // Same as the 2-copy case but with three repeats, so a fix that special-cased
+        // "exactly 2" (e.g. "keep first, remove second") rather than counting the real
+        // removal budget would still fail this one.
+        let out = n_feeds(vec![vec![
+            item_keyed("same", Some("dup"), None),
+            item_keyed("same", Some("dup"), None),
+            item_keyed("same", Some("dup"), None),
+        ]]);
+        let groups = find_duplicates(&out);
+        assert_eq!(groups[0].item_ids.len(), 3);
+        let mut out = out;
+        drop_duplicates(&mut out, &groups);
+        assert_eq!(out.feeds[0].items.len(), 1, "exactly one copy survives");
+        assert_eq!(out.total_items, 1);
+    }
+
+    #[test]
+    fn fresh_fetch_output_serializes_duplicates_as_empty_array_not_omitted() {
+        let out = FetchOutput::new("2026-06-01T00:00:00Z".to_string());
+        let v = serde_json::to_value(&out).expect("serializable");
+        assert_eq!(
+            v.get("duplicates"),
+            Some(&serde_json::json!([])),
+            "duplicates must serialize as [] and never be omitted (invariant 2)"
         );
     }
 }
