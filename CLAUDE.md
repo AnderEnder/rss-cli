@@ -78,7 +78,12 @@ One core powers both front-ends, so they cannot diverge
    `a86aced5664c7742`) locks the byte layout — changing `item_id` changes a public contract.
 5. **Exit codes are a contract:** `0` ok · `1` unexpected · `2` usage · `3` partial · `4`
    all-failed. Defined in `error.rs::exit`, mapped in `main.rs`. They key on feed **errors**,
-   never on item counts (a feed emptied by `--dedupe drop` is still exit 0).
+   never on item counts (a feed emptied by `--dedupe drop` is still exit 0). `FeedStatus::Stale`
+   is *not* an error, so a stale-only batch is exit 0 — reachable only by opting into
+   `stale-if-error`, which is exactly why that policy is opt-in
+   ([ADR-0019](./docs/adr/0019-stale-if-error-cache-policy.md)). Making it the default would
+   silently turn a rate-limited `rss fetch` from exit 4 into exit 0. Pinned by
+   `core::tests::the_default_policy_still_fails_a_throttled_feed`.
 6. **CLI and MCP share `core.rs`.** Add behavior to the core; don't fork it into a front-end.
 7. **MCP responses are size-bounded and *fill* rather than reject.** An over-budget batch ships
    what fits plus `truncation.next_cursor`. `RESPONSE_TOO_LARGE` fires only when not even one
@@ -109,7 +114,16 @@ One core powers both front-ends, so they cannot diverge
       the fingerprint stamped `"drop"`, and nothing could ever redeem that token.
     - `cache_policy: "no-cache"` — it writes nothing, so the next page would resume against
       some earlier call's snapshot.
-13. **Dedup reports by default; only `drop` removes.** `duplicates[]` groups on `guid` → `url`
+13. **Serving stale is opt-in, and `error` stays `null` when it happens.** Only
+    `cache_policy: "stale-if-error"` can produce `FeedStatus::Stale`, and only an *origin
+    refusal* (`Http`/`RateLimited`/`Network`) qualifies — `fetch::is_origin_refusal` is the
+    single place that list lives. A parse failure still errors (the origin answered), and
+    `DeadlineExceeded` must never go stale or it would turn a resumable omission into a
+    silently stale page. A stale feed carries real items, so `error` stays `null` and the
+    reason rides in `warnings[]` as `SERVED_STALE`: overloading `error` would make
+    `if (feed.error) skip(feed)` discard a usable feed. Age needs no new field —
+    `cache_age_seconds` already exists. (ADR-0019)
+14. **Dedup reports by default; only `drop` removes.** `duplicates[]` groups on `guid` → `url`
     → `content_hash` and leaves `feeds[]`, order, and `item_count` untouched. Grouping runs
     *before* `paginate` (the budget must measure what ships), so on a paged response
     `duplicates[]` describes that page's fetch only.
@@ -142,6 +156,16 @@ One core powers both front-ends, so they cannot diverge
   bounds one *in-flight* retry holding its host permit; `HOST_MAX_COOLDOWN`/`MAX_GATE_WAIT`
   (60 s) bound a *sibling's* gate wait; `FetchParams::deadline` bounds when a fetch may
   **start**. Raising the first to match the second blocks siblings behind a retrying request.
+- **`FetchParams::deadline` is enforced *at the gate*, not just before it.**
+  `HostGate::acquire_until` bounds both the permit wait and the cooldown sleep by it, so a
+  same-host batch sheds what it cannot start instead of serializing behind escalating
+  cooldowns. Don't revert it to a pre-flight-only check: with `per_host = 1` all
+  `concurrency` feeds pass a start-time check at t≈0, and the call then runs **~82 s against
+  a 3 s deadline** — past any client tool timeout, which returns *nothing at all*, not even
+  the `feeds_omitted` envelope. This is a fourth, tighter ceiling
+  (`min(MAX_GATE_WAIT, deadline)`), *not* a merge of the three above. Pinned by
+  `core::tests::deadline_is_a_real_wall_clock_bound_for_a_throttled_same_host_batch`
+  (asserts elapsed wall-clock — omission counts alone pass either way).
 - **Never hold the `HostGate` slot-map lock across an `.await`.** `slot_for` locks only to
   insert-and-clone the `Arc<HostSlot>`; all waiting uses the per-slot semaphore.
 - **`fetch_feed`'s `limit` is per feed, not per batch.** Scaling it down by feed count would
@@ -152,6 +176,12 @@ One core powers both front-ends, so they cannot diverge
   (ADR-0017). Pinned by `paginate_ships_a_page_that_fits_even_when_a_later_feed_is_dropped`.
 - **`query` runs before `limit`, on purpose,** so `limit` means "N matching items". Pinned by
   `parse::tests::query_filters_before_limit`.
+- **`since` *retains* undated items — don't "tighten" that to a drop.** The retain arm is
+  `None => true` because we cannot prove an undated item is older than the cutoff. This is
+  what makes `since` safe on a feed with no dates at all (Reddit's `…/comments/.rss` carries
+  `published: null` on every entry): dropping them would return **zero items, silently**, since
+  an empty feed is not an error. Pinned by
+  `parse::tests::since_retains_undated_items_so_a_comment_feed_is_not_emptied`.
 - **`item.id` and the dedup key disagree — never collapse duplicates by id.** `identity.rs`
   keys on link → guid → title|published; `core::dedup_key` on guid → url → content_hash. A feed
   whose entries share one `<link>` gives every item the same `id` while their guids put them in

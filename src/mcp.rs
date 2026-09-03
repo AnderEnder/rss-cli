@@ -433,8 +433,9 @@ struct FetchFeedArgs {
     /// prefer one batched call over several calls with your own delays between them.
     #[serde(default, deserialize_with = "de_lenient_url_list")]
     urls: Option<Vec<String>>,
-    /// Content extraction format: `markdown` (default), `text`, `html`, or `none`.
+    /// Content extraction format. Defaults to `markdown`.
     #[serde(default)]
+    #[schemars(extend("enum" = ["markdown", "text", "html", "none", null]))]
     content_format: Option<String>,
     /// Only include items published at or after this time: a duration (`2h`, `7d`) or an
     /// ISO-8601 date/datetime (`2026-06-01`). Applied before `limit`.
@@ -442,17 +443,22 @@ struct FetchFeedArgs {
     since: Option<String>,
     /// Keyword filter over each item's title, summary, and content. Space-separated terms
     /// are AND-ed, `"quoted phrases"` match as a unit, `-term` excludes. Applied before
-    /// `limit`, so `limit` means "N matching items". A plain `Option<String>` is fine here
-    /// (unlike the numeric fields below): MCP clients that stringify every argument already
-    /// send a string for this one.
+    /// `limit`, so `limit` means "N matching items".
+    //
+    // A plain `Option<String>` needs no `de_lenient_*` helper, unlike the numeric fields:
+    // clients that stringify every argument already send a string for this one. Kept as a
+    // non-doc comment deliberately — it is crate-internal reasoning, and a doc comment here
+    // ships in the generated `inputSchema` to every client on every session.
     #[serde(default)]
     query: Option<String>,
     /// Cross-feed duplicate handling: `report` (the default — group repeated entries in
     /// `duplicates[]` and change nothing else), `off` (skip detection), or `drop` (also remove
     /// the later copies, which lowers each feed's `item_count`). `drop` cannot be combined
-    /// with `cursor`. A plain `Option<String>` for the same reason as `query`: clients that
-    /// stringify every argument already send a string for this one.
+    /// with `cursor`.
+    //
+    // Plain `Option<String>` for the same reason as `query`; see the note there.
     #[serde(default)]
+    #[schemars(extend("enum" = ["report", "off", "drop", null]))]
     dedupe: Option<String>,
     /// Maximum number of items to return (most recent first). Omit to use the default cap
     /// of 25; pass a larger number to fetch more (subject to the response budget).
@@ -469,10 +475,28 @@ struct FetchFeedArgs {
     max_response_tokens: Option<usize>,
     /// Cache behavior: `revalidate` (default — re-checks with cached validators, cheap when
     /// unchanged, but a cold cache or a validator-less origin gets a full fetch), `no-cache`
-    /// (always refetch), `cache-first` (serve any cached copy without a network call), or
-    /// `max-age:<duration>` (serve cache younger than e.g. `15m`). Ignored on a continuation
-    /// call (see `cursor`), which is always served cache-first.
+    /// (always refetch), `cache-first` (serve any cached copy without a network call),
+    /// `stale-if-error` (revalidate, but serve the last cached copy when the origin refuses —
+    /// a rate-limited feed comes back as `status: "stale"` with a `SERVED_STALE` warning
+    /// instead of failing), or `max-age:<duration>` (serve cache younger than e.g. `15m`).
+    /// Ignored on a continuation call (see `cursor`), which is always served cache-first.
+    ///
+    /// Prefer `stale-if-error` when fetching many feeds from one host (e.g. several Reddit
+    /// subreddits): it turns the feeds that get throttled into slightly-old ones rather than
+    /// dropped ones.
+    //
+    // A `pattern`, not an `enum`: `max-age:<duration>` is open-ended, so a closed member list
+    // would advertise it as invalid. `config::parse_cache_policy` stays deliberately more
+    // lenient than this (blank, mixed case, surrounding whitespace) — advertise the canonical
+    // grammar, accept sloppy input.
+    //
+    // Kept to plain ECMA-262: JSON Schema `pattern` has no inline-flag syntax, so an `(?i)`
+    // prefix is not case-insensitivity here — it is a literal that makes the regex match
+    // nothing in a strict validator.
     #[serde(default)]
+    #[schemars(extend(
+        "pattern" = r"^(revalidate|no-cache|cache-first|stale-if-error|max-age:\S+)$"
+    ))]
     cache_policy: Option<String>,
     /// Opaque continuation token from a prior response's `truncation.next_cursor`. Pass it
     /// back with the SAME arguments to get the next page. Continuation pages resume
@@ -508,7 +532,8 @@ struct GetItemArgs {
 /// Arguments for the `get_schema` tool.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct GetSchemaArgs {
-    /// Which command's output schema to return: `fetch` or `discover`.
+    /// Which command's output schema to return.
+    #[schemars(extend("enum" = ["fetch", "discover"]))]
     command: String,
 }
 
@@ -1864,6 +1889,121 @@ mod tests {
             "get_schema does not touch the network"
         );
         assert!(get_schema.output_schema.is_none());
+    }
+
+    #[test]
+    fn enumerated_args_advertise_their_values_and_the_parsers_accept_every_one() {
+        // The prose used to be the *only* place the legal values lived, so a client whose
+        // tool-listing truncates long descriptions could not discover them. These constraints
+        // put them in the schema itself — and this test pins the half that actually matters:
+        // everything advertised must round-trip through the shared parser. A schema that
+        // promises a value `config` rejects is worse than no schema.
+        let tools = RssServer::tool_router().list_all();
+        let props = |tool: &str| {
+            tools
+                .iter()
+                .find(|t| t.name == tool)
+                .unwrap_or_else(|| panic!("{tool} registered"))
+                .input_schema
+                .get("properties")
+                .and_then(|p| p.as_object())
+                .cloned()
+                .unwrap_or_else(|| panic!("{tool} has properties"))
+        };
+        let fetch = props("fetch_feed");
+
+        let members = |schema: &serde_json::Value| -> Vec<String> {
+            schema
+                .get("enum")
+                .and_then(|e| e.as_array())
+                .unwrap_or_else(|| panic!("expected an enum in {schema}"))
+                .iter()
+                .filter(|v| !v.is_null()) // `null` is the "argument omitted" member
+                .map(|v| v.as_str().expect("enum members are strings").to_string())
+                .collect()
+        };
+
+        let formats = members(&fetch["content_format"]);
+        assert_eq!(formats, ["markdown", "text", "html", "none"]);
+        for f in &formats {
+            assert!(
+                parse_content_format(f).is_some(),
+                "content_format `{f}` is advertised but rejected by the parser"
+            );
+        }
+
+        let modes = members(&fetch["dedupe"]);
+        assert_eq!(modes, ["report", "off", "drop"]);
+        for m in &modes {
+            assert!(
+                crate::config::parse_dedupe(m).is_ok(),
+                "dedupe `{m}` is advertised but rejected by the parser"
+            );
+        }
+
+        let commands = members(&props("get_schema")["command"]);
+        assert_eq!(commands, ["fetch", "discover"]);
+        for c in &commands {
+            assert!(
+                !crate::output::schema_for(c).is_null(),
+                "get_schema command `{c}` is advertised but has no schema"
+            );
+        }
+
+        // `cache_policy` is a `pattern`, not an `enum`, because `max-age:<duration>` is
+        // open-ended. Assert the literal so a rewrite has to come back through this test —
+        // JSON Schema `pattern` is ECMA-262, which has no inline-flag syntax, so an `(?i)`
+        // would be a literal that matches nothing rather than a case-insensitivity switch.
+        let pattern = fetch["cache_policy"]["pattern"]
+            .as_str()
+            .expect("cache_policy advertises a pattern");
+        assert_eq!(
+            pattern, r"^(revalidate|no-cache|cache-first|stale-if-error|max-age:\S+)$",
+            "keep this plain ECMA-262"
+        );
+        assert!(
+            !pattern.contains("(?"),
+            "no inline flags in a JSON Schema pattern"
+        );
+        for p in [
+            "revalidate",
+            "no-cache",
+            "cache-first",
+            "stale-if-error",
+            "max-age:15m",
+        ] {
+            assert!(
+                crate::config::parse_cache_policy(p).is_ok(),
+                "cache_policy `{p}` matches the advertised pattern but the parser rejects it"
+            );
+        }
+    }
+
+    #[test]
+    fn arg_descriptions_carry_no_crate_internal_reasoning() {
+        // Every `inputSchema` description ships to every client on every session, so notes
+        // about Rust types are pure token cost to the reader who cannot act on them (the same
+        // rule CLAUDE.md states for `model.rs`). Two of these leaked `Option<String>` rationale.
+        let tools = RssServer::tool_router().list_all();
+        for t in &tools {
+            let Some(props) = t.input_schema.get("properties").and_then(|p| p.as_object()) else {
+                continue;
+            };
+            for (name, schema) in props {
+                let Some(desc) = schema.get("description").and_then(|d| d.as_str()) else {
+                    continue;
+                };
+                for leak in ["Option<", "Vec<", "usize", "&str", "serde", "de_lenient"] {
+                    assert!(
+                        !desc.contains(leak),
+                        "{}.{name} description leaks the crate-internal token `{leak}`: \
+                         put it in a `//` comment instead — a doc comment here is billed to \
+                         every client, every session.\n{desc}",
+                        t.name
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -3378,11 +3518,29 @@ mod tests {
     }
 
     /// The delay a slow-server test serves each response after, and the deadline it pairs with.
-    /// The gap between them is the determinism margin: the first `concurrency` fetches are
-    /// admitted within microseconds (well inside `DEADLINE`), and no later feed can be polled
-    /// until one of them completes — which takes at least `SERVER_DELAY`, well past it.
+    /// The gap between them is the determinism margin: only the fetch holding the per-host
+    /// permit can finish inside `DEADLINE`, and every sibling queued behind it is shed at the
+    /// gate once the deadline passes (`HostGate::acquire_until`), so a page under this pair
+    /// reliably ships a short prefix and reports the rest omitted.
     const SERVER_DELAY: std::time::Duration = std::time::Duration::from_millis(80);
     const DEADLINE: std::time::Duration = std::time::Duration::from_millis(25);
+
+    /// The one test that needs *more than one* feed delivered before a budget trims it uses
+    /// its own, slower server and a proportionally longer deadline. Since the deadline became
+    /// a real bound, same-host feeds arrive serially about one response-delay apart, so the
+    /// delivered count is governed by how many *fit* — not by how many were admitted at t≈0.
+    ///
+    /// The ratio is chosen so both bounds survive a slow CI runner (the suite runs on five
+    /// OSes, Windows included):
+    /// - the upper bound (`delivered < urls.len()`) is guaranteed by the server's own sleep:
+    ///   10 feeds cannot finish in 1000 ms when each is floored at 200 ms.
+    /// - the lower bound (`delivered > 1`) has ~300 ms of per-request slack on top of that
+    ///   floor before it is threatened.
+    ///
+    /// Widen both together if this ever flakes; shrinking the deadline alone re-tightens the
+    /// lower bound, and growing it alone eventually delivers every feed and kills the upper.
+    const COMPOSED_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
+    const COMPOSED_DEADLINE: std::time::Duration = std::time::Duration::from_millis(1000);
 
     #[tokio::test]
     async fn a_page_bounded_by_both_the_deadline_and_the_budget_keeps_both_counts() {
@@ -3390,7 +3548,7 @@ mod tests {
         // `paginate` measures the payload, the budget's `PageStop` then assigns its own counts,
         // and `merge_deadline_omissions` adds them — with the BUDGET minting the cursor, because
         // it points earlier in the same list than the deadline's would.
-        let base = slow_feed_server(SERVER_DELAY, feed_with_items(5));
+        let base = slow_feed_server(COMPOSED_DELAY, feed_with_items(5));
         let urls: Vec<String> = (0..10).map(|i| format!("{base}/f{i}.xml")).collect();
         let (cache, dir) = temp_cache("deadline-and-budget");
         let http = test_http();
@@ -3398,24 +3556,32 @@ mod tests {
         // Measure the same deadline-bounded page under a generous budget first, so the budget
         // below is a fraction of the page actually being trimmed — not of the whole batch.
         let generous = output_of(
-            &fetch_feed_with_deadline(&http, &cache, batch_args(urls.clone()), DEADLINE).await,
+            &fetch_feed_with_deadline(&http, &cache, batch_args(urls.clone()), COMPOSED_DEADLINE)
+                .await,
         );
         let delivered = generous.feeds.len();
-        // A range, not an equality: admission is timing-derived, and delivering *fewer* would
-        // only mean the deadline bit harder — never a defect. More than one feed getting past a
-        // 25 ms deadline is the whole of Finding 1; `concurrency` is the structural ceiling.
+        // A range, not an equality: delivery is timing-derived, and delivering *fewer* would
+        // only mean the deadline bit harder — never a defect. Two conditions matter, and both
+        // are about what this test is for: >1 so the budget below has a page to trim, and
+        // <10 so the deadline genuinely omitted feeds for the counts to compose.
+        //
+        // Do NOT lower this back to `DEADLINE` — the deadline is now enforced at the per-host
+        // permit, so a 25 ms budget against an 80 ms server delivers exactly one feed and the
+        // budget half of this test stops exercising anything. Pinned by
+        // `core::tests::deadline_is_a_real_wall_clock_bound_for_a_throttled_same_host_batch`.
         assert!(
-            delivered > 1 && delivered <= FetchParams::default().concurrency,
-            "feeds admitted at t≈0 come back regardless of the deadline — it stops feeds that \
-             have not STARTED and cannot touch ones already queued on the per-host permit \
-             (Finding 1's known limitation); expected 2..={}, got {delivered}",
-            FetchParams::default().concurrency
+            delivered > 1 && delivered < urls.len(),
+            "need a multi-feed page that the deadline still trimmed; expected 2..{}, got \
+             {delivered}. If this flakes on a loaded runner, widen COMPOSED_DELAY and \
+             COMPOSED_DEADLINE together — see their docs.",
+            urls.len()
         );
         let full = core::estimate_response_tokens(&generous);
 
         let mut args = batch_args(urls.clone());
         args.max_response_tokens = Some(full / 2);
-        let page = output_of(&fetch_feed_with_deadline(&http, &cache, args, DEADLINE).await);
+        let page =
+            output_of(&fetch_feed_with_deadline(&http, &cache, args, COMPOSED_DEADLINE).await);
 
         assert!(
             page.total_items > 0,

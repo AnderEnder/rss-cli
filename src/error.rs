@@ -45,6 +45,13 @@ pub enum RssError {
         retry_after: Duration,
     },
 
+    /// The batch deadline passed before this fetch could **start** — it never reached the
+    /// origin. Internal by construction: `core::fetch_feeds` maps it to an unattempted feed
+    /// (`truncation.feeds_omitted`), never into `errors[]`, so it does not widen the
+    /// error contract. Unreachable when `FetchParams::deadline` is `None`.
+    #[error("batch deadline passed before {url} was attempted")]
+    DeadlineExceeded { url: String },
+
     #[error("feed parse error: {0}")]
     Parse(String),
 
@@ -81,6 +88,7 @@ impl RssError {
             RssError::Network(_) => "NETWORK_ERROR",
             RssError::Http { .. } => "FEED_FETCH_FAILED",
             RssError::RateLimited { .. } => "RATE_LIMITED",
+            RssError::DeadlineExceeded { .. } => "BATCH_DEADLINE_EXCEEDED",
             RssError::Parse(_) => "FEED_PARSE_FAILED",
             RssError::NotFound(_) => "NOT_FOUND",
             RssError::Cache(_) => "CACHE_ERROR",

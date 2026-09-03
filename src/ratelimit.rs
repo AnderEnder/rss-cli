@@ -49,6 +49,9 @@ const WARM_WINDOW: Duration = Duration::from_secs(120);
 /// **not** the time spent contending for the per-host permit — under `cap = 1` a sibling can
 /// still block on `acquire_owned` for as long as the in-flight holder runs, which is
 /// separately bounded by the reqwest request timeout. Override with `RSS_MAX_GATE_WAIT_SECS`.
+///
+/// A caller that passes a batch deadline gets both waits bounded by it as well; see
+/// [`HostGate::acquire_until`]. That is a *tighter* ceiling layered on top, not a replacement.
 const MAX_GATE_WAIT: Duration = Duration::from_secs(60);
 
 /// Current wall-clock as epoch milliseconds (matches the crate's chrono-based clock).
@@ -154,16 +157,50 @@ impl HostGate {
     /// spacing. Returns the permit guard (released on drop, including on cancellation) or a
     /// [`RssError::RateLimited`] if the required wait exceeds `max_gate_wait`.
     pub async fn acquire(&self, url: &str) -> Result<OwnedSemaphorePermit, RssError> {
+        self.acquire_until(url, None).await
+    }
+
+    /// [`acquire`](Self::acquire) with a hard ceiling: `stop_at` is the batch deadline as an
+    /// absolute instant, and a wait that would cross it yields
+    /// [`RssError::DeadlineExceeded`] instead — the request never starts, so `core` reports
+    /// the feed as unattempted rather than failed.
+    ///
+    /// This is what makes `FetchParams::deadline` a **real** bound rather than a
+    /// start-time-only one. Both of the waits below can outlast it, and under `per_host = 1`
+    /// they routinely do: a batch of same-host feeds all pass `core`'s pre-flight check at
+    /// t≈0, then queue here, where the first `429` sets a cooldown the whole queue serializes
+    /// behind (ADR-0017 recorded this as a known limitation and named this as the fix).
+    ///
+    /// **This adds a fourth bound; it does not merge the existing three.** `max_gate_wait`
+    /// still caps a sibling's pacing wait and `RETRY_MAX_DELAY` still caps one in-flight
+    /// retry — the effective pacing ceiling is now `min(max_gate_wait, stop_at - now)`.
+    /// Collapsing any two of them is the thing to keep avoiding (see CLAUDE.md).
+    ///
+    /// `stop_at: None` is byte-for-byte the old behaviour, which is what keeps the CLI
+    /// path (`deadline: None`) untouched.
+    pub async fn acquire_until(
+        &self,
+        url: &str,
+        stop_at: Option<tokio::time::Instant>,
+    ) -> Result<OwnedSemaphorePermit, RssError> {
         let slot = self.slot_for_url(url);
+        let expired = || RssError::DeadlineExceeded {
+            url: url.to_string(),
+        };
 
         // Concurrency cap. `acquire_owned` yields a permit carrying no borrow, so the guard is
         // `Send` and RAII-released even if the caller's future is dropped mid-flight.
-        let permit = slot
-            .sem
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| RssError::Other("rate-limiter semaphore closed".to_string()))?;
+        //
+        // Unbounded without a deadline: under `per_host = 1` this blocks for as long as the
+        // in-flight holder runs, however many siblings are queued behind it.
+        let acquire = slot.sem.clone().acquire_owned();
+        let permit = match stop_at {
+            Some(t) => tokio::time::timeout_at(t, acquire)
+                .await
+                .map_err(|_| expired())?,
+            None => acquire.await,
+        }
+        .map_err(|_| RssError::Other("rate-limiter semaphore closed".to_string()))?;
 
         // `next_allowed - now` is a non-negative millisecond count; the conversion is total.
         let now = now_ms();
@@ -178,6 +215,12 @@ impl HostGate {
             });
         }
         if !wait.is_zero() {
+            // Sleeping out a cooldown that ends past the deadline would burn the caller's
+            // remaining budget and still deliver nothing. Yield the permit now (RAII) so a
+            // sibling on a *different* deadline can use it.
+            if stop_at.is_some_and(|t| tokio::time::Instant::now() + wait > t) {
+                return Err(expired());
+            }
             tokio::time::sleep(wait).await;
         }
 
@@ -301,6 +344,78 @@ mod tests {
         drop(p1);
         // Once released, it proceeds.
         assert!(fut.await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn deadline_sheds_a_cooldown_instead_of_sleeping_through_it() {
+        let g = gate();
+        // A 30s cooldown: well under `max_gate_wait` (60s), so without a deadline this
+        // acquire would faithfully sleep all 30 seconds.
+        g.note_throttled("https://slow.example.com/a", Some(Duration::from_secs(30)));
+
+        let t0 = now_ms();
+        let r = g
+            .acquire_until(
+                "https://slow.example.com/b",
+                Some(tokio::time::Instant::now() + Duration::from_millis(200)),
+            )
+            .await;
+
+        assert!(
+            matches!(r, Err(RssError::DeadlineExceeded { .. })),
+            "a cooldown ending past the deadline must shed, not sleep; got {r:?}"
+        );
+        // The point of the fix: it returns *now*, not in 30s.
+        assert!(
+            now_ms() - t0 < 1_000,
+            "shedding must be immediate, took {}ms",
+            now_ms() - t0
+        );
+    }
+
+    #[tokio::test]
+    async fn deadline_bounds_the_wait_for_a_held_permit() {
+        let g = gate();
+        // `acquire_owned` under cap=1 is the unbounded wait `max_gate_wait` never covered:
+        // it is bounded only by however long the holder runs.
+        let _held = g.acquire("https://example.com/a").await.unwrap();
+
+        let t0 = now_ms();
+        let r = g
+            .acquire_until(
+                "https://example.com/b",
+                Some(tokio::time::Instant::now() + Duration::from_millis(200)),
+            )
+            .await;
+
+        assert!(
+            matches!(r, Err(RssError::DeadlineExceeded { .. })),
+            "queueing behind a held permit must respect the deadline; got {r:?}"
+        );
+        let elapsed = now_ms() - t0;
+        assert!(
+            (150..2_000).contains(&elapsed),
+            "should wait out the deadline then give up, took {elapsed}ms"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_deadline_still_waits_out_a_cooldown() {
+        // The CLI path (`deadline: None`) must be untouched by the two tests above: a short
+        // cooldown is still honored rather than shed.
+        let g = gate();
+        g.note_throttled(
+            "https://slow.example.com/a",
+            Some(Duration::from_millis(300)),
+        );
+
+        let t0 = now_ms();
+        let r = g.acquire_until("https://slow.example.com/b", None).await;
+        assert!(r.is_ok(), "no deadline must not shed: {r:?}");
+        assert!(
+            now_ms() - t0 >= 200,
+            "the cooldown must still be honored without a deadline"
+        );
     }
 
     #[tokio::test]

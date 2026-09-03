@@ -32,6 +32,15 @@ pub enum CachePolicy {
     CacheFirst,
     /// Ignore the cache entirely (do not read or write it).
     NoCache,
+    /// Like [`CachePolicy::Revalidate`], but when the origin **refuses or fails** the
+    /// revalidation (a `429`/`403`, a `5xx`, a transport error) serve the cached body instead
+    /// of failing the feed — `stale-if-error` per
+    /// [RFC 5861](https://www.rfc-editor.org/rfc/rfc5861#section-4). Opt-in: it is the only
+    /// policy that can produce [`crate::model::FeedStatus::Stale`]. See ADR-0019.
+    ///
+    /// Deliberately *not* `stale-while-revalidate`, which serves stale proactively while
+    /// refreshing in the background. This only reaches for the cache after a real refusal.
+    StaleIfError,
 }
 
 /// How cross-feed duplicates are handled for a fetch (ADR-0018).
@@ -101,11 +110,12 @@ pub struct FetchParams {
     /// `RETRY_MAX_DELAY` bounds one in-flight retry, `MAX_GATE_WAIT` a sibling's pacing wait,
     /// and this one when a fetch may **start**.
     ///
-    /// It therefore does *not* bound a fetch already admitted: the first `concurrency` futures
-    /// all pass the check at t≈0, then queue on the per-host permit where no clock reaches
-    /// them. The real bound is the deadline plus up to `concurrency - 1` admitted fetches
-    /// draining serially, each able to sit out a cooldown (itself capped by `timeout`). Known
-    /// limitation in ADR-0017, with the deeper fix named.
+    /// It is threaded into the per-host gate ([`crate::ratelimit::HostGate::acquire_until`]),
+    /// so a queued sibling is bounded by it too — without that, the first `concurrency`
+    /// futures all pass the start check at t≈0 and then serialize behind a cooldown no clock
+    /// reached, letting the call outlive the caller's timeout entirely and return nothing.
+    /// It still does not interrupt a request already **in flight**; that remains `timeout`'s
+    /// job, so the residual overshoot is one in-flight request plus its bounded retry.
     pub deadline: Option<Duration>,
 }
 
@@ -183,11 +193,12 @@ pub fn parse_cache_policy(s: &str) -> Result<CachePolicy, RssError> {
         "" | "revalidate" => Ok(CachePolicy::Revalidate),
         "no-cache" => Ok(CachePolicy::NoCache),
         "cache-first" => Ok(CachePolicy::CacheFirst),
+        "stale-if-error" => Ok(CachePolicy::StaleIfError),
         other => match other.strip_prefix("max-age:") {
             Some(dur) if !dur.trim().is_empty() => Ok(CachePolicy::MaxAge(parse_duration(dur)?)),
             _ => Err(RssError::Usage(format!(
                 "invalid cache_policy '{s}' (expected revalidate | no-cache | cache-first | \
-                 max-age:<duration>, e.g. max-age:15m)"
+                 stale-if-error | max-age:<duration>, e.g. max-age:15m)"
             ))),
         },
     }

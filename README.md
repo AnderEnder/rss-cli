@@ -116,6 +116,7 @@ Notable flags:
 | `--no-cache` | — | Bypass the cache entirely (no read, no write). |
 | `--max-age <DUR>` | — | Serve from cache without revalidating if the entry is younger than `DUR`. |
 | `--refresh` | — | Force revalidation, ignoring `--max-age`. |
+| `--stale-if-error` | — | Serve the last cached copy when the origin refuses to revalidate (`429`/`403`/`5xx`), instead of failing the feed. |
 | `--user-agent <STRING>` | (tool default) | Override the `User-Agent` header. |
 
 Inputs (positional URLs, `-` for stdin, `--input`, `--opml`) are merged and
@@ -186,14 +187,14 @@ authoritative schema is `rss schema --command fetch`.
 
 ```jsonc
 {
-  "schema_version": "1",
+  "schema_version": "2",
   "fetched_at": "2026-06-01T12:00:00Z",   // when this invocation ran (RFC-3339 UTC)
   "total_items": 1,                        // items across all feeds (after limit/--since)
   "total_content_tokens_est": 7,           // sum of items' content_tokens_est (budget against this)
   "feeds": [
     {
       "feed_url": "https://example.com/feed.xml",
-      "status": "ok",                       // "ok" | "not_modified" | "error"
+      "status": "ok",                       // "ok" | "not_modified" | "stale" | "error"
       "from_cache": false,                  // true when served from a cached body
       "title": "Example Feed",
       "site_url": "https://example.com/",
@@ -274,6 +275,15 @@ To trade freshness for speed, pass `--max-age <DUR>`: if the cached entry is
 younger than `DUR` it is served directly **without any network call**. `--refresh`
 forces revalidation even within `--max-age`, and `--no-cache` ignores the cache
 entirely (no read, no write).
+
+To trade freshness for *availability*, pass `--stale-if-error`: when the origin
+refuses the revalidation (a `429`, `403`, `5xx`, or a transport error) the last
+cached copy is served instead of the feed failing. Those feeds come back as
+`status: "stale"` with a `SERVED_STALE` warning and a non-null
+`cache_age_seconds`, and they count as **success** for the exit code. This is
+opt-in precisely so that the default `rss fetch` keeps exiting non-zero when it
+could not get fresh data — see
+[ADR-0019](docs/adr/0019-stale-if-error-cache-policy.md).
 
 The cache exists only for conditional GETs and for resolving `show` lookups — it is
 **not** what makes item ids stable.
@@ -395,7 +405,11 @@ which means it **cannot be paged** (paging reads the body cache, so a bounded `n
 comes back with `next_cursor: null` — use `revalidate` if the batch may need paging);
 `cache-first`
 serves any cached copy with no network call at all; `max-age:<duration>` does the same but
-only when the cache is younger than that duration. A continuation page (`cursor`) forces
+only when the cache is younger than that duration; `stale-if-error` revalidates like the
+default but falls back to the cached body when the origin **refuses** — a throttled feed comes
+back as `status: "stale"` (with a `SERVED_STALE` warning and a non-null `cache_age_seconds`)
+rather than as an error, which is what you want when sweeping many feeds from one host. It
+pages normally, since it still writes on the success path. A continuation page (`cursor`) forces
 `cache-first` for the whole page, so a feed already cached comes back
 `not_modified`/`from_cache: true` whether or not it actually changed. Each
 `FeedResult` carries `cached_at` and `cache_age_seconds` (both `null` when not served from

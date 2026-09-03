@@ -18,6 +18,10 @@
 //!     (last_modified) from the cache entry if present. On `304`, return the cached body
 //!     with `not_modified = true`, `from_cache = true`. On `200`, store the new body +
 //!     validators (`ETag`, `Last-Modified`) in the cache and return it.
+//!   - `StaleIfError`: like `Revalidate`, but if the origin *refuses* the revalidation
+//!     (`429`/`403`/`5xx`/transport error) and a cached body exists, return it with
+//!     `from_cache = true`, `not_modified = false`, and `stale_reason = Some(..)`. A cache
+//!     miss, or any error that is not an origin refusal, propagates unchanged (ADR-0019).
 //! - On a non-success, non-304 status, return [`RssError::Http`].
 //! - `final_url` is the URL after following redirects (used to resolve relative links).
 
@@ -51,6 +55,11 @@ pub struct RawFeed {
     /// RFC-3339 time the served body was written to cache, when it came from cache.
     /// `None` for a body fetched fresh from the network this call.
     pub cached_at: Option<String>,
+    /// Why this body is stale: the origin refused or failed the revalidation and
+    /// [`CachePolicy::StaleIfError`] fell back to the cache. `None` on every other path.
+    /// `core` turns it into [`crate::model::FeedStatus::Stale`] plus a `SERVED_STALE`
+    /// warning (ADR-0019).
+    pub stale_reason: Option<String>,
 }
 
 /// Reusable HTTP client.
@@ -87,10 +96,26 @@ impl HttpClient {
         cache: &Cache,
         policy: CachePolicy,
     ) -> Result<RawFeed, RssError> {
+        self.fetch_until(url, cache, policy, None).await
+    }
+
+    /// [`fetch`](Self::fetch) bounded by an absolute batch deadline: a fetch that cannot even
+    /// *start* before `stop_at` yields [`RssError::DeadlineExceeded`] from the per-host gate
+    /// rather than queueing behind a cooldown that outlives the caller's timeout. See
+    /// [`HostGate::acquire_until`]. `None` is the unbounded (CLI) behaviour.
+    pub async fn fetch_until(
+        &self,
+        url: &str,
+        cache: &Cache,
+        policy: CachePolicy,
+        stop_at: Option<tokio::time::Instant>,
+    ) -> Result<RawFeed, RssError> {
         match policy {
             // Never touch the cache: a plain GET returning whatever the server sends.
             CachePolicy::NoCache => {
-                let resp = self.gated_send(url, || self.inner.get(url)).await?;
+                let resp = self
+                    .gated_send(url, stop_at, || self.inner.get(url))
+                    .await?;
                 let status = resp.status();
                 let final_url = resp.url().to_string();
                 if !status.is_success() {
@@ -114,6 +139,7 @@ impl HttpClient {
                     not_modified: false,
                     from_cache: false,
                     cached_at: None,
+                    stale_reason: None,
                 })
             }
 
@@ -131,9 +157,10 @@ impl HttpClient {
                         not_modified: true,
                         from_cache: true,
                         cached_at: Some(cached_at),
+                        stale_reason: None,
                     });
                 }
-                self.revalidate(url, cache).await
+                self.revalidate(url, cache, stop_at).await
             }
 
             // Serve the cached body if present, regardless of age — never revalidate.
@@ -149,19 +176,60 @@ impl HttpClient {
                         not_modified: true,
                         from_cache: true,
                         cached_at: Some(cached_at),
+                        stale_reason: None,
                     });
                 }
-                self.revalidate(url, cache).await
+                self.revalidate(url, cache, stop_at).await
             }
 
+            // Revalidate, but let a *refused* revalidation fall back to the cached body
+            // instead of failing the feed (ADR-0019). Opt-in — the only path that can set
+            // `stale_reason`.
+            CachePolicy::StaleIfError => match self.revalidate(url, cache, stop_at).await {
+                Ok(raw) => Ok(raw),
+                // Only an *origin refusal* may be papered over with an old copy; every other
+                // error propagates untouched. See `is_origin_refusal` for why each exclusion
+                // is there.
+                Err(e) if is_origin_refusal(&e) => {
+                    // `.ok().flatten()` deliberately, not `?`: if the cache read itself fails
+                    // the fallback simply did not work, and the caller should see the origin's
+                    // `429` — not a `CACHE_ERROR` that masks what actually happened.
+                    match cache.get(url).ok().flatten() {
+                        Some(entry) => Ok(RawFeed {
+                            body: entry.body,
+                            final_url: url.to_string(),
+                            content_type: entry.meta.content_type,
+                            status: 200,
+                            // Not a `304`: the origin never confirmed this body is current,
+                            // which is exactly what separates stale from `NotModified`.
+                            not_modified: false,
+                            from_cache: true,
+                            cached_at: Some(entry.meta.fetched_at),
+                            stale_reason: Some(e.to_string()),
+                        }),
+                        // No usable cached copy, so there is no stale body to serve and the
+                        // refusal stands rather than becoming an empty success.
+                        None => Err(e),
+                    }
+                }
+                Err(e) => Err(e),
+            },
+
             // Default: conditional GET, letting a `304` reuse the cached body.
-            CachePolicy::Revalidate => self.revalidate(url, cache).await,
+            CachePolicy::Revalidate => self.revalidate(url, cache, stop_at).await,
         }
     }
 
     /// Conditional GET: attach validators from any cache entry, reuse the cached body on a
-    /// `304`, and otherwise store and return the fresh `200` response.
-    async fn revalidate(&self, url: &str, cache: &Cache) -> Result<RawFeed, RssError> {
+    /// `304`, and otherwise store and return the fresh `200` response. `stop_at` bounds only
+    /// the wait to *start* the request (see [`HostGate::acquire_until`]); a cache hit that
+    /// short-circuits before here never consults it.
+    async fn revalidate(
+        &self,
+        url: &str,
+        cache: &Cache,
+        stop_at: Option<tokio::time::Instant>,
+    ) -> Result<RawFeed, RssError> {
         let cached = cache.get(url)?;
 
         let build = || {
@@ -177,7 +245,7 @@ impl HttpClient {
             req
         };
 
-        let resp = self.gated_send(url, build).await?;
+        let resp = self.gated_send(url, stop_at, build).await?;
         let status = resp.status();
         let final_url = resp.url().to_string();
 
@@ -208,6 +276,7 @@ impl HttpClient {
                 not_modified: true,
                 from_cache: true,
                 cached_at: Some(cached_at),
+                stale_reason: None,
             });
         }
 
@@ -246,12 +315,13 @@ impl HttpClient {
             not_modified: false,
             from_cache: false,
             cached_at: None,
+            stale_reason: None,
         })
     }
 
     /// Plain GET returning the raw body (used by `discover` for the homepage HTML).
     pub async fn get_bytes(&self, url: &str) -> Result<(Vec<u8>, String), RssError> {
-        let resp = self.gated_send(url, || self.inner.get(url)).await?;
+        let resp = self.gated_send(url, None, || self.inner.get(url)).await?;
         let status = resp.status();
         let final_url = resp.url().to_string();
         if !status.is_success() {
@@ -294,6 +364,27 @@ fn retry_after_raw(headers: &HeaderMap) -> Option<String> {
 const RETRY_BASE_DELAY: Duration = Duration::from_millis(500);
 const RETRY_MAX_DELAY: Duration = Duration::from_secs(5);
 
+/// Whether an error means *the origin refused or failed to answer* — the only class
+/// [`CachePolicy::StaleIfError`] may paper over with a cached body (ADR-0019).
+///
+/// The exclusions are the point of this function:
+/// - **`Parse`** — the origin *did* answer; a feed that now emits malformed XML is a real
+///   problem the caller should see, not something to hide behind an old copy (ADR-0019 §4).
+///   (It also cannot reach here: parsing happens in `core`, after this layer.)
+/// - **`DeadlineExceeded`** — the fetch never *started*, so the feed is unattempted, not
+///   failed. Serving stale here would convert an omission the caller can resume into a
+///   silently stale page, and would corrupt `feeds_omitted` (invariant 9).
+/// - **`Cache`/`Io`** — the cache itself is the thing that is broken; reading it again is not
+///   a recovery.
+/// - **`Usage`/`InvalidUrl`/`ResponseTooLarge`/`NotFound`/`Other`** — caller or internal
+///   errors, not origin behaviour.
+fn is_origin_refusal(e: &RssError) -> bool {
+    matches!(
+        e,
+        RssError::Http { .. } | RssError::RateLimited { .. } | RssError::Network(_)
+    )
+}
+
 impl HttpClient {
     /// Gate-aware send: acquire the per-host permit (waiting out any active cooldown / sticky
     /// spacing), then send with the single bounded ADR-0015 retry on a transient `403`/`429`.
@@ -303,14 +394,19 @@ impl HttpClient {
     /// itself just set (the two waits are one budget — ADR-0016). Acquiring may instead return
     /// [`RssError::RateLimited`] when a sibling's cooldown would make this request wait past
     /// the gate ceiling.
-    async fn gated_send<F>(&self, url: &str, build: F) -> Result<reqwest::Response, RssError>
+    async fn gated_send<F>(
+        &self,
+        url: &str,
+        stop_at: Option<tokio::time::Instant>,
+        build: F,
+    ) -> Result<reqwest::Response, RssError>
     where
         F: Fn() -> reqwest::RequestBuilder,
     {
         // The gate keys on the *request* URL's host. reqwest follows redirects internally, so
         // a cross-host redirect's throttle is attributed to the origin host, not the final
         // one — acceptable (callers hit one host consistently) and unavoidable pre-send.
-        let _permit = self.gate.acquire(url).await?;
+        let _permit = self.gate.acquire_until(url, stop_at).await?;
 
         let resp = build()
             .send()
@@ -812,5 +908,139 @@ mod tests {
         }
         m.assert_async().await; // exactly 2 attempts: one retry, no more.
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Seed a cached body so a `StaleIfError` test has something stale to fall back to.
+    fn seed(cache: &Cache, url: &str, body: &[u8]) {
+        let meta = CacheMeta {
+            feed_url: url.to_string(),
+            etag: Some("\"seeded\"".to_string()),
+            last_modified: None,
+            fetched_at: "2020-01-01T00:00:00Z".to_string(),
+            content_type: Some("application/rss+xml".to_string()),
+        };
+        cache.put(&meta, body).expect("seed cache");
+    }
+
+    #[tokio::test]
+    async fn stale_if_error_serves_the_cached_body_when_the_origin_refuses() {
+        let mut server = mockito::Server::new_async().await;
+        let dir = temp_cache_dir("stale-429");
+        let cache = Cache::open(Some(dir.clone())).expect("open cache");
+        let url = format!("{}/feed.xml", server.url());
+        seed(&cache, &url, b"<rss>cached</rss>");
+
+        // 429 twice (original + the single ADR-0015 retry), so the revalidation truly fails.
+        let m = server
+            .mock("GET", "/feed.xml")
+            .with_status(429)
+            .expect(2)
+            .create_async()
+            .await;
+
+        let raw = client()
+            .fetch(&url, &cache, CachePolicy::StaleIfError)
+            .await
+            .expect("a refused revalidation with a cached copy must not fail the feed");
+
+        assert_eq!(raw.body, b"<rss>cached</rss>");
+        assert!(raw.from_cache);
+        assert!(
+            !raw.not_modified,
+            "the origin never confirmed this body — that is what separates stale from a 304"
+        );
+        assert!(
+            raw.stale_reason
+                .as_deref()
+                .is_some_and(|r| r.contains("429")),
+            "the staleness reason must name the upstream refusal: {:?}",
+            raw.stale_reason
+        );
+        assert_eq!(raw.cached_at.as_deref(), Some("2020-01-01T00:00:00Z"));
+        m.assert_async().await;
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn stale_if_error_still_fails_when_nothing_is_cached() {
+        let mut server = mockito::Server::new_async().await;
+        let dir = temp_cache_dir("stale-nocache");
+        let cache = Cache::open(Some(dir.clone())).expect("open cache");
+        let url = format!("{}/feed.xml", server.url());
+
+        let m = server
+            .mock("GET", "/feed.xml")
+            .with_status(429)
+            .expect(2)
+            .create_async()
+            .await;
+
+        // No cached copy: there is no stale body to serve, so the refusal must stand rather
+        // than become a silently empty success.
+        let err = client()
+            .fetch(&url, &cache, CachePolicy::StaleIfError)
+            .await
+            .unwrap_err();
+        match err {
+            RssError::Http { status, .. } => assert_eq!(status, 429),
+            other => panic!("expected the original Http error, got {other:?}"),
+        }
+        m.assert_async().await;
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn stale_if_error_is_a_plain_revalidate_when_the_origin_answers() {
+        let mut server = mockito::Server::new_async().await;
+        let dir = temp_cache_dir("stale-happy");
+        let cache = Cache::open(Some(dir.clone())).expect("open cache");
+        let url = format!("{}/feed.xml", server.url());
+        seed(&cache, &url, b"<rss>cached</rss>");
+
+        let m = server
+            .mock("GET", "/feed.xml")
+            .with_status(200)
+            .with_body("<rss>fresh</rss>")
+            .create_async()
+            .await;
+
+        let raw = client()
+            .fetch(&url, &cache, CachePolicy::StaleIfError)
+            .await
+            .expect("a 200 must behave exactly like Revalidate");
+
+        assert_eq!(raw.body, b"<rss>fresh</rss>", "the fresh body wins");
+        assert!(
+            raw.stale_reason.is_none(),
+            "nothing was refused, so nothing is stale"
+        );
+        assert!(!raw.from_cache);
+        m.assert_async().await;
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn only_origin_refusals_may_be_papered_over_with_a_stale_copy() {
+        // The exclusions are the whole safety argument for `StaleIfError` (ADR-0019 §4).
+        assert!(is_origin_refusal(&RssError::Http {
+            status: 429,
+            url: "u".into(),
+            retry_after: None
+        }));
+        assert!(is_origin_refusal(&RssError::RateLimited {
+            url: "u".into(),
+            retry_after: Duration::from_secs(1)
+        }));
+        assert!(is_origin_refusal(&RssError::Network("reset".into())));
+
+        // A body that arrived and failed to parse is a real problem, not a staleness case.
+        assert!(!is_origin_refusal(&RssError::Parse("bad xml".into())));
+        // Never started => unattempted, and must stay resumable via `feeds_omitted`. Serving
+        // stale here would convert an omission into a silently stale page (invariant 9).
+        assert!(!is_origin_refusal(&RssError::DeadlineExceeded {
+            url: "u".into()
+        }));
+        assert!(!is_origin_refusal(&RssError::Cache("disk".into())));
+        assert!(!is_origin_refusal(&RssError::Usage("nope".into())));
     }
 }
