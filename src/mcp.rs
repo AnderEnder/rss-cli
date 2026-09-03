@@ -3378,11 +3378,18 @@ mod tests {
     }
 
     /// The delay a slow-server test serves each response after, and the deadline it pairs with.
-    /// The gap between them is the determinism margin: the first `concurrency` fetches are
-    /// admitted within microseconds (well inside `DEADLINE`), and no later feed can be polled
-    /// until one of them completes — which takes at least `SERVER_DELAY`, well past it.
+    /// The gap between them is the determinism margin: only the fetch holding the per-host
+    /// permit can finish inside `DEADLINE`, and every sibling queued behind it is shed at the
+    /// gate once the deadline passes (`HostGate::acquire_until`), so a page under this pair
+    /// reliably ships a short prefix and reports the rest omitted.
     const SERVER_DELAY: std::time::Duration = std::time::Duration::from_millis(80);
     const DEADLINE: std::time::Duration = std::time::Duration::from_millis(25);
+
+    /// A deadline worth several `SERVER_DELAY`s, for the one test that needs *more than one*
+    /// feed delivered before a budget trims it. Since the deadline became a real bound, feeds
+    /// on one host are delivered serially at roughly `SERVER_DELAY` apart, so the count is
+    /// governed by how many fit — not by how many were admitted at t≈0.
+    const COMPOSED_DEADLINE: std::time::Duration = std::time::Duration::from_millis(300);
 
     #[tokio::test]
     async fn a_page_bounded_by_both_the_deadline_and_the_budget_keeps_both_counts() {
@@ -3398,24 +3405,31 @@ mod tests {
         // Measure the same deadline-bounded page under a generous budget first, so the budget
         // below is a fraction of the page actually being trimmed — not of the whole batch.
         let generous = output_of(
-            &fetch_feed_with_deadline(&http, &cache, batch_args(urls.clone()), DEADLINE).await,
+            &fetch_feed_with_deadline(&http, &cache, batch_args(urls.clone()), COMPOSED_DEADLINE)
+                .await,
         );
         let delivered = generous.feeds.len();
-        // A range, not an equality: admission is timing-derived, and delivering *fewer* would
-        // only mean the deadline bit harder — never a defect. More than one feed getting past a
-        // 25 ms deadline is the whole of Finding 1; `concurrency` is the structural ceiling.
+        // A range, not an equality: delivery is timing-derived, and delivering *fewer* would
+        // only mean the deadline bit harder — never a defect. Two conditions matter, and both
+        // are about what this test is for: >1 so the budget below has a page to trim, and
+        // <10 so the deadline genuinely omitted feeds for the counts to compose.
+        //
+        // Do NOT lower this back to `DEADLINE` — the deadline is now enforced at the per-host
+        // permit, so a 25 ms budget against an 80 ms server delivers exactly one feed and the
+        // budget half of this test stops exercising anything. Pinned by
+        // `core::tests::deadline_is_a_real_wall_clock_bound_for_a_throttled_same_host_batch`.
         assert!(
-            delivered > 1 && delivered <= FetchParams::default().concurrency,
-            "feeds admitted at t≈0 come back regardless of the deadline — it stops feeds that \
-             have not STARTED and cannot touch ones already queued on the per-host permit \
-             (Finding 1's known limitation); expected 2..={}, got {delivered}",
-            FetchParams::default().concurrency
+            delivered > 1 && delivered < urls.len(),
+            "need a multi-feed page that the deadline still trimmed; expected 2..{}, got \
+             {delivered}",
+            urls.len()
         );
         let full = core::estimate_response_tokens(&generous);
 
         let mut args = batch_args(urls.clone());
         args.max_response_tokens = Some(full / 2);
-        let page = output_of(&fetch_feed_with_deadline(&http, &cache, args, DEADLINE).await);
+        let page =
+            output_of(&fetch_feed_with_deadline(&http, &cache, args, COMPOSED_DEADLINE).await);
 
         assert!(
             page.total_items > 0,

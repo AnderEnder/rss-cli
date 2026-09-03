@@ -142,6 +142,16 @@ One core powers both front-ends, so they cannot diverge
   bounds one *in-flight* retry holding its host permit; `HOST_MAX_COOLDOWN`/`MAX_GATE_WAIT`
   (60 s) bound a *sibling's* gate wait; `FetchParams::deadline` bounds when a fetch may
   **start**. Raising the first to match the second blocks siblings behind a retrying request.
+- **`FetchParams::deadline` is enforced *at the gate*, not just before it.**
+  `HostGate::acquire_until` bounds both the permit wait and the cooldown sleep by it, so a
+  same-host batch sheds what it cannot start instead of serializing behind escalating
+  cooldowns. Don't revert it to a pre-flight-only check: with `per_host = 1` all
+  `concurrency` feeds pass a start-time check at t≈0, and the call then runs **~82 s against
+  a 3 s deadline** — past any client tool timeout, which returns *nothing at all*, not even
+  the `feeds_omitted` envelope. This is a fourth, tighter ceiling
+  (`min(MAX_GATE_WAIT, deadline)`), *not* a merge of the three above. Pinned by
+  `core::tests::deadline_is_a_real_wall_clock_bound_for_a_throttled_same_host_batch`
+  (asserts elapsed wall-clock — omission counts alone pass either way).
 - **Never hold the `HostGate` slot-map lock across an `.await`.** `slot_for` locks only to
   insert-and-clone the `Arc<HostSlot>`; all waiting uses the per-slot semaphore.
 - **`fetch_feed`'s `limit` is per feed, not per batch.** Scaling it down by feed count would

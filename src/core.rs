@@ -80,8 +80,13 @@ pub async fn fetch_feeds_with(
             {
                 return (idx, None);
             }
-            match fetch_one(&url, http, params, cache).await {
+            match fetch_one_until(&url, http, params, cache, stop_at).await {
                 Ok((fr, warnings, filtered)) => (idx, Some((fr, warnings, filtered))),
+                // Never reached the origin: the gate refused to start it before the deadline.
+                // Report it exactly as the pre-flight check above does — unattempted, so it
+                // lands in `feeds_omitted` and stays resumable, not a fabricated failure in
+                // `errors[]`.
+                Err(RssError::DeadlineExceeded { .. }) => (idx, None),
                 Err(e) => (
                     idx,
                     Some((
@@ -381,7 +386,22 @@ pub async fn fetch_one(
     params: &FetchParams,
     cache: &Cache,
 ) -> Result<(FeedResult, Vec<Warning>, usize), RssError> {
-    let raw = http.fetch(url, cache, params.cache_policy).await?;
+    fetch_one_until(url, http, params, cache, None).await
+}
+
+/// [`fetch_one`] bounded by an absolute batch deadline. A feed that cannot start before
+/// `stop_at` returns [`RssError::DeadlineExceeded`], which [`fetch_feeds`] turns into an
+/// *unattempted* feed rather than a failed one. `None` is the unbounded (CLI) behaviour.
+pub async fn fetch_one_until(
+    url: &str,
+    http: &HttpClient,
+    params: &FetchParams,
+    cache: &Cache,
+    stop_at: Option<tokio::time::Instant>,
+) -> Result<(FeedResult, Vec<Warning>, usize), RssError> {
+    let raw = http
+        .fetch_until(url, cache, params.cache_policy, stop_at)
+        .await?;
     let parsed = parse::parse_feed(&raw.body, url, params)?;
     let item_count = parsed.items.len();
     let content_tokens_est_total = parsed
@@ -1243,6 +1263,71 @@ mod tests {
             "the stale item since dropped must be counted end-to-end, not left at 0"
         );
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn deadline_is_a_real_wall_clock_bound_for_a_throttled_same_host_batch() {
+        // The failure this pins: a batch of same-host feeds that all pass the *start* check at
+        // t≈0, then serialize behind the cooldown the first `429` sets. Bounding only the
+        // start time let the call run far past the deadline and blow the caller's tool
+        // timeout, which returns **nothing** — no partial page, no per-feed statuses.
+        //
+        // `expired_deadline_attempts_nothing_and_reports_every_feed` cannot catch this: its
+        // `Duration::ZERO` short-circuits at the pre-flight check and never reaches the gate.
+        // The assertion that matters here is elapsed wall-clock, not just that omission is
+        // reported.
+        let mut server = mockito::Server::new_async().await;
+        let m = server
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(429) // no Retry-After: escalating default cooldown (2s, 4s, 8s…)
+            .expect_at_least(1)
+            .create_async()
+            .await;
+
+        let dir = std::env::temp_dir().join(format!("rss-hard-deadline-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache = Cache::open(Some(dir.clone())).unwrap();
+        let http = crate::fetch::HttpClient::new("t", std::time::Duration::from_secs(5)).unwrap();
+
+        // One authority, so `per_host = 1` serializes all four behind a single permit.
+        let urls: Vec<String> = (0..4)
+            .map(|i| format!("{}/f{i}.xml", server.url()))
+            .collect();
+        let deadline = std::time::Duration::from_secs(3);
+        let params = FetchParams {
+            deadline: Some(deadline),
+            cache_policy: CachePolicy::NoCache,
+            ..Default::default()
+        };
+
+        let t0 = std::time::Instant::now();
+        let out = fetch_feeds_with(&urls, &params, &cache, &http).await;
+        let elapsed = t0.elapsed();
+
+        assert!(
+            elapsed < deadline,
+            "the deadline must actually bound the call; took {elapsed:?} against a {deadline:?} \
+             budget (unbounded, the siblings sleep out 4s + 8s + … of cooldown serially)"
+        );
+        let omitted = out
+            .truncation
+            .as_ref()
+            .map(|t| t.feeds_omitted)
+            .unwrap_or(0);
+        assert!(
+            omitted >= 3,
+            "the feeds that never started must be reported as omitted, got {omitted}"
+        );
+        // No gap: whatever shipped is a contiguous prefix, and everything is accounted for
+        // (invariant 9) — the cursor indexes into this same list.
+        assert_eq!(
+            out.feeds.len() + omitted,
+            urls.len(),
+            "every requested feed must be either shipped or reported omitted"
+        );
+
+        drop(m);
         std::fs::remove_dir_all(&dir).ok();
     }
 

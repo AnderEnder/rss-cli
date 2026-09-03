@@ -87,10 +87,26 @@ impl HttpClient {
         cache: &Cache,
         policy: CachePolicy,
     ) -> Result<RawFeed, RssError> {
+        self.fetch_until(url, cache, policy, None).await
+    }
+
+    /// [`fetch`](Self::fetch) bounded by an absolute batch deadline: a fetch that cannot even
+    /// *start* before `stop_at` yields [`RssError::DeadlineExceeded`] from the per-host gate
+    /// rather than queueing behind a cooldown that outlives the caller's timeout. See
+    /// [`HostGate::acquire_until`]. `None` is the unbounded (CLI) behaviour.
+    pub async fn fetch_until(
+        &self,
+        url: &str,
+        cache: &Cache,
+        policy: CachePolicy,
+        stop_at: Option<tokio::time::Instant>,
+    ) -> Result<RawFeed, RssError> {
         match policy {
             // Never touch the cache: a plain GET returning whatever the server sends.
             CachePolicy::NoCache => {
-                let resp = self.gated_send(url, || self.inner.get(url)).await?;
+                let resp = self
+                    .gated_send(url, stop_at, || self.inner.get(url))
+                    .await?;
                 let status = resp.status();
                 let final_url = resp.url().to_string();
                 if !status.is_success() {
@@ -133,7 +149,7 @@ impl HttpClient {
                         cached_at: Some(cached_at),
                     });
                 }
-                self.revalidate(url, cache).await
+                self.revalidate(url, cache, stop_at).await
             }
 
             // Serve the cached body if present, regardless of age — never revalidate.
@@ -151,17 +167,24 @@ impl HttpClient {
                         cached_at: Some(cached_at),
                     });
                 }
-                self.revalidate(url, cache).await
+                self.revalidate(url, cache, stop_at).await
             }
 
             // Default: conditional GET, letting a `304` reuse the cached body.
-            CachePolicy::Revalidate => self.revalidate(url, cache).await,
+            CachePolicy::Revalidate => self.revalidate(url, cache, stop_at).await,
         }
     }
 
     /// Conditional GET: attach validators from any cache entry, reuse the cached body on a
-    /// `304`, and otherwise store and return the fresh `200` response.
-    async fn revalidate(&self, url: &str, cache: &Cache) -> Result<RawFeed, RssError> {
+    /// `304`, and otherwise store and return the fresh `200` response. `stop_at` bounds only
+    /// the wait to *start* the request (see [`HostGate::acquire_until`]); a cache hit that
+    /// short-circuits before here never consults it.
+    async fn revalidate(
+        &self,
+        url: &str,
+        cache: &Cache,
+        stop_at: Option<tokio::time::Instant>,
+    ) -> Result<RawFeed, RssError> {
         let cached = cache.get(url)?;
 
         let build = || {
@@ -177,7 +200,7 @@ impl HttpClient {
             req
         };
 
-        let resp = self.gated_send(url, build).await?;
+        let resp = self.gated_send(url, stop_at, build).await?;
         let status = resp.status();
         let final_url = resp.url().to_string();
 
@@ -251,7 +274,7 @@ impl HttpClient {
 
     /// Plain GET returning the raw body (used by `discover` for the homepage HTML).
     pub async fn get_bytes(&self, url: &str) -> Result<(Vec<u8>, String), RssError> {
-        let resp = self.gated_send(url, || self.inner.get(url)).await?;
+        let resp = self.gated_send(url, None, || self.inner.get(url)).await?;
         let status = resp.status();
         let final_url = resp.url().to_string();
         if !status.is_success() {
@@ -303,14 +326,19 @@ impl HttpClient {
     /// itself just set (the two waits are one budget — ADR-0016). Acquiring may instead return
     /// [`RssError::RateLimited`] when a sibling's cooldown would make this request wait past
     /// the gate ceiling.
-    async fn gated_send<F>(&self, url: &str, build: F) -> Result<reqwest::Response, RssError>
+    async fn gated_send<F>(
+        &self,
+        url: &str,
+        stop_at: Option<tokio::time::Instant>,
+        build: F,
+    ) -> Result<reqwest::Response, RssError>
     where
         F: Fn() -> reqwest::RequestBuilder,
     {
         // The gate keys on the *request* URL's host. reqwest follows redirects internally, so
         // a cross-host redirect's throttle is attributed to the origin host, not the final
         // one — acceptable (callers hit one host consistently) and unavoidable pre-send.
-        let _permit = self.gate.acquire(url).await?;
+        let _permit = self.gate.acquire_until(url, stop_at).await?;
 
         let resp = build()
             .send()

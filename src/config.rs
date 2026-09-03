@@ -101,11 +101,12 @@ pub struct FetchParams {
     /// `RETRY_MAX_DELAY` bounds one in-flight retry, `MAX_GATE_WAIT` a sibling's pacing wait,
     /// and this one when a fetch may **start**.
     ///
-    /// It therefore does *not* bound a fetch already admitted: the first `concurrency` futures
-    /// all pass the check at t≈0, then queue on the per-host permit where no clock reaches
-    /// them. The real bound is the deadline plus up to `concurrency - 1` admitted fetches
-    /// draining serially, each able to sit out a cooldown (itself capped by `timeout`). Known
-    /// limitation in ADR-0017, with the deeper fix named.
+    /// It is threaded into the per-host gate ([`crate::ratelimit::HostGate::acquire_until`]),
+    /// so a queued sibling is bounded by it too — without that, the first `concurrency`
+    /// futures all pass the start check at t≈0 and then serialize behind a cooldown no clock
+    /// reached, letting the call outlive the caller's timeout entirely and return nothing.
+    /// It still does not interrupt a request already **in flight**; that remains `timeout`'s
+    /// job, so the residual overshoot is one in-flight request plus its bounded retry.
     pub deadline: Option<Duration>,
 }
 
