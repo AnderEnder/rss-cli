@@ -433,8 +433,9 @@ struct FetchFeedArgs {
     /// prefer one batched call over several calls with your own delays between them.
     #[serde(default, deserialize_with = "de_lenient_url_list")]
     urls: Option<Vec<String>>,
-    /// Content extraction format: `markdown` (default), `text`, `html`, or `none`.
+    /// Content extraction format. Defaults to `markdown`.
     #[serde(default)]
+    #[schemars(extend("enum" = ["markdown", "text", "html", "none", null]))]
     content_format: Option<String>,
     /// Only include items published at or after this time: a duration (`2h`, `7d`) or an
     /// ISO-8601 date/datetime (`2026-06-01`). Applied before `limit`.
@@ -442,17 +443,22 @@ struct FetchFeedArgs {
     since: Option<String>,
     /// Keyword filter over each item's title, summary, and content. Space-separated terms
     /// are AND-ed, `"quoted phrases"` match as a unit, `-term` excludes. Applied before
-    /// `limit`, so `limit` means "N matching items". A plain `Option<String>` is fine here
-    /// (unlike the numeric fields below): MCP clients that stringify every argument already
-    /// send a string for this one.
+    /// `limit`, so `limit` means "N matching items".
+    //
+    // A plain `Option<String>` needs no `de_lenient_*` helper, unlike the numeric fields:
+    // clients that stringify every argument already send a string for this one. Kept as a
+    // non-doc comment deliberately — it is crate-internal reasoning, and a doc comment here
+    // ships in the generated `inputSchema` to every client on every session.
     #[serde(default)]
     query: Option<String>,
     /// Cross-feed duplicate handling: `report` (the default — group repeated entries in
     /// `duplicates[]` and change nothing else), `off` (skip detection), or `drop` (also remove
     /// the later copies, which lowers each feed's `item_count`). `drop` cannot be combined
-    /// with `cursor`. A plain `Option<String>` for the same reason as `query`: clients that
-    /// stringify every argument already send a string for this one.
+    /// with `cursor`.
+    //
+    // Plain `Option<String>` for the same reason as `query`; see the note there.
     #[serde(default)]
+    #[schemars(extend("enum" = ["report", "off", "drop", null]))]
     dedupe: Option<String>,
     /// Maximum number of items to return (most recent first). Omit to use the default cap
     /// of 25; pass a larger number to fetch more (subject to the response budget).
@@ -472,7 +478,17 @@ struct FetchFeedArgs {
     /// (always refetch), `cache-first` (serve any cached copy without a network call), or
     /// `max-age:<duration>` (serve cache younger than e.g. `15m`). Ignored on a continuation
     /// call (see `cursor`), which is always served cache-first.
+    //
+    // A `pattern`, not an `enum`: `max-age:<duration>` is open-ended, so a closed member list
+    // would advertise it as invalid. `config::parse_cache_policy` stays deliberately more
+    // lenient than this (blank, mixed case, surrounding whitespace) — advertise the canonical
+    // grammar, accept sloppy input.
+    //
+    // Kept to plain ECMA-262: JSON Schema `pattern` has no inline-flag syntax, so an `(?i)`
+    // prefix is not case-insensitivity here — it is a literal that makes the regex match
+    // nothing in a strict validator.
     #[serde(default)]
+    #[schemars(extend("pattern" = r"^(revalidate|no-cache|cache-first|max-age:\S+)$"))]
     cache_policy: Option<String>,
     /// Opaque continuation token from a prior response's `truncation.next_cursor`. Pass it
     /// back with the SAME arguments to get the next page. Continuation pages resume
@@ -508,7 +524,8 @@ struct GetItemArgs {
 /// Arguments for the `get_schema` tool.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct GetSchemaArgs {
-    /// Which command's output schema to return: `fetch` or `discover`.
+    /// Which command's output schema to return.
+    #[schemars(extend("enum" = ["fetch", "discover"]))]
     command: String,
 }
 
@@ -1864,6 +1881,115 @@ mod tests {
             "get_schema does not touch the network"
         );
         assert!(get_schema.output_schema.is_none());
+    }
+
+    #[test]
+    fn enumerated_args_advertise_their_values_and_the_parsers_accept_every_one() {
+        // The prose used to be the *only* place the legal values lived, so a client whose
+        // tool-listing truncates long descriptions could not discover them. These constraints
+        // put them in the schema itself — and this test pins the half that actually matters:
+        // everything advertised must round-trip through the shared parser. A schema that
+        // promises a value `config` rejects is worse than no schema.
+        let tools = RssServer::tool_router().list_all();
+        let props = |tool: &str| {
+            tools
+                .iter()
+                .find(|t| t.name == tool)
+                .unwrap_or_else(|| panic!("{tool} registered"))
+                .input_schema
+                .get("properties")
+                .and_then(|p| p.as_object())
+                .cloned()
+                .unwrap_or_else(|| panic!("{tool} has properties"))
+        };
+        let fetch = props("fetch_feed");
+
+        let members = |schema: &serde_json::Value| -> Vec<String> {
+            schema
+                .get("enum")
+                .and_then(|e| e.as_array())
+                .unwrap_or_else(|| panic!("expected an enum in {schema}"))
+                .iter()
+                .filter(|v| !v.is_null()) // `null` is the "argument omitted" member
+                .map(|v| v.as_str().expect("enum members are strings").to_string())
+                .collect()
+        };
+
+        let formats = members(&fetch["content_format"]);
+        assert_eq!(formats, ["markdown", "text", "html", "none"]);
+        for f in &formats {
+            assert!(
+                parse_content_format(f).is_some(),
+                "content_format `{f}` is advertised but rejected by the parser"
+            );
+        }
+
+        let modes = members(&fetch["dedupe"]);
+        assert_eq!(modes, ["report", "off", "drop"]);
+        for m in &modes {
+            assert!(
+                crate::config::parse_dedupe(m).is_ok(),
+                "dedupe `{m}` is advertised but rejected by the parser"
+            );
+        }
+
+        let commands = members(&props("get_schema")["command"]);
+        assert_eq!(commands, ["fetch", "discover"]);
+        for c in &commands {
+            assert!(
+                !crate::output::schema_for(c).is_null(),
+                "get_schema command `{c}` is advertised but has no schema"
+            );
+        }
+
+        // `cache_policy` is a `pattern`, not an `enum`, because `max-age:<duration>` is
+        // open-ended. Assert the literal so a rewrite has to come back through this test —
+        // JSON Schema `pattern` is ECMA-262, which has no inline-flag syntax, so an `(?i)`
+        // would be a literal that matches nothing rather than a case-insensitivity switch.
+        let pattern = fetch["cache_policy"]["pattern"]
+            .as_str()
+            .expect("cache_policy advertises a pattern");
+        assert_eq!(
+            pattern, r"^(revalidate|no-cache|cache-first|max-age:\S+)$",
+            "keep this plain ECMA-262"
+        );
+        assert!(
+            !pattern.contains("(?"),
+            "no inline flags in a JSON Schema pattern"
+        );
+        for p in ["revalidate", "no-cache", "cache-first", "max-age:15m"] {
+            assert!(
+                crate::config::parse_cache_policy(p).is_ok(),
+                "cache_policy `{p}` matches the advertised pattern but the parser rejects it"
+            );
+        }
+    }
+
+    #[test]
+    fn arg_descriptions_carry_no_crate_internal_reasoning() {
+        // Every `inputSchema` description ships to every client on every session, so notes
+        // about Rust types are pure token cost to the reader who cannot act on them (the same
+        // rule CLAUDE.md states for `model.rs`). Two of these leaked `Option<String>` rationale.
+        let tools = RssServer::tool_router().list_all();
+        for t in &tools {
+            let Some(props) = t.input_schema.get("properties").and_then(|p| p.as_object()) else {
+                continue;
+            };
+            for (name, schema) in props {
+                let Some(desc) = schema.get("description").and_then(|d| d.as_str()) else {
+                    continue;
+                };
+                for leak in ["Option<", "Vec<", "usize", "&str", "serde", "de_lenient"] {
+                    assert!(
+                        !desc.contains(leak),
+                        "{}.{name} description leaks the crate-internal token `{leak}`: \
+                         put it in a `//` comment instead — a doc comment here is billed to \
+                         every client, every session.\n{desc}",
+                        t.name
+                    );
+                }
+            }
+        }
     }
 
     #[test]
