@@ -42,7 +42,9 @@ fn fetch_json_produces_valid_structured_output() {
     let v: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("fetch --format json should be valid JSON");
 
-    assert_eq!(v["schema_version"], "1");
+    // Hardcoded on purpose: a bump must be a deliberate edit here, not something a change to
+    // `model.rs` can do silently. "2" is ADR-0019's `FeedStatus::Stale` (invariant 1).
+    assert_eq!(v["schema_version"], "2");
     assert!(v["fetched_at"].as_str().is_some_and(looks_iso8601));
 
     let feeds = v["feeds"].as_array().expect("feeds is an array");

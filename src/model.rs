@@ -9,7 +9,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// Output schema version. Bump on any breaking change to these structs.
-pub const SCHEMA_VERSION: &str = "1";
+pub const SCHEMA_VERSION: &str = "2";
 
 /// Top-level result of `rss fetch`.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -197,6 +197,11 @@ pub enum FeedStatus {
     NotModified,
     /// The feed failed to fetch or parse; see `error`.
     Error,
+    /// The origin refused or failed the revalidation, so `items` come from the cached body.
+    /// Only reachable under `cache_policy: "stale-if-error"`. `error` stays `null` (the items
+    /// are real); the refusal is reported as a `SERVED_STALE` warning, and
+    /// `cache_age_seconds` gives the age. Counts as success for exit codes.
+    Stale,
 }
 
 /// Per-feed result.

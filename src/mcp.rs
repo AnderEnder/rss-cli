@@ -475,9 +475,15 @@ struct FetchFeedArgs {
     max_response_tokens: Option<usize>,
     /// Cache behavior: `revalidate` (default — re-checks with cached validators, cheap when
     /// unchanged, but a cold cache or a validator-less origin gets a full fetch), `no-cache`
-    /// (always refetch), `cache-first` (serve any cached copy without a network call), or
-    /// `max-age:<duration>` (serve cache younger than e.g. `15m`). Ignored on a continuation
-    /// call (see `cursor`), which is always served cache-first.
+    /// (always refetch), `cache-first` (serve any cached copy without a network call),
+    /// `stale-if-error` (revalidate, but serve the last cached copy when the origin refuses —
+    /// a rate-limited feed comes back as `status: "stale"` with a `SERVED_STALE` warning
+    /// instead of failing), or `max-age:<duration>` (serve cache younger than e.g. `15m`).
+    /// Ignored on a continuation call (see `cursor`), which is always served cache-first.
+    ///
+    /// Prefer `stale-if-error` when fetching many feeds from one host (e.g. several Reddit
+    /// subreddits): it turns the feeds that get throttled into slightly-old ones rather than
+    /// dropped ones.
     //
     // A `pattern`, not an `enum`: `max-age:<duration>` is open-ended, so a closed member list
     // would advertise it as invalid. `config::parse_cache_policy` stays deliberately more
@@ -488,7 +494,9 @@ struct FetchFeedArgs {
     // prefix is not case-insensitivity here — it is a literal that makes the regex match
     // nothing in a strict validator.
     #[serde(default)]
-    #[schemars(extend("pattern" = r"^(revalidate|no-cache|cache-first|max-age:\S+)$"))]
+    #[schemars(extend(
+        "pattern" = r"^(revalidate|no-cache|cache-first|stale-if-error|max-age:\S+)$"
+    ))]
     cache_policy: Option<String>,
     /// Opaque continuation token from a prior response's `truncation.next_cursor`. Pass it
     /// back with the SAME arguments to get the next page. Continuation pages resume
@@ -1950,14 +1958,20 @@ mod tests {
             .as_str()
             .expect("cache_policy advertises a pattern");
         assert_eq!(
-            pattern, r"^(revalidate|no-cache|cache-first|max-age:\S+)$",
+            pattern, r"^(revalidate|no-cache|cache-first|stale-if-error|max-age:\S+)$",
             "keep this plain ECMA-262"
         );
         assert!(
             !pattern.contains("(?"),
             "no inline flags in a JSON Schema pattern"
         );
-        for p in ["revalidate", "no-cache", "cache-first", "max-age:15m"] {
+        for p in [
+            "revalidate",
+            "no-cache",
+            "cache-first",
+            "stale-if-error",
+            "max-age:15m",
+        ] {
             assert!(
                 crate::config::parse_cache_policy(p).is_ok(),
                 "cache_policy `{p}` matches the advertised pattern but the parser rejects it"

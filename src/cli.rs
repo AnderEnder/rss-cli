@@ -177,6 +177,12 @@ pub struct FetchArgs {
     #[arg(long, conflicts_with = "no_cache")]
     pub refresh: bool,
 
+    /// Serve the last cached copy when the origin refuses to revalidate (`429`/`403`/`5xx`
+    /// or a transport error) instead of failing the feed. Those feeds come back with
+    /// `status: "stale"`, a `SERVED_STALE` warning, and count as success for the exit code.
+    #[arg(long, conflicts_with_all = ["no_cache", "max_age"])]
+    pub stale_if_error: bool,
+
     /// Override the User-Agent header.
     #[arg(long, value_name = "STRING")]
     pub user_agent: Option<String>,
@@ -189,6 +195,10 @@ impl FetchArgs {
             Ok(CachePolicy::NoCache)
         } else if let Some(ma) = &self.max_age {
             Ok(CachePolicy::MaxAge(parse_duration(ma)?))
+        } else if self.stale_if_error {
+            // Compatible with `--refresh`: both revalidate, and this only changes what
+            // happens when that revalidation is refused.
+            Ok(CachePolicy::StaleIfError)
         } else {
             // `--refresh` and the default both revalidate.
             Ok(CachePolicy::Revalidate)

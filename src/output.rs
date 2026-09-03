@@ -33,6 +33,7 @@ fn status_label(status: FeedStatus) -> &'static str {
         FeedStatus::Ok => "ok",
         FeedStatus::NotModified => "not_modified",
         FeedStatus::Error => "error",
+        FeedStatus::Stale => "stale",
     }
 }
 

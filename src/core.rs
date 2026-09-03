@@ -422,7 +422,11 @@ pub async fn fetch_one_until(
     });
     let fr = FeedResult {
         feed_url: url.to_string(),
-        status: if raw.not_modified {
+        // Order matters: a stale body is served with `not_modified: false` (the origin never
+        // confirmed it), so `Stale` must be tested before the `304` case, not after.
+        status: if raw.stale_reason.is_some() {
+            FeedStatus::Stale
+        } else if raw.not_modified {
             FeedStatus::NotModified
         } else {
             FeedStatus::Ok
@@ -438,7 +442,24 @@ pub async fn fetch_one_until(
         cached_at,
         cache_age_seconds,
     };
-    Ok((fr, parsed.warnings, parsed.items_filtered_out))
+    let mut warnings = parsed.warnings;
+    // `error` stays `null` on a stale feed — the items are real, and the obvious consumer
+    // idiom `if (feed.error) skip(feed)` would otherwise discard a usable feed. The refusal
+    // rides here instead, and `cache_age_seconds` (already set above) carries the age, so no
+    // new `FeedResult` field is needed. ADR-0019 §3.
+    if let Some(reason) = &raw.stale_reason {
+        let age = fr
+            .cache_age_seconds
+            .map_or_else(|| "unknown".to_string(), |s| format!("{s}s"));
+        warnings.push(Warning {
+            feed_url: Some(url.to_string()),
+            code: "SERVED_STALE".to_string(),
+            message: format!(
+                "origin refused revalidation ({reason}); served the cached copy, {age} old"
+            ),
+        });
+    }
+    Ok((fr, warnings, parsed.items_filtered_out))
 }
 
 /// Discover feeds advertised on a website homepage, through a **caller-provided** client.
@@ -1328,6 +1349,119 @@ mod tests {
         );
 
         drop(m);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn stale_if_error_reports_stale_without_an_error_and_scores_as_success() {
+        // ADR-0019 end-to-end through `core`: the shape a consumer actually sees.
+        let mut server = mockito::Server::new_async().await;
+        let dir = std::env::temp_dir().join(format!("rss-stale-core-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache = Cache::open(Some(dir.clone())).unwrap();
+        let url = format!("{}/feed.xml", server.url());
+
+        let meta = crate::cache::CacheMeta {
+            feed_url: url.clone(),
+            etag: None,
+            last_modified: None,
+            fetched_at: "2020-01-01T00:00:00Z".to_string(),
+            content_type: Some("application/rss+xml".to_string()),
+        };
+        cache.put(&meta, BODY.as_bytes()).expect("seed");
+
+        let m = server
+            .mock("GET", "/feed.xml")
+            .with_status(429)
+            .expect(2) // original + the single bounded retry
+            .create_async()
+            .await;
+
+        let http = crate::fetch::HttpClient::new("t", std::time::Duration::from_secs(5)).unwrap();
+        let params = FetchParams {
+            cache_policy: CachePolicy::StaleIfError,
+            ..Default::default()
+        };
+        let out = fetch_feeds_with(std::slice::from_ref(&url), &params, &cache, &http).await;
+
+        let feed = &out.feeds[0];
+        assert_eq!(feed.status, FeedStatus::Stale);
+        assert!(feed.from_cache);
+        assert!(
+            !feed.items.is_empty(),
+            "a stale feed carries real items — that is the entire point"
+        );
+        // The footgun this shape exists to avoid: `if (feed.error) skip(feed)` must not
+        // discard a usable feed (ADR-0019 §3).
+        assert!(
+            feed.error.is_none(),
+            "error must stay null on a stale feed: {:?}",
+            feed.error
+        );
+        assert!(
+            feed.cache_age_seconds.is_some(),
+            "the caller needs the age to enforce its own freshness floor"
+        );
+        let stale_warning = out
+            .warnings
+            .iter()
+            .find(|w| w.code == "SERVED_STALE")
+            .expect("the refused revalidation must be reported somewhere");
+        assert_eq!(stale_warning.feed_url.as_deref(), Some(url.as_str()));
+        assert!(
+            stale_warning.message.contains("429"),
+            "the warning must name the upstream refusal: {}",
+            stale_warning.message
+        );
+        // Not an error => success. A stale-only batch exits 0, reachable only by opting in.
+        assert_eq!(exit_code_for(&out), crate::error::exit::OK);
+        assert!(out.errors.is_empty());
+
+        m.assert_async().await;
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn the_default_policy_still_fails_a_throttled_feed() {
+        // The regression guard for invariant 5. Had stale-serving been the default, this batch
+        // would have flipped from ALL_FAILED to OK and silently broken every script that reads
+        // `rss fetch`'s exit code to detect "could not get fresh data".
+        let mut server = mockito::Server::new_async().await;
+        let dir = std::env::temp_dir().join(format!("rss-nostale-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache = Cache::open(Some(dir.clone())).unwrap();
+        let url = format!("{}/feed.xml", server.url());
+
+        // A cached copy IS available — the default policy must decline to use it anyway.
+        let meta = crate::cache::CacheMeta {
+            feed_url: url.clone(),
+            etag: None,
+            last_modified: None,
+            fetched_at: "2020-01-01T00:00:00Z".to_string(),
+            content_type: Some("application/rss+xml".to_string()),
+        };
+        cache.put(&meta, BODY.as_bytes()).expect("seed");
+
+        let m = server
+            .mock("GET", "/feed.xml")
+            .with_status(429)
+            .expect(2)
+            .create_async()
+            .await;
+
+        let http = crate::fetch::HttpClient::new("t", std::time::Duration::from_secs(5)).unwrap();
+        let params = FetchParams::default(); // Revalidate
+        let out = fetch_feeds_with(std::slice::from_ref(&url), &params, &cache, &http).await;
+
+        assert_eq!(out.feeds[0].status, FeedStatus::Error);
+        assert!(out.feeds[0].error.is_some());
+        assert_eq!(exit_code_for(&out), crate::error::exit::ALL_FAILED);
+        assert!(
+            !out.warnings.iter().any(|w| w.code == "SERVED_STALE"),
+            "nothing was served stale under the default policy"
+        );
+
+        m.assert_async().await;
         std::fs::remove_dir_all(&dir).ok();
     }
 

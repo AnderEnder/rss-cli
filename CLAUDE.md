@@ -78,7 +78,12 @@ One core powers both front-ends, so they cannot diverge
    `a86aced5664c7742`) locks the byte layout — changing `item_id` changes a public contract.
 5. **Exit codes are a contract:** `0` ok · `1` unexpected · `2` usage · `3` partial · `4`
    all-failed. Defined in `error.rs::exit`, mapped in `main.rs`. They key on feed **errors**,
-   never on item counts (a feed emptied by `--dedupe drop` is still exit 0).
+   never on item counts (a feed emptied by `--dedupe drop` is still exit 0). `FeedStatus::Stale`
+   is *not* an error, so a stale-only batch is exit 0 — reachable only by opting into
+   `stale-if-error`, which is exactly why that policy is opt-in
+   ([ADR-0019](./docs/adr/0019-stale-if-error-cache-policy.md)). Making it the default would
+   silently turn a rate-limited `rss fetch` from exit 4 into exit 0. Pinned by
+   `core::tests::the_default_policy_still_fails_a_throttled_feed`.
 6. **CLI and MCP share `core.rs`.** Add behavior to the core; don't fork it into a front-end.
 7. **MCP responses are size-bounded and *fill* rather than reject.** An over-budget batch ships
    what fits plus `truncation.next_cursor`. `RESPONSE_TOO_LARGE` fires only when not even one
@@ -109,7 +114,16 @@ One core powers both front-ends, so they cannot diverge
       the fingerprint stamped `"drop"`, and nothing could ever redeem that token.
     - `cache_policy: "no-cache"` — it writes nothing, so the next page would resume against
       some earlier call's snapshot.
-13. **Dedup reports by default; only `drop` removes.** `duplicates[]` groups on `guid` → `url`
+13. **Serving stale is opt-in, and `error` stays `null` when it happens.** Only
+    `cache_policy: "stale-if-error"` can produce `FeedStatus::Stale`, and only an *origin
+    refusal* (`Http`/`RateLimited`/`Network`) qualifies — `fetch::is_origin_refusal` is the
+    single place that list lives. A parse failure still errors (the origin answered), and
+    `DeadlineExceeded` must never go stale or it would turn a resumable omission into a
+    silently stale page. A stale feed carries real items, so `error` stays `null` and the
+    reason rides in `warnings[]` as `SERVED_STALE`: overloading `error` would make
+    `if (feed.error) skip(feed)` discard a usable feed. Age needs no new field —
+    `cache_age_seconds` already exists. (ADR-0019)
+14. **Dedup reports by default; only `drop` removes.** `duplicates[]` groups on `guid` → `url`
     → `content_hash` and leaves `feeds[]`, order, and `item_count` untouched. Grouping runs
     *before* `paginate` (the budget must measure what ships), so on a paged response
     `duplicates[]` describes that page's fetch only.
