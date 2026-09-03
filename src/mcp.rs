@@ -3525,11 +3525,22 @@ mod tests {
     const SERVER_DELAY: std::time::Duration = std::time::Duration::from_millis(80);
     const DEADLINE: std::time::Duration = std::time::Duration::from_millis(25);
 
-    /// A deadline worth several `SERVER_DELAY`s, for the one test that needs *more than one*
-    /// feed delivered before a budget trims it. Since the deadline became a real bound, feeds
-    /// on one host are delivered serially at roughly `SERVER_DELAY` apart, so the count is
-    /// governed by how many fit — not by how many were admitted at t≈0.
-    const COMPOSED_DEADLINE: std::time::Duration = std::time::Duration::from_millis(300);
+    /// The one test that needs *more than one* feed delivered before a budget trims it uses
+    /// its own, slower server and a proportionally longer deadline. Since the deadline became
+    /// a real bound, same-host feeds arrive serially about one response-delay apart, so the
+    /// delivered count is governed by how many *fit* — not by how many were admitted at t≈0.
+    ///
+    /// The ratio is chosen so both bounds survive a slow CI runner (the suite runs on five
+    /// OSes, Windows included):
+    /// - the upper bound (`delivered < urls.len()`) is guaranteed by the server's own sleep:
+    ///   10 feeds cannot finish in 1000 ms when each is floored at 200 ms.
+    /// - the lower bound (`delivered > 1`) has ~300 ms of per-request slack on top of that
+    ///   floor before it is threatened.
+    ///
+    /// Widen both together if this ever flakes; shrinking the deadline alone re-tightens the
+    /// lower bound, and growing it alone eventually delivers every feed and kills the upper.
+    const COMPOSED_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
+    const COMPOSED_DEADLINE: std::time::Duration = std::time::Duration::from_millis(1000);
 
     #[tokio::test]
     async fn a_page_bounded_by_both_the_deadline_and_the_budget_keeps_both_counts() {
@@ -3537,7 +3548,7 @@ mod tests {
         // `paginate` measures the payload, the budget's `PageStop` then assigns its own counts,
         // and `merge_deadline_omissions` adds them — with the BUDGET minting the cursor, because
         // it points earlier in the same list than the deadline's would.
-        let base = slow_feed_server(SERVER_DELAY, feed_with_items(5));
+        let base = slow_feed_server(COMPOSED_DELAY, feed_with_items(5));
         let urls: Vec<String> = (0..10).map(|i| format!("{base}/f{i}.xml")).collect();
         let (cache, dir) = temp_cache("deadline-and-budget");
         let http = test_http();
@@ -3561,7 +3572,8 @@ mod tests {
         assert!(
             delivered > 1 && delivered < urls.len(),
             "need a multi-feed page that the deadline still trimmed; expected 2..{}, got \
-             {delivered}",
+             {delivered}. If this flakes on a loaded runner, widen COMPOSED_DELAY and \
+             COMPOSED_DEADLINE together — see their docs.",
             urls.len()
         );
         let full = core::estimate_response_tokens(&generous);
