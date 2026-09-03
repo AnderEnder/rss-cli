@@ -658,6 +658,31 @@ mod tests {
     }
 
     #[test]
+    fn since_retains_undated_items_so_a_comment_feed_is_not_emptied() {
+        // Load-bearing for comment feeds. Reddit's `.../comments/.rss` carries no
+        // `published` on any entry, so if the `since` filter dropped undated items, every
+        // `since`-scoped fetch of a comment feed would return ZERO items — silently, since
+        // an empty feed is not an error. The filter keeps them because it cannot prove they
+        // are older than the cutoff.
+        //
+        // Don't "tighten" the `None => true` arm in the `since` retain: that is the whole
+        // reason `since` is safe to pass to an undated feed.
+        let mut p = params();
+        p.since = Some(Utc.with_ymd_and_hms(2030, 1, 1, 0, 0, 0).unwrap());
+
+        let parsed = parse_feed(UNDATED_RSS.as_bytes(), FEED_URL, &p).unwrap();
+        assert_eq!(
+            parsed.items.len(),
+            2,
+            "an undated item survives even a cutoff far in the future"
+        );
+        assert_eq!(
+            parsed.items_filtered_out, 0,
+            "nothing was filtered, so nothing should be counted as filtered"
+        );
+    }
+
+    #[test]
     fn dated_feed_has_no_undated_warning() {
         // RSS has pubDates, so ordering is reliable and no warning should fire.
         let parsed = parse_feed(RSS.as_bytes(), FEED_URL, &params()).unwrap();

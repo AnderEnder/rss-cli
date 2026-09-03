@@ -76,9 +76,12 @@ malformed XML is a real problem the caller should see rather than paper over wit
 - **`from_cache: true` is now ambiguous on its own** between `NotModified` (origin confirmed
   our copy is current) and `Stale` (origin never answered). It always needed `status` to be
   read alongside it; this makes that sharper.
-- **A stale page is safe to paginate.** `StaleIfError` writes nothing to the cache, but unlike
-  `no-cache` it *reads* it, so a continuation resumes against the same snapshot. It therefore
-  does **not** join the `no_cursor_reason` list in invariant 12.
+- **A stale page is safe to paginate.** Its success path *is* `Revalidate`, so it writes the
+  body to the cache exactly as the default does; only the refusal path skips the write, and
+  that path is serving an already-cached body anyway. Either way the snapshot a continuation
+  reads is present, so `StaleIfError` does **not** join the `no_cursor_reason` list in
+  invariant 12. (Contrast `no-cache`, which is barred precisely because it writes *nothing* —
+  "writes nothing" is the disqualifying property, and `stale-if-error` does not have it.)
 - **The cache is now load-bearing for availability, not just for cost.** A cache wipe degrades
   a rate-limited batch from "stale but usable" back to "8 of 15 missing."
 

@@ -368,3 +368,75 @@ pub enum CacheAction {
     /// Remove all cache entries.
     Clear,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    /// Parse an `rss fetch …` argv into its `FetchArgs`.
+    fn fetch_args(extra: &[&str]) -> FetchArgs {
+        let mut argv = vec!["rss", "fetch", "https://example.com/feed.xml"];
+        argv.extend_from_slice(extra);
+        match Cli::try_parse_from(argv)
+            .expect("argv should parse")
+            .command
+        {
+            Command::Fetch(a) => a,
+            other => panic!("expected Fetch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cache_policy_resolves_each_flag_and_the_default() {
+        assert_eq!(
+            fetch_args(&[]).cache_policy().unwrap(),
+            CachePolicy::Revalidate,
+            "no flags means the always-revalidate default"
+        );
+        assert_eq!(
+            fetch_args(&["--no-cache"]).cache_policy().unwrap(),
+            CachePolicy::NoCache
+        );
+        assert_eq!(
+            fetch_args(&["--max-age", "15m"]).cache_policy().unwrap(),
+            CachePolicy::MaxAge(std::time::Duration::from_secs(900))
+        );
+        assert_eq!(
+            fetch_args(&["--refresh"]).cache_policy().unwrap(),
+            CachePolicy::Revalidate,
+            "--refresh is a revalidate, not its own policy"
+        );
+        assert_eq!(
+            fetch_args(&["--stale-if-error"]).cache_policy().unwrap(),
+            CachePolicy::StaleIfError
+        );
+        // `--stale-if-error` only changes what happens when the revalidation is REFUSED, so
+        // combining it with `--refresh` is meaningful and must not be swallowed by branch
+        // order. This is the case that would break silently if a `conflicts_with` were
+        // relaxed later, since `cache_policy()` tests the flags in a fixed sequence.
+        assert_eq!(
+            fetch_args(&["--stale-if-error", "--refresh"])
+                .cache_policy()
+                .unwrap(),
+            CachePolicy::StaleIfError
+        );
+    }
+
+    #[test]
+    fn stale_if_error_conflicts_with_the_cache_bypassing_flags() {
+        // Both would make the fallback meaningless: `--no-cache` never writes a copy to fall
+        // back to, and `--max-age` already answers from cache without asking the origin.
+        for conflicting in [
+            ["--stale-if-error", "--no-cache"].as_slice(),
+            &["--stale-if-error", "--max-age", "5m"],
+        ] {
+            let mut argv = vec!["rss", "fetch", "https://example.com/feed.xml"];
+            argv.extend_from_slice(conflicting);
+            assert!(
+                Cli::try_parse_from(argv).is_err(),
+                "{conflicting:?} must be rejected by clap, not silently resolved by branch order"
+            );
+        }
+    }
+}

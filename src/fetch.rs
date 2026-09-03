@@ -187,22 +187,31 @@ impl HttpClient {
             // `stale_reason`.
             CachePolicy::StaleIfError => match self.revalidate(url, cache, stop_at).await {
                 Ok(raw) => Ok(raw),
-                Err(e) if is_origin_refusal(&e) => match cache.get(url)? {
-                    Some(entry) => Ok(RawFeed {
-                        body: entry.body,
-                        final_url: url.to_string(),
-                        content_type: entry.meta.content_type,
-                        status: 200,
-                        // Not a `304`: the origin never confirmed this body is current, which
-                        // is exactly what distinguishes stale from `NotModified`.
-                        not_modified: false,
-                        from_cache: true,
-                        cached_at: Some(entry.meta.fetched_at),
-                        stale_reason: Some(e.to_string()),
-                    }),
-                    // Nothing cached: there is no stale copy to serve, so the refusal stands.
-                    None => Err(e),
-                },
+                // Only an *origin refusal* may be papered over with an old copy; every other
+                // error propagates untouched. See `is_origin_refusal` for why each exclusion
+                // is there.
+                Err(e) if is_origin_refusal(&e) => {
+                    // `.ok().flatten()` deliberately, not `?`: if the cache read itself fails
+                    // the fallback simply did not work, and the caller should see the origin's
+                    // `429` — not a `CACHE_ERROR` that masks what actually happened.
+                    match cache.get(url).ok().flatten() {
+                        Some(entry) => Ok(RawFeed {
+                            body: entry.body,
+                            final_url: url.to_string(),
+                            content_type: entry.meta.content_type,
+                            status: 200,
+                            // Not a `304`: the origin never confirmed this body is current,
+                            // which is exactly what separates stale from `NotModified`.
+                            not_modified: false,
+                            from_cache: true,
+                            cached_at: Some(entry.meta.fetched_at),
+                            stale_reason: Some(e.to_string()),
+                        }),
+                        // No usable cached copy, so there is no stale body to serve and the
+                        // refusal stands rather than becoming an empty success.
+                        None => Err(e),
+                    }
+                }
                 Err(e) => Err(e),
             },
 

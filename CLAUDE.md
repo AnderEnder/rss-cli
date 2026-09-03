@@ -176,6 +176,12 @@ One core powers both front-ends, so they cannot diverge
   (ADR-0017). Pinned by `paginate_ships_a_page_that_fits_even_when_a_later_feed_is_dropped`.
 - **`query` runs before `limit`, on purpose,** so `limit` means "N matching items". Pinned by
   `parse::tests::query_filters_before_limit`.
+- **`since` *retains* undated items — don't "tighten" that to a drop.** The retain arm is
+  `None => true` because we cannot prove an undated item is older than the cutoff. This is
+  what makes `since` safe on a feed with no dates at all (Reddit's `…/comments/.rss` carries
+  `published: null` on every entry): dropping them would return **zero items, silently**, since
+  an empty feed is not an error. Pinned by
+  `parse::tests::since_retains_undated_items_so_a_comment_feed_is_not_emptied`.
 - **`item.id` and the dedup key disagree — never collapse duplicates by id.** `identity.rs`
   keys on link → guid → title|published; `core::dedup_key` on guid → url → content_hash. A feed
   whose entries share one `<link>` gives every item the same `id` while their guids put them in
