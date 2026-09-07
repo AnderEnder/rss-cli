@@ -43,11 +43,11 @@ rather than one call per feed with your own delays -- the server serializes same
 requests and applies an adaptive cooldown honoring the origin's Retry-After, so it \
 paces on your behalf; do NOT hand-roll sleeps. A throttled feed gets its own \
 feeds[].error, not a failed call -- check each feed's status, not just the call's. \
-FEED_FETCH_FAILED (an origin 429/403, the common case) carries details.retry_after, the \
-origin's raw header, null if absent -- then back off yourself rather than assume none \
-is needed. RATE_LIMITED (the server's own pacing ceiling, rare at default settings) \
-carries retry_after_seconds/retry_after_ms instead, always populated; see fetch_feed's \
-own description for exact fields. get_item/discover_feeds report the same codes as an \
+RATE_LIMITED means wait, then retry -- an origin 429 (the common case) or the server's \
+own pacing ceiling. It carries details.retry_after_seconds/retry_after_ms; an origin 429 \
+adds details.http_status and details.retry_after, the origin's raw header, null if \
+absent. FEED_FETCH_FAILED is any other failed status -- notably 403, a block rather than \
+a window, so do not simply wait it out. get_item/discover_feeds report the same codes as an \
 actual tool failure, because each targets one feed or site. A batch that cannot finish \
 inside the wall-clock deadline returns what it completed plus truncation.feeds_omitted \
 -- follow truncation.next_cursor when present, or request the omitted feeds separately.\n\
@@ -595,9 +595,10 @@ impl RssServer {
         the batch deadline never reached still needs a live fetch. \
         truncation.items_omitted/feeds_omitted describe only this page, not a running total. \
         A lone oversized item still returns RESPONSE_TOO_LARGE with \
-        suggested_max_content_chars (a tool-level failure). If the host's pacing ceiling is \
-        hit for one feed, THAT FEED gets a RATE_LIMITED entry in feeds[].error with \
-        details.retry_after_seconds/retry_after_ms -- the call itself still succeeds, so \
+        suggested_max_content_chars (a tool-level failure). If one feed is throttled -- the \
+        origin sending 429, or the host's pacing ceiling -- THAT FEED gets a RATE_LIMITED \
+        entry in feeds[].error with details.retry_after_seconds/retry_after_ms -- the call \
+        itself still succeeds, so \
         check per-feed status, not just whether the call errored; wait that long and retry \
         that feed. \
         Provider notes: \
@@ -625,7 +626,13 @@ impl RssServer {
         &self,
         Parameters(args): Parameters<DiscoverFeedsArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        match core::discover_feeds_with(&args.site_url, &FetchParams::default(), &self.http).await {
+        // The same wall-clock ceiling `fetch_feed` uses: a discover call left sitting in the
+        // per-host queue past the client's tool timeout returns nothing at all, not even an error.
+        let params = FetchParams {
+            deadline: Some(batch_deadline()),
+            ..FetchParams::default()
+        };
+        match core::discover_feeds_with(&args.site_url, &params, &self.http).await {
             Ok(out) => {
                 let summary = format!(
                     "Discovered {} feed(s) at {}.",
@@ -1291,6 +1298,7 @@ async fn get_item_inner(http: &HttpClient, cache: &Cache, args: GetItemArgs) -> 
     let params = FetchParams {
         max_content_chars: args.max_content_chars,
         cache_policy: CachePolicy::CacheFirst,
+        deadline: Some(batch_deadline()),
         ..FetchParams::default()
     };
     match core::show_item_with(&args.feed_url, &args.id, &params, cache, http).await {
@@ -2003,6 +2011,69 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn the_shipped_guidance_names_the_code_a_429_actually_gets() {
+        // This drifted once, invisibly: the instructions said "FEED_FETCH_FAILED (an origin
+        // 429/403, the common case)" after `code()` had started returning RATE_LIMITED for a
+        // 429, so the surface taught every client to branch on a code the server never sends --
+        // worse than documenting nothing, and no other test here could see it. Derive the truth
+        // from `code()` rather than restating it, so the guidance is checked against behavior.
+        let throttled = RssError::Http {
+            status: 429,
+            url: "https://x/feed".into(),
+            retry_after: None,
+            retry_after_hint: Some(std::time::Duration::from_secs(30)),
+        };
+        assert_eq!(throttled.code(), "RATE_LIMITED");
+        assert_eq!(
+            RssError::Http {
+                status: 403,
+                url: "https://x/feed".into(),
+                retry_after: None,
+                retry_after_hint: None,
+            }
+            .code(),
+            "FEED_FETCH_FAILED",
+            "a 403 is a block, not a window -- it must not be advertised as paceable"
+        );
+
+        let (cache, dir) = temp_cache("guidance-429");
+        let server = RssServer::new(cache, test_http());
+        let served = server
+            .get_info()
+            .instructions
+            .expect("get_info() must advertise instructions");
+        std::fs::remove_dir_all(&dir).ok();
+
+        // Assert the *association*, not one phrasing: find the sentence that tells a client
+        // what an origin 429 yields, and require it to name the code `code()` actually returns.
+        // A bare `!contains("FEED_FETCH_FAILED (an origin 429")` passed on any reword.
+        let sentence = served
+            .split(". ")
+            .find(|s| s.contains("origin 429"))
+            .expect("the guidance must state what an origin 429 yields");
+        assert!(
+            sentence.contains(throttled.code()),
+            "the sentence describing an origin 429 must name {}, got {sentence:?}",
+            throttled.code()
+        );
+        assert!(
+            !sentence.contains("FEED_FETCH_FAILED"),
+            "an origin 429 must not be tied to FEED_FETCH_FAILED: {sentence:?}"
+        );
+
+        // The two pacing keys the guidance promises for RATE_LIMITED must actually be emitted
+        // by the origin-429 variant too, not only by the gate's own.
+        let details = throttled.to_error_obj(None).details;
+        for key in ["retry_after_seconds", "retry_after_ms"] {
+            assert!(served.contains(key), "the guidance must name '{key}'");
+            assert!(
+                details.get(key).is_some_and(|v| v.is_u64()),
+                "an origin 429 must emit '{key}', which the shipped guidance promises"
+            );
         }
     }
 

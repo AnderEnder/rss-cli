@@ -17,6 +17,13 @@ use crate::model::{
 };
 use crate::{discover, parse};
 
+/// The absolute instant by which a fetch must have *started*, from [`FetchParams::deadline`].
+/// `None` (the CLI default) is unbounded. Every `core` entry point that can reach the per-host
+/// gate derives its bound here, so none is left waiting on a permit with no ceiling.
+fn stop_at_for(params: &FetchParams) -> Option<tokio::time::Instant> {
+    params.deadline.map(|d| tokio::time::Instant::now() + d)
+}
+
 /// Fetch and parse many feeds concurrently, returning the full structured output.
 ///
 /// Partial failure is the norm: a feed that errors becomes a [`FeedStatus::Error`] entry
@@ -61,20 +68,18 @@ pub async fn fetch_feeds_with(
     http: &HttpClient,
 ) -> FetchOutput {
     let output = FetchOutput::new(now_rfc3339());
-    let stop_at = params.deadline.map(|d| tokio::time::Instant::now() + d);
+    let stop_at = stop_at_for(params);
 
     // Tag each task with its input index so we can restore request order after the
     // completion-ordered `buffer_unordered` stream — `feeds[]`/`errors[]` are then
     // deterministic within a run (an agent can address feeds by position). See ADR-0012.
     let results: Vec<IndexedFetch> = stream::iter(urls.iter().cloned().enumerate())
         .map(|(idx, url)| async move {
-            // Known limitation (recorded for ADR-0017): this bounds only when a fetch may
-            // *start*. `buffer_unordered` polls the first `concurrency` futures immediately, so
-            // they all pass this check at t≈0 and then queue on the per-host permit, where no
-            // clock reaches them — a call can outlive the deadline by up to `concurrency - 1`
-            // serialized fetches (see `FetchParams::deadline`). The deeper fix is to thread the
-            // deadline into the gate's permit acquire (`timeout_at` on the semaphore), which
-            // touches `fetch`/`ratelimit` and is deliberately out of scope here.
+            // A cheap short-circuit so an already-expired batch attempts nothing at all —
+            // *not* the real bound. `buffer_unordered` polls the first `concurrency` futures at
+            // t≈0, so they all pass this check and then queue on the per-host permit, where
+            // `HostGate::acquire_until` enforces `stop_at` for real (ADR-0016). Pinned by
+            // `deadline_is_a_real_wall_clock_bound_for_a_throttled_same_host_batch`.
             if let Some(t) = stop_at
                 && tokio::time::Instant::now() >= t
             {
@@ -386,12 +391,19 @@ pub async fn fetch_one(
     params: &FetchParams,
     cache: &Cache,
 ) -> Result<(FeedResult, Vec<Warning>, usize), RssError> {
-    fetch_one_until(url, http, params, cache, None).await
+    // Honors `params.deadline` rather than passing `None`: a caller that set a deadline and
+    // then waited on the gate with no ceiling was the whole bug this file's `stop_at_for`
+    // exists to prevent.
+    fetch_one_until(url, http, params, cache, stop_at_for(params)).await
 }
 
-/// [`fetch_one`] bounded by an absolute batch deadline. A feed that cannot start before
+/// [`fetch_one`] against an **explicit** absolute instant. A feed that cannot start before
 /// `stop_at` returns [`RssError::DeadlineExceeded`], which [`fetch_feeds`] turns into an
-/// *unattempted* feed rather than a failed one. `None` is the unbounded (CLI) behaviour.
+/// *unattempted* feed rather than a failed one. `None` is unbounded.
+///
+/// A batch needs this rather than [`fetch_one`]: every feed must share the *one* instant
+/// computed when the call began, or a per-feed `now + deadline` would restart the clock on
+/// each feed and the batch could never expire.
 pub async fn fetch_one_until(
     url: &str,
     http: &HttpClient,
@@ -465,15 +477,16 @@ pub async fn fetch_one_until(
 /// Discover feeds advertised on a website homepage, through a **caller-provided** client.
 /// The MCP server passes its shared client so discovery shares the per-host gate (ADR-0016).
 ///
-/// `_params` is unread — discovery has no params to apply — and exists only so this signature
-/// stays parallel to [`fetch_feeds_with`]'s `(url, params, http)` shape; that symmetry is what
-/// the brief asked for, not an oversight.
+/// No filtering params apply here, but the call does traverse that gate, so it reads
+/// [`FetchParams::deadline`]. Without that bound a busy host parks the call on the permit
+/// queue indefinitely — `MAX_GATE_WAIT` caps a single cooldown, not the siblings ahead of you
+/// — and the caller times out having received nothing.
 pub async fn discover_feeds_with(
     site_url: &str,
-    _params: &FetchParams,
+    params: &FetchParams,
     http: &HttpClient,
 ) -> Result<DiscoverOutput, RssError> {
-    discover::discover(site_url, http).await
+    discover::discover_until(site_url, http, stop_at_for(params)).await
 }
 
 /// Discover feeds advertised on a website homepage. Thin wrapper that builds a client for
@@ -494,7 +507,10 @@ pub async fn show_item_with(
     cache: &Cache,
     http: &HttpClient,
 ) -> Result<Option<crate::model::Item>, RssError> {
-    let (fr, _warnings, _filtered) = fetch_one(feed_url, http, params, cache).await?;
+    // Same bound as discovery: `CacheFirst` means a cache hit never reaches the gate, but a
+    // miss does, and an unbounded wait there outlives any client's tool timeout.
+    let (fr, _warnings, _filtered) =
+        fetch_one_until(feed_url, http, params, cache, stop_at_for(params)).await?;
     Ok(fr.items.into_iter().find(|it| {
         it.id == key || it.guid.as_deref() == Some(key) || it.url.as_deref() == Some(key)
     }))
@@ -973,6 +989,69 @@ mod tests {
             "a future fetched_at must clamp to 0, not wrap to a huge u64"
         );
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn an_expired_deadline_attempts_nothing_on_any_single_url_path() {
+        // `RSS_MCP_BATCH_DEADLINE_SECS=0` is a documented load-shedding value, but only the
+        // batch path had a pre-flight check; the single-URL paths relied on the gate, and tokio
+        // hands out an immediately-available permit *before* consulting the timer, so an
+        // already-expired `stop_at` still sent. `.expect(0)` is the real assertion.
+        //
+        // All three entry points are exercised: covering only `discover_feeds_with` left the
+        // test green when `show_item_with` or `fetch_one` stopped forwarding the deadline.
+        let mut server = mockito::Server::new_async().await;
+        let never = server
+            .mock("GET", mockito::Matcher::Any)
+            .expect(0)
+            .create_async()
+            .await;
+        let dir = std::env::temp_dir().join(format!("rss-nodl-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache = Cache::open(Some(dir.clone())).unwrap();
+        let http = crate::fetch::HttpClient::new("t", std::time::Duration::from_secs(5)).unwrap();
+        let expired = FetchParams {
+            deadline: Some(std::time::Duration::ZERO),
+            ..Default::default()
+        };
+        let url = format!("{}/feed.xml", server.url());
+
+        let shed = |what: &str, e: RssError| {
+            assert!(
+                matches!(e, RssError::DeadlineExceeded { .. }),
+                "{what}: an expired deadline must shed before the request is sent, got {e:?}"
+            );
+        };
+
+        shed(
+            "discover_feeds_with",
+            discover_feeds_with(&server.url(), &expired, &http)
+                .await
+                .unwrap_err(),
+        );
+
+        // `CacheFirst` mirrors the MCP `get_item` tool. The cache dir is fresh, so this is the
+        // *miss* path — the only one that reaches the gate at all (ADR-0014).
+        let item_params = FetchParams {
+            cache_policy: CachePolicy::CacheFirst,
+            ..expired.clone()
+        };
+        shed(
+            "show_item_with",
+            show_item_with(&url, "any-id", &item_params, &cache, &http)
+                .await
+                .unwrap_err(),
+        );
+
+        // The public single-feed wrapper: forwarding this back to `None` would silently restore
+        // the unbounded permit wait for any caller that set a deadline.
+        shed(
+            "fetch_one",
+            fetch_one(&url, &http, &expired, &cache).await.unwrap_err(),
+        );
+
+        never.assert_async().await;
         std::fs::remove_dir_all(&dir).ok();
     }
 

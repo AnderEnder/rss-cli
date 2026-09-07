@@ -44,3 +44,4 @@ where a real fork existed). Statuses: `Proposed`, `Accepted`, `Superseded by NNN
 | [0018](0018-duplicate-reporting-and-keyword-filtering.md) | Cross-feed duplicate reporting and local keyword filtering | Accepted |
 | [0019](0019-stale-if-error-cache-policy.md) | Serving stale on a refused revalidation (`stale-if-error`) | Accepted |
 | [0020](0020-per-feed-caller-watermarks.md) | Per-feed caller watermarks (`since_last_seen`) | Proposed |
+| [0021](0021-origin-429-is-rate-limited.md) | An origin `429` is `RATE_LIMITED`, not `FEED_FETCH_FAILED` | Accepted |

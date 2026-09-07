@@ -119,11 +119,7 @@ impl HttpClient {
                 let status = resp.status();
                 let final_url = resp.url().to_string();
                 if !status.is_success() {
-                    return Err(RssError::Http {
-                        status: status.as_u16(),
-                        url: url.to_string(),
-                        retry_after: retry_after_raw(resp.headers()),
-                    });
+                    return Err(self.http_error(url, &resp));
                 }
                 let content_type = header_string(resp.headers(), &CONTENT_TYPE);
                 let body = resp
@@ -281,11 +277,7 @@ impl HttpClient {
         }
 
         if !status.is_success() {
-            return Err(RssError::Http {
-                status: status.as_u16(),
-                url: url.to_string(),
-                retry_after: retry_after_raw(resp.headers()),
-            });
+            return Err(self.http_error(url, &resp));
         }
 
         // `200 OK`: capture validators, store the new body, and return it.
@@ -319,17 +311,45 @@ impl HttpClient {
         })
     }
 
+    /// Classify a non-success response — the single place any status becomes an error.
+    ///
+    /// The gate's learned cooldown rides along whenever one is active, whatever the status: it
+    /// is a true statement about when this host will next be sent to. It carries the most
+    /// weight on a `429` (the status that becomes `RATE_LIMITED`), because the provider
+    /// ADR-0016 probed sends no `Retry-After` at all, leaving the hint as the only pacing
+    /// signal the caller gets.
+    fn http_error(&self, url: &str, resp: &reqwest::Response) -> RssError {
+        RssError::Http {
+            status: resp.status().as_u16(),
+            url: url.to_string(),
+            retry_after: retry_after_raw(resp.headers()),
+            retry_after_hint: self.gate.cooldown_remaining(url),
+        }
+    }
+
     /// Plain GET returning the raw body (used by `discover` for the homepage HTML).
+    /// Unbounded — see [`get_bytes_until`](Self::get_bytes_until) to bound the wait to start.
     pub async fn get_bytes(&self, url: &str) -> Result<(Vec<u8>, String), RssError> {
-        let resp = self.gated_send(url, None, || self.inner.get(url)).await?;
+        self.get_bytes_until(url, None).await
+    }
+
+    /// [`get_bytes`](Self::get_bytes) bounded by an absolute instant, mirroring
+    /// [`fetch`](Self::fetch)/[`fetch_until`](Self::fetch_until).
+    ///
+    /// `None` is what turned a `discover` call on a busy host into a multi-minute hang:
+    /// `MAX_GATE_WAIT` bounds one cooldown, never the queue of siblings behind it.
+    pub async fn get_bytes_until(
+        &self,
+        url: &str,
+        stop_at: Option<tokio::time::Instant>,
+    ) -> Result<(Vec<u8>, String), RssError> {
+        let resp = self
+            .gated_send(url, stop_at, || self.inner.get(url))
+            .await?;
         let status = resp.status();
         let final_url = resp.url().to_string();
         if !status.is_success() {
-            return Err(RssError::Http {
-                status: status.as_u16(),
-                url: url.to_string(),
-                retry_after: retry_after_raw(resp.headers()),
-            });
+            return Err(self.http_error(url, &resp));
         }
         let body = resp
             .bytes()
@@ -962,6 +982,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_throttled_429_is_paceable_and_carries_the_gates_learned_window() {
+        // The digest-agent bug: a Reddit-style `429` (no `Retry-After` header) surfaced as an
+        // opaque `FEED_FETCH_FAILED` with no wait hint, so the caller could not tell "wait 40s"
+        // from "this feed is dead" and dropped the source. The gate already knows the window.
+        let mut server = mockito::Server::new_async().await;
+        let dir = temp_cache_dir("throttle-code");
+        let cache = Cache::open(Some(dir.clone())).expect("open cache");
+        let url = format!("{}/feed.xml", server.url());
+
+        // No `Retry-After` anywhere — exactly the provider ADR-0016 probed.
+        let m = server
+            .mock("GET", "/feed.xml")
+            .with_status(429)
+            .expect(2)
+            .create_async()
+            .await;
+
+        let err = client()
+            .fetch(&url, &cache, CachePolicy::Revalidate)
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code(), "RATE_LIMITED", "got {err:?}");
+        match &err {
+            RssError::Http {
+                status,
+                retry_after,
+                retry_after_hint,
+                ..
+            } => {
+                assert_eq!(*status, 429);
+                assert_eq!(*retry_after, None, "this provider sends no header");
+                assert!(
+                    retry_after_hint.is_some_and(|d| d > Duration::from_secs(0)),
+                    "the gate's escalated cooldown must ride along, else the agent has nothing \
+                     to pace on: {retry_after_hint:?}"
+                );
+            }
+            other => panic!("expected Http, got {other:?}"),
+        }
+        assert!(
+            err.to_error_obj(Some(&url)).details["retry_after_seconds"].is_u64(),
+            "the wait must reach the wire as a number"
+        );
+        m.assert_async().await;
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn get_bytes_sheds_a_cooldown_that_outlives_the_deadline() {
+        // `discover` used to call `get_bytes` with `stop_at: None`, so a warm host's cooldown
+        // was slept out in full and the caller got nothing back before its tool timeout.
+        // `MAX_GATE_WAIT` does not save it: 30s is under that ceiling, so the old code slept.
+        let mut server = mockito::Server::new_async().await;
+        let url = format!("{}/index.html", server.url());
+        let http = client();
+        http.gate
+            .note_throttled(&url, Some(Duration::from_secs(30)));
+
+        // Proves the request is never sent: the deadline is enforced *at the gate*.
+        let never = server
+            .mock("GET", "/index.html")
+            .expect(0)
+            .create_async()
+            .await;
+
+        let start = tokio::time::Instant::now();
+        let err = http
+            .get_bytes_until(&url, Some(start + Duration::from_millis(200)))
+            .await
+            .unwrap_err();
+        let elapsed = start.elapsed();
+
+        assert!(
+            matches!(err, RssError::DeadlineExceeded { .. }),
+            "a cooldown past the deadline must shed as unattempted, got {err:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the deadline must bound the wait, not the 30s cooldown; took {elapsed:?}"
+        );
+        never.assert_async().await;
+    }
+
+    #[tokio::test]
     async fn stale_if_error_still_fails_when_nothing_is_cached() {
         let mut server = mockito::Server::new_async().await;
         let dir = temp_cache_dir("stale-nocache");
@@ -1025,7 +1130,8 @@ mod tests {
         assert!(is_origin_refusal(&RssError::Http {
             status: 429,
             url: "u".into(),
-            retry_after: None
+            retry_after: None,
+            retry_after_hint: None
         }));
         assert!(is_origin_refusal(&RssError::RateLimited {
             url: "u".into(),
