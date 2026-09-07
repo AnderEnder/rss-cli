@@ -1,7 +1,8 @@
 //! Feed autodiscovery from a website homepage. **Owner: `cli` agent.**
 //!
 //! ## Requirements
-//! - GET the `site_url` HTML via [`HttpClient::get_bytes`].
+//! - GET the `site_url` HTML via [`HttpClient::get_bytes_until`], bounded by the caller's
+//!   deadline ([`HttpClient::get_bytes`] is the unbounded wrapper).
 //! - Parse the `<head>` for `<link rel="alternate" type="application/rss+xml">` and
 //!   `type="application/atom+xml"` (also accept `application/json` / `feed+json`). Use the
 //!   lightweight `tl` HTML parser — do not pull a heavyweight DOM stack.
@@ -18,9 +19,21 @@ use crate::error::RssError;
 use crate::fetch::HttpClient;
 use crate::model::{DiscoverOutput, DiscoveredFeed};
 
-/// Discover feeds advertised on `site_url`. **Owner: `cli` agent.**
+/// Discover feeds advertised on `site_url`. **Owner: `cli` agent.** Unbounded; see
+/// [`discover_until`].
 pub async fn discover(site_url: &str, http: &HttpClient) -> Result<DiscoverOutput, RssError> {
-    let (bytes, final_url) = http.get_bytes(site_url).await?;
+    discover_until(site_url, http, None).await
+}
+
+/// [`discover`] bounded by an absolute instant, mirroring `fetch`/`fetch_until`. The homepage
+/// GET traverses the per-host gate, where an unbounded permit wait is what let a busy host park
+/// the call past the caller's timeout. `None` is the unbounded (CLI) behaviour.
+pub async fn discover_until(
+    site_url: &str,
+    http: &HttpClient,
+    stop_at: Option<tokio::time::Instant>,
+) -> Result<DiscoverOutput, RssError> {
+    let (bytes, final_url) = http.get_bytes_until(site_url, stop_at).await?;
     let html = String::from_utf8_lossy(&bytes);
     // Resolve relative hrefs against the post-redirect URL when available.
     let feeds = extract_feeds(&html, &final_url);

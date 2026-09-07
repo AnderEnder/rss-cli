@@ -305,9 +305,11 @@ Reddit's feeds have a few quirks worth knowing when consuming them:
   than an error.
 - **Transient `403`/`429` are retried once automatically.** Reddit intermittently
   rate-limits mid-batch; `rss` retries a `403`/`429` exactly once (honoring
-  `Retry-After`, capped) before giving up. On persistent failure the
-  `FEED_FETCH_FAILED` error surfaces `http_status` and (when sent) `retry_after` in
-  its `details`. See
+  `Retry-After`, capped) before giving up. A persistent `429` then surfaces as
+  `RATE_LIMITED` — wait and retry — carrying
+  `details.retry_after_seconds`/`retry_after_ms` alongside `http_status` and the
+  origin's raw `retry_after` (when it sent one). A persistent `403` stays
+  `FEED_FETCH_FAILED`: a block is not a window, so do not simply wait it out. See
   [ADR-0015](docs/adr/0015-bounded-retry-on-transient-429-403.md).
 
 ---
@@ -373,13 +375,14 @@ and `openWorldHint` for the network-touching tools). See
 
 **Batching and per-host pacing.** Pass several feeds in one `fetch_feed` call via `urls`
 (max 50) instead of looping with your own delays: the server serializes requests to the same
-host and applies an adaptive cooldown that honors the origin's `Retry-After`. The common case
-is the origin itself sending a `429`/`403`: that feed gets a structured
-**`FEED_FETCH_FAILED`** entry in its own `feeds[].error` (`details.http_status`,
-`details.retry_after` — the origin's raw header, `null` when it sent none, so back off
-yourself rather than assume none is needed). Only when the server's own pacing ceiling is hit
-(rare at default settings) does a feed instead get **`RATE_LIMITED`**
-(`details.retry_after_seconds`/`retry_after_ms`, always populated). Either way the
+host and applies an adaptive cooldown that honors the origin's `Retry-After`.
+**`RATE_LIMITED`** means wait, then retry, and covers both sources: an origin `429` (the
+common case) and the server's own pacing ceiling (rare at default settings). That feed gets a
+structured entry in its own `feeds[].error` carrying
+`details.retry_after_seconds`/`retry_after_ms`; an origin `429` additionally carries
+`details.http_status` and `details.retry_after`, the origin's raw header, `null` when it sent
+none. A `403` — a block rather than a window — stays **`FEED_FETCH_FAILED`**, as does any
+other failed status, so those must not simply be waited out. Either way the
 `fetch_feed` call itself still succeeds, so check each feed's `status`, not just whether the
 call errored. `get_item` and `discover_feeds` surface the same codes as an actual tool error
 instead, because each targets a single feed or site. A batch that cannot finish inside the

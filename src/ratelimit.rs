@@ -187,6 +187,10 @@ impl HostGate {
         let expired = || RssError::DeadlineExceeded {
             url: url.to_string(),
         };
+        // `stop_at` bounds when a request may *start*, so every path that hands back a permit
+        // has to re-assert it: tokio resolves a ready future before consulting the timer, and
+        // its timers never fire early but do fire late.
+        let past_deadline = || stop_at.is_some_and(|t| tokio::time::Instant::now() >= t);
 
         // Concurrency cap. `acquire_owned` yields a permit carrying no borrow, so the guard is
         // `Send` and RAII-released even if the caller's future is dropped mid-flight.
@@ -201,6 +205,14 @@ impl HostGate {
             None => acquire.await,
         }
         .map_err(|_| RssError::Other("rate-limiter semaphore closed".to_string()))?;
+
+        // An immediately-available permit is handed out even when `stop_at` has already
+        // passed, so without this an expired deadline still sends — and
+        // `RSS_MCP_BATCH_DEADLINE_SECS=0` is a *documented* load-shedding value. The permit
+        // drops here (RAII), freeing the host.
+        if past_deadline() {
+            return Err(expired());
+        }
 
         // `next_allowed - now` is a non-negative millisecond count; the conversion is total.
         let now = now_ms();
@@ -222,6 +234,14 @@ impl HostGate {
                 return Err(expired());
             }
             tokio::time::sleep(wait).await;
+            // The pre-check above clears a wait that *ends* at `stop_at`; a timer that fires
+            // late then lands past it. Re-check rather than start a request after the deadline.
+            //
+            // Untested by design: deterministic coverage needs a clock shared with `now_ms`,
+            // and cooldowns are wall-clock while deadlines are tokio time.
+            if past_deadline() {
+                return Err(expired());
+            }
         }
 
         // Sticky spacing: while the host is warm, reserve a gap before the *next* sibling so a
@@ -277,6 +297,23 @@ impl HostGate {
             .consecutive_throttles
             .store(0, Ordering::Relaxed);
     }
+
+    /// The host's remaining *pacing* delay (`next_allowed_ms`), if one is active — the window
+    /// the gate learned from the server (its `Retry-After` where it sent one, else bounded
+    /// escalation). That makes it the number to hand a throttled caller, with no header
+    /// re-parsing and no per-provider constant to keep in sync.
+    ///
+    /// Deliberately **not** an end-to-end time-to-send: it excludes the permit queue, so a
+    /// caller behind busy siblings waits longer than this. Keeping those two apart is the
+    /// point — see [`Self::acquire_until`].
+    pub fn cooldown_remaining(&self, url: &str) -> Option<Duration> {
+        let slot = self.slot_for_url(url);
+        let wait = slot.next_allowed_ms.load(Ordering::Relaxed) - now_ms();
+        u64::try_from(wait)
+            .ok()
+            .filter(|ms| *ms > 0)
+            .map(Duration::from_millis)
+    }
 }
 
 /// Milliseconds of a `Duration` as `i64` (saturating — durations here are always small).
@@ -295,6 +332,28 @@ mod tests {
 
     fn gate() -> HostGate {
         HostGate::default()
+    }
+
+    #[test]
+    fn cooldown_remaining_reports_the_learned_window_and_nothing_on_a_cold_host() {
+        let g = gate();
+        let url = "https://cold.example/feed.xml";
+        assert_eq!(
+            g.cooldown_remaining(url),
+            None,
+            "a host that has never throttled owes no wait"
+        );
+
+        // What a headerless provider's `429` looks like to the gate: escalation supplies the
+        // window. This is the number a throttled caller is handed, so it must be readable back.
+        g.note_throttled(url, Some(Duration::from_secs(30)));
+        let remaining = g
+            .cooldown_remaining(url)
+            .expect("an active cooldown must be reportable");
+        assert!(
+            remaining > Duration::from_secs(25) && remaining <= Duration::from_secs(30),
+            "expected ~30s, got {remaining:?}"
+        );
     }
 
     #[test]

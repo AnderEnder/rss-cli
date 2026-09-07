@@ -168,6 +168,24 @@ One core powers both front-ends, so they cannot diverge
   (asserts elapsed wall-clock — omission counts alone pass either way).
 - **Never hold the `HostGate` slot-map lock across an `.await`.** `slot_for` locks only to
   insert-and-clone the `Arc<HostSlot>`; all waiting uses the per-slot semaphore.
+- **A `429` is `RATE_LIMITED`; a `403` is not.** `RssError::Http` maps status 429 to the same
+  paceable code the gate's fail-fast uses, and carries the gate's *learned* cooldown as
+  `details.retry_after_seconds` (`HostGate::cooldown_remaining`) — the provider ADR-0016 probed
+  sends no `Retry-After`, so without that an agent cannot tell "wait 40 s" from "this feed is
+  dead" and drops the source. Don't extend it to `403`: that is a block, not a window, and
+  waiting it out is wrong. Pinned by
+  `error::tests::a_429_is_paceable_and_every_other_status_is_a_plain_failure`.
+- **Every `core` entry point that can reach the gate must pass `stop_at`.** `MAX_GATE_WAIT`
+  bounds *one* cooldown, never the queue of siblings ahead of you, so a `None` deadline parks
+  the call on the permit semaphore with no ceiling at all — that is how MCP `discover_feeds`
+  hung for minutes and returned *nothing*, not even an error. `core::stop_at_for` is the single
+  place the bound is derived; route new entry points through it rather than passing `None`.
+  `discover_feeds`/`get_item` have no `feeds_omitted` envelope to defer into, so they surface
+  `BATCH_DEADLINE_EXCEEDED` — still better than the unbounded wait it replaces, which the
+  client kills with no result at all. (`get_item` only reaches the gate on a cache *miss*;
+  ADR-0014's guarantee is the hit path, and it documents a miss as an ordinary revalidating
+  GET — which in MCP is deadline-bounded anyway.)
+  Pinned by `fetch::tests::get_bytes_sheds_a_cooldown_that_outlives_the_deadline`.
 - **`fetch_feed`'s `limit` is per feed, not per batch.** Scaling it down by feed count would
   silently return fewer items than the same single-URL call.
 - **`core::pretty_tokens` must never over-estimate.** Its flat `+ 2` deliberately under-counts

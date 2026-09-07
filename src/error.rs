@@ -36,6 +36,10 @@ pub enum RssError {
         url: String,
         /// Raw `Retry-After` header value when the server sent one (delta-seconds form).
         retry_after: Option<String>,
+        /// The per-host gate's learned cooldown, when one is active. ADR-0016's probe found a
+        /// provider that throttles with **no** `Retry-After` at all, so on those hosts this is
+        /// the only thing that makes a `429` paceable rather than a guess.
+        retry_after_hint: Option<Duration>,
     },
 
     #[error("rate limited: {url} (retry after ~{}s)", retry_after.as_secs())]
@@ -46,9 +50,11 @@ pub enum RssError {
     },
 
     /// The batch deadline passed before this fetch could **start** — it never reached the
-    /// origin. Internal by construction: `core::fetch_feeds` maps it to an unattempted feed
-    /// (`truncation.feeds_omitted`), never into `errors[]`, so it does not widen the
-    /// error contract. Unreachable when `FetchParams::deadline` is `None`.
+    /// origin. On the batch path it stays internal: `core::fetch_feeds` maps it to an
+    /// unattempted feed (`truncation.feeds_omitted`), never into `errors[]`. The single-URL
+    /// `discover_feeds` / `get_item` tools have no such envelope to defer into, so there it
+    /// surfaces as a `BATCH_DEADLINE_EXCEEDED` tool error — still "retry this", never "this
+    /// feed is broken". Unreachable when `FetchParams::deadline` is `None`.
     #[error("batch deadline passed before {url} was attempted")]
     DeadlineExceeded { url: String },
 
@@ -86,6 +92,11 @@ impl RssError {
             RssError::Usage(_) => "USAGE_ERROR",
             RssError::InvalidUrl(_) => "INVALID_URL",
             RssError::Network(_) => "NETWORK_ERROR",
+            // A `429` is a window, not a dead feed. It shares the gate's paceable code so an
+            // agent branches on one signal and waits, instead of reading an opaque
+            // `FEED_FETCH_FAILED` as "drop this source" (ADR-0016). Every other status stays a
+            // plain fetch failure — notably `403`, which is a block and must not be waited out.
+            RssError::Http { status: 429, .. } => "RATE_LIMITED",
             RssError::Http { .. } => "FEED_FETCH_FAILED",
             RssError::RateLimited { .. } => "RATE_LIMITED",
             RssError::DeadlineExceeded { .. } => "BATCH_DEADLINE_EXCEEDED",
@@ -108,11 +119,18 @@ impl RssError {
             RssError::Http {
                 status,
                 retry_after,
+                retry_after_hint,
                 ..
             } => {
                 obj.details = serde_json::json!({
                     "http_status": status,
                     "retry_after": retry_after,
+                    // Both pacing keys, exactly as the gate's own `RATE_LIMITED` emits them: a
+                    // `429` now shares that code, so a client must never have to know which
+                    // side refused to find the wait. `null` when the host is not in cooldown.
+                    "retry_after_seconds": retry_after_hint.map(|d| d.as_secs()),
+                    "retry_after_ms": retry_after_hint
+                        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)),
                 });
             }
             RssError::RateLimited { retry_after, .. } => {
@@ -149,14 +167,53 @@ mod tests {
     #[test]
     fn http_error_surfaces_retry_after_when_present() {
         let e = RssError::Http {
-            status: 429,
+            status: 503,
             url: "https://x".into(),
             retry_after: Some("2".into()),
+            retry_after_hint: None,
         };
         let obj = e.to_error_obj(None);
         assert_eq!(obj.code, "FEED_FETCH_FAILED");
-        assert_eq!(obj.details["http_status"], 429);
+        assert_eq!(obj.details["http_status"], 503);
         assert_eq!(obj.details["retry_after"], "2");
+    }
+
+    #[test]
+    fn a_429_is_paceable_and_every_other_status_is_a_plain_failure() {
+        // The bug this pins: a Reddit-style `429` (no `Retry-After` header at all) arrived as
+        // an opaque `FEED_FETCH_FAILED`, indistinguishable from a dead feed, so a digest agent
+        // dropped the source instead of waiting. The gate's learned cooldown rides along as
+        // `retry_after_seconds` — the same key the gate's own `RATE_LIMITED` uses.
+        let throttled = RssError::Http {
+            status: 429,
+            url: "https://x/feed".into(),
+            retry_after: None,
+            retry_after_hint: Some(Duration::from_secs(48)),
+        };
+        let obj = throttled.to_error_obj(Some("https://x/feed"));
+        assert_eq!(obj.code, "RATE_LIMITED");
+        // Both variants of `RATE_LIMITED` must present the same pacing shape, since the MCP
+        // guidance promises these two keys for the code, not for one of its two sources.
+        assert_eq!(obj.details["retry_after_seconds"], 48);
+        assert_eq!(obj.details["retry_after_ms"], 48_000);
+        // Display keeps naming the status, which is what a `SERVED_STALE` warning quotes.
+        assert!(obj.message.contains("429"), "message was {:?}", obj.message);
+
+        // `403` is a block, not a window: waiting it out is wrong, so it must not share the
+        // paceable code even though the gate retries both.
+        for status in [403, 404, 500] {
+            let e = RssError::Http {
+                status,
+                url: "https://x/feed".into(),
+                retry_after: None,
+                retry_after_hint: None,
+            };
+            assert_eq!(e.code(), "FEED_FETCH_FAILED", "status {status}");
+            assert_eq!(
+                e.to_error_obj(None).details["retry_after_seconds"],
+                serde_json::Value::Null
+            );
+        }
     }
 
     #[test]
