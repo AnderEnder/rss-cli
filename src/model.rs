@@ -198,9 +198,9 @@ pub enum FeedStatus {
     /// The feed failed to fetch or parse; see `error`.
     Error,
     /// The origin refused or failed the revalidation, so `items` come from the cached body.
-    /// Only reachable under `cache_policy: "stale-if-error"`. `error` stays `null` (the items
-    /// are real); the refusal is reported as a `SERVED_STALE` warning, and
-    /// `cache_age_seconds` gives the age. Counts as success for exit codes.
+    /// Only under `cache_policy: "stale-if-error"`, and only if the copy is newer than any
+    /// stated `since`. `error` stays `null` (items are real); the refusal rides in a
+    /// `SERVED_STALE` warning and `cache_age_seconds` gives the age. Counts as success.
     Stale,
 }
 

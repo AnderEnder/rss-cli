@@ -180,6 +180,9 @@ pub struct FetchArgs {
     /// Serve the last cached copy when the origin refuses to revalidate (`429`/`403`/`5xx`
     /// or a transport error) instead of failing the feed. Those feeds come back with
     /// `status: "stale"`, a `SERVED_STALE` warning, and count as success for the exit code.
+    ///
+    /// A copy older than `--since` is not served — it cannot answer that window, so the
+    /// feed fails as usual.
     #[arg(long, conflicts_with_all = ["no_cache", "max_age"])]
     pub stale_if_error: bool,
 

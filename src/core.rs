@@ -412,7 +412,7 @@ pub async fn fetch_one_until(
     stop_at: Option<tokio::time::Instant>,
 ) -> Result<(FeedResult, Vec<Warning>, usize), RssError> {
     let raw = http
-        .fetch_until(url, cache, params.cache_policy, stop_at)
+        .fetch_until(url, cache, params.cache_policy, stop_at, params.since)
         .await?;
     let parsed = parse::parse_feed(&raw.body, url, params)?;
     let item_count = parsed.items.len();
@@ -1542,6 +1542,76 @@ mod tests {
 
         m.assert_async().await;
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// End to end: this shipped `status: "stale"` at exit `0` before ADR-0022. Both bodies
+    /// on purpose — the undated one used to return items, so it shows the availability the
+    /// rule trades away.
+    #[tokio::test]
+    async fn a_stale_copy_that_cannot_cover_the_since_window_surfaces_the_rate_limit() {
+        const DATED: &str = r#"<rss version="2.0"><channel><title>t</title>
+            <item><title>Old</title><guid>t3_a</guid>
+                  <pubDate>Mon, 01 Jun 2026 00:00:00 GMT</pubDate></item>
+            </channel></rss>"#;
+        // Reddit's `…/comments/.rss` shape: undated, so `since` used to retain it.
+        const UNDATED: &str = r#"<rss version="2.0"><channel><title>t</title>
+            <item><title>Comment</title><guid>t1_b</guid></item>
+            </channel></rss>"#;
+
+        for (label, body) in [("dated", DATED), ("undated", UNDATED)] {
+            let mut server = mockito::Server::new_async().await;
+            let dir = std::env::temp_dir().join(format!("rss-cov-{label}-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let cache = Cache::open(Some(dir.clone())).unwrap();
+            let url = format!("{}/feed.xml", server.url());
+
+            let meta = crate::cache::CacheMeta {
+                feed_url: url.clone(),
+                etag: None,
+                last_modified: None,
+                fetched_at: (Utc::now() - chrono::Duration::days(8)).to_rfc3339(),
+                content_type: Some("application/rss+xml".to_string()),
+            };
+            cache.put(&meta, body.as_bytes()).expect("seed");
+
+            let m = server
+                .mock("GET", "/feed.xml")
+                .with_status(429)
+                .expect(2) // original + the single bounded retry
+                .create_async()
+                .await;
+
+            let http =
+                crate::fetch::HttpClient::new("t", std::time::Duration::from_secs(5)).unwrap();
+            let params = FetchParams {
+                cache_policy: CachePolicy::StaleIfError,
+                since: Some(Utc::now() - chrono::Duration::hours(24)),
+                ..Default::default()
+            };
+            let out = fetch_feeds_with(std::slice::from_ref(&url), &params, &cache, &http).await;
+            let feed = &out.feeds[0];
+
+            assert_eq!(feed.status, FeedStatus::Error, "{label}");
+            // `RATE_LIMITED`, not `FEED_FETCH_FAILED`: the agent needs to know to retry rather
+            // than drop the source (ADR-0021).
+            let err = feed
+                .error
+                .as_ref()
+                .expect("{label}: the refusal must surface");
+            assert_eq!(err.code, "RATE_LIMITED", "{label}");
+            assert!(
+                !out.warnings.iter().any(|w| w.code == "SERVED_STALE"),
+                "{label}: nothing was served stale, so nothing should claim it was"
+            );
+            assert_eq!(
+                exit_code_for(&out),
+                crate::error::exit::ALL_FAILED,
+                "{label}"
+            );
+
+            m.assert_async().await;
+            std::fs::remove_dir_all(&dir).ok();
+        }
     }
 
     #[tokio::test]

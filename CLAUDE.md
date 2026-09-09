@@ -123,6 +123,13 @@ One core powers both front-ends, so they cannot diverge
     reason rides in `warnings[]` as `SERVED_STALE`: overloading `error` would make
     `if (feed.error) skip(feed)` discard a usable feed. Age needs no new field —
     `cache_age_seconds` already exists. (ADR-0019)
+
+    **A copy older than a stated `since` is not served at all** — `fetch::covers_window` gates
+    the fallback on `fetched_at >= since`, and the origin's error propagates instead. Don't
+    swap it for a fixed max-age: `cache_age_seconds` is time since last *confirmation*, not
+    body age, so the predicate is *coverage*, not freshness. Pinned by
+    `fetch::tests::stale_if_error_declines_a_copy_that_cannot_cover_the_window`.
+    ([ADR-0022](./docs/adr/0022-stale-copies-that-cannot-cover-the-since-window.md))
 14. **Dedup reports by default; only `drop` removes.** `duplicates[]` groups on `guid` → `url`
     → `content_hash` and leaves `feeds[]`, order, and `item_count` untouched. Grouping runs
     *before* `paginate` (the budget must measure what ships), so on a paged response
@@ -152,6 +159,13 @@ One core powers both front-ends, so they cannot diverge
   `fetch::tests::retries_once_on_403_then_succeeds`.
 - **The MCP server reuses ONE `HttpClient`.** A per-call client reintroduces the concurrent-call
   429 burst (ADR-0016). Pinned by `mcp::tests::concurrent_fetches_share_one_client_and_gate`.
+- **`note_success` decays the escalation depth; it does not clear it** — and `note_throttled`
+  restarts the climb once `warm_until_ms` lapses. `store(0)` let interleaved same-host
+  successes discard depth the gate still held, understating `retry_after_ms`; without the
+  restart, a decayed depth would outlive any idle period. Both halves are load-bearing —
+  pinned by `a_success_decays_the_escalation_depth_instead_of_clearing_it` and
+  `a_throttle_after_the_warm_window_expires_starts_from_base`
+  ([ADR-0023](./docs/adr/0023-cooldown-escalation-decays-rather-than-resets.md)).
 - **The rate limiter has three separate bounds — don't merge them.** `RETRY_MAX_DELAY` (5 s)
   bounds one *in-flight* retry holding its host permit; `HOST_MAX_COOLDOWN`/`MAX_GATE_WAIT`
   (60 s) bound a *sibling's* gate wait; `FetchParams::deadline` bounds when a fetch may
@@ -166,6 +180,11 @@ One core powers both front-ends, so they cannot diverge
   (`min(MAX_GATE_WAIT, deadline)`), *not* a merge of the three above. Pinned by
   `core::tests::deadline_is_a_real_wall_clock_bound_for_a_throttled_same_host_batch`
   (asserts elapsed wall-clock — omission counts alone pass either way).
+- **`escalation_depth` is the one non-atomic field in `HostSlot`, deliberately.** Its update
+  is compound (test the warm window, move the depth, publish a new window); as separate
+  atomics, concurrent throttles each restart the ladder. The `Mutex` must span the *whole*
+  step — releasing it before publishing the window still loses updates. Pinned by
+  `ratelimit::tests::concurrent_throttles_after_a_lapse_each_advance_the_ladder_exactly_once`.
 - **Never hold the `HostGate` slot-map lock across an `.await`.** `slot_for` locks only to
   insert-and-clone the `Arc<HostSlot>`; all waiting uses the per-slot semaphore.
 - **A `429` is `RATE_LIMITED`; a `403` is not.** `RssError::Http` maps status 429 to the same

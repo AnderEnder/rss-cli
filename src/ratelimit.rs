@@ -16,7 +16,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
 use chrono::Utc;
@@ -72,8 +72,10 @@ fn authority_of(url: &str) -> String {
     }
 }
 
-/// Per-authority state. All timing fields are epoch-ms in atomics so they are read/updated
-/// lock-free; the only lock in the gate is the brief one around the slot map.
+/// Per-authority state. The timing fields are epoch-ms atomics, read/updated lock-free on the
+/// hot path. `escalation_depth` is behind a brief `Mutex` instead: its update is *compound*
+/// (test the warm window, move the depth, publish a new window) and an atomic read-then-write
+/// let concurrent throttles each restart the ladder. Never held across an `.await`.
 struct HostSlot {
     /// Concurrency cap for this host. `Arc` so `acquire_owned` yields a `'static` permit.
     sem: Arc<Semaphore>,
@@ -81,8 +83,10 @@ struct HostSlot {
     next_allowed_ms: AtomicI64,
     /// Epoch-ms until which the host is considered recently-throttled (sticky spacing on).
     warm_until_ms: AtomicI64,
-    /// Consecutive throttles with no intervening success — drives cooldown escalation.
-    consecutive_throttles: AtomicU32,
+    /// How far up the cooldown ladder this host has climbed. Rises on each throttle, decays
+    /// one rung per non-throttled response, and restarts once `warm_until_ms` lapses — so it
+    /// is a *depth*, not a streak count (ADR-0023).
+    escalation_depth: Mutex<u32>,
 }
 
 impl HostSlot {
@@ -91,7 +95,7 @@ impl HostSlot {
             sem: Arc::new(Semaphore::new(per_host.max(1))),
             next_allowed_ms: AtomicI64::new(0),
             warm_until_ms: AtomicI64::new(0),
-            consecutive_throttles: AtomicU32::new(0),
+            escalation_depth: Mutex::new(0),
         }
     }
 }
@@ -257,8 +261,9 @@ impl HostGate {
 
     /// The cooldown to apply on a throttle. Honors the server's `retry_after` (capped above
     /// only — no lower floor, since sticky spacing already prevents re-hammering); when the
-    /// server sent none, escalates `base · 2^(n-1)` with `n` = consecutive throttles, capped
-    /// at `max_cooldown`. Pure (no clock, no state) so it is directly unit-tested.
+    /// server sent none, escalates `base · 2^(n-1)` with `n` = the host's escalation depth
+    /// (not a streak count — see [`HostSlot::escalation_depth`]), capped at `max_cooldown`.
+    /// Pure (no clock, no state) so it is directly unit-tested.
     fn cooldown_for(&self, n: u32, retry_after: Option<Duration>) -> Duration {
         match retry_after {
             Some(d) => d.min(self.max_cooldown),
@@ -279,23 +284,52 @@ impl HostGate {
     /// bounded escalation of the base cooldown is used.
     pub fn note_throttled(&self, url: &str, retry_after: Option<Duration>) {
         let slot = self.slot_for_url(url);
-        let n = slot.consecutive_throttles.fetch_add(1, Ordering::Relaxed) + 1;
-        let cooldown = self.cooldown_for(n, retry_after);
-
+        // Held across the whole transition, publishing the new warm window included: a
+        // concurrent sibling must either see the old window and climb, or block here and then
+        // see the new one. Read-then-write let every sibling restart the ladder (ADR-0023).
+        let mut depth = slot
+            .escalation_depth
+            .lock()
+            .expect("host-slot depth poisoned");
         let now = now_ms();
+        // A host quiet for a whole `warm_window` is not on a streak — restart the climb.
+        *depth = if slot.warm_until_ms.load(Ordering::Relaxed) > now {
+            depth.saturating_add(1)
+        } else {
+            1
+        };
+        let cooldown = self.cooldown_for(*depth, retry_after);
+
         slot.next_allowed_ms
             .fetch_max(now + ms(cooldown), Ordering::Relaxed);
         slot.warm_until_ms
             .fetch_max(now + ms(self.warm_window), Ordering::Relaxed);
     }
 
-    /// Record a non-throttled response from `url`'s host: reset the escalation counter so the
-    /// next throttle starts from the base cooldown again. `warm_until` is left to decay on its
-    /// own, so a host that just recovered keeps light spacing briefly.
+    /// Record a non-throttled response from `url`'s host: step the escalation counter **down
+    /// one rung**. `warm_until` is left to decay on its own.
+    ///
+    /// A decay, not a reset — `store(0)` let interleaved same-host successes discard depth
+    /// the gate still held in `warm_until_ms`, understating `cooldown_remaining`
+    /// ([ADR-0023](../docs/adr/0023-cooldown-escalation-decays-rather-than-resets.md)).
     pub fn note_success(&self, url: &str) {
-        self.slot_for_url(url)
-            .consecutive_throttles
-            .store(0, Ordering::Relaxed);
+        let slot = self.slot_for_url(url);
+        let mut depth = slot
+            .escalation_depth
+            .lock()
+            .expect("host-slot depth poisoned");
+        *depth = depth.saturating_sub(1);
+    }
+
+    /// This host's current escalation depth. Test-facing: the transition is compound, so
+    /// reading the field directly invites asserting on a torn value.
+    #[cfg(test)]
+    fn depth_of(&self, authority: &str) -> u32 {
+        *self
+            .slot_for(authority)
+            .escalation_depth
+            .lock()
+            .expect("host-slot depth poisoned")
     }
 
     /// The host's remaining *pacing* delay (`next_allowed_ms`), if one is active — the window
@@ -353,6 +387,61 @@ mod tests {
         assert!(
             remaining > Duration::from_secs(25) && remaining <= Duration::from_secs(30),
             "expected ~30s, got {remaining:?}"
+        );
+    }
+
+    /// The reported `retry_after_ms` values (`16000`, `4000`, `60000`, one host, one run) are
+    /// ladder rungs — not per-feed, and not decayed remainders. The depths differed because
+    /// `note_success` used to clear the counter. ADR-0023.
+    #[test]
+    fn the_hint_is_the_shared_per_host_ladder_and_a_success_decays_its_depth() {
+        let g = gate();
+        // One authority for every subreddit: the hint can never be per-feed.
+        assert_eq!(
+            authority_of("https://www.reddit.com/r/AI_Agents/.rss"),
+            authority_of("https://www.reddit.com/r/rust/.rss")
+        );
+
+        // Headerless provider (ADR-0016): escalation supplies the window, so only ladder
+        // values are reachable.
+        let ladder: Vec<u128> = (1..=8)
+            .map(|n| g.cooldown_for(n, None).as_millis())
+            .collect();
+        for observed in [16_000u128, 4_000, 60_000] {
+            assert!(
+                ladder.contains(&observed),
+                "{observed} is not a reachable cooldown, so the hint was not freshly computed"
+            );
+        }
+        // The discriminator: anything decayed would land between rungs. None did.
+        assert!(
+            !ladder.contains(&3_847),
+            "a decayed remainder must not be mistakable for a fresh cooldown"
+        );
+
+        // A *sibling* success costs one rung, not the whole learned depth (ADR-0023).
+        let a = "https://www.reddit.com/r/AI_Agents/.rss";
+        let b = "https://www.reddit.com/r/rust/.rss";
+        for _ in 0..4 {
+            g.note_throttled(a, None);
+        }
+        let slot = g.slot_for_url(a);
+        assert_eq!(
+            g.depth_of("www.reddit.com:443"),
+            4,
+            "four consecutive throttles must actually reach depth 4"
+        );
+        assert_eq!(g.cooldown_for(4, None), Duration::from_secs(16));
+        g.note_success(b);
+        g.note_throttled(a, None);
+        assert_eq!(
+            g.depth_of("www.reddit.com:443"),
+            4,
+            "a sibling success costs one rung, not the whole learned depth"
+        );
+        assert!(
+            slot.warm_until_ms.load(Ordering::Relaxed) > now_ms(),
+            "yet the host is still warm — the gate knows it was recently throttled"
         );
     }
 
@@ -549,25 +638,105 @@ mod tests {
         );
     }
 
+    /// One success steps down one rung, not to the floor — a hard reset is what made a
+    /// `4000` hint reachable toward a host in a 60s-class limit. ADR-0023.
+    /// A host not throttled within `warm_window` is not on a streak, so the next throttle
+    /// starts from base. This is what bounds the decay's recovery cost (ADR-0023).
+    /// `RSS_HOST_CONCURRENCY` permits more than one in-flight request per host, so the
+    /// warm-window check and the depth update must be one transition. Read-then-write would
+    /// let every concurrent throttle observe the lapsed window and each restart the ladder,
+    /// losing all but one — understating the next cooldown.
     #[test]
-    fn note_success_resets_escalation_counter() {
+    fn concurrent_throttles_after_a_lapse_each_advance_the_ladder_exactly_once() {
+        const N: u32 = 8;
+        let g = std::sync::Arc::new(gate());
+        let url = "https://race.example.com/x";
+        // Lapsed window: every thread below starts out seeing "not recently throttled".
+        g.slot_for("race.example.com:443")
+            .warm_until_ms
+            .store(now_ms() - 1, Ordering::Relaxed);
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(N as usize));
+        let mut handles = Vec::new();
+        for _ in 0..N {
+            let (g, barrier) = (std::sync::Arc::clone(&g), std::sync::Arc::clone(&barrier));
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                g.note_throttled(url, None);
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        assert_eq!(
+            g.depth_of("race.example.com:443"),
+            N,
+            "every concurrent throttle must advance the ladder exactly once"
+        );
+    }
+
+    #[test]
+    fn a_throttle_after_the_warm_window_expires_starts_from_base() {
+        let g = gate();
+        let url = "https://idle.example.com/x";
+        let slot = g.slot_for("idle.example.com:443");
+        let depth = || g.depth_of("idle.example.com:443");
+
+        for _ in 0..4 {
+            g.note_throttled(url, None);
+        }
+        assert_eq!(depth(), 4);
+
+        // Lapse the warm window by moving it into the past — a sleep here would race the
+        // throttles above against their own window.
+        slot.warm_until_ms.store(now_ms() - 1, Ordering::Relaxed);
+        g.note_throttled(url, None);
+        assert_eq!(depth(), 1, "an idle host must not resume mid-ladder");
+        assert_eq!(g.cooldown_for(depth(), None), g.base_cooldown);
+    }
+
+    #[test]
+    fn a_success_decays_the_escalation_depth_instead_of_clearing_it() {
+        let g = gate();
+        let url = "https://decay.example.com/x";
+        let depth = || g.depth_of("decay.example.com:443");
+
+        for _ in 0..4 {
+            g.note_throttled(url, None);
+        }
+        assert_eq!(depth(), 4);
+
+        g.note_success(url);
+        assert_eq!(depth(), 3, "one success steps down one rung, not to zero");
+
+        // The next throttle resumes near the learned depth, not back at 2s.
+        g.note_throttled(url, None);
+        assert_eq!(depth(), 4);
+        assert_eq!(g.cooldown_for(depth(), None), Duration::from_secs(16));
+
+        // A genuinely recovered host still walks all the way back to the base cooldown.
+        for _ in 0..10 {
+            g.note_success(url);
+        }
+        assert_eq!(depth(), 0, "sustained success must fully clear the depth");
+        g.note_throttled(url, None);
+        assert_eq!(g.cooldown_for(depth(), None), g.base_cooldown);
+    }
+
+    #[test]
+    fn success_walks_the_escalation_counter_back_to_base() {
         let g = gate();
         let url = "https://esc.example.com/x";
         g.note_throttled(url, None);
         g.note_throttled(url, None);
-        assert_eq!(
-            g.slot_for("esc.example.com:443")
-                .consecutive_throttles
-                .load(Ordering::Relaxed),
-            2
-        );
+        assert_eq!(g.depth_of("esc.example.com:443"), 2);
+        g.note_success(url);
         g.note_success(url);
         assert_eq!(
-            g.slot_for("esc.example.com:443")
-                .consecutive_throttles
-                .load(Ordering::Relaxed),
+            g.depth_of("esc.example.com:443"),
             0,
-            "a success must reset the escalation counter so the next throttle starts from base"
+            "success must walk the counter back down so the next throttle starts from base"
         );
     }
 

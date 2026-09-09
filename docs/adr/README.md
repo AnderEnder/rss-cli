@@ -45,3 +45,5 @@ where a real fork existed). Statuses: `Proposed`, `Accepted`, `Superseded by NNN
 | [0019](0019-stale-if-error-cache-policy.md) | Serving stale on a refused revalidation (`stale-if-error`) | Accepted |
 | [0020](0020-per-feed-caller-watermarks.md) | Per-feed caller watermarks (`since_last_seen`) | Proposed |
 | [0021](0021-origin-429-is-rate-limited.md) | An origin `429` is `RATE_LIMITED`, not `FEED_FETCH_FAILED` | Accepted |
+| [0022](0022-stale-copies-that-cannot-cover-the-since-window.md) | A stale copy that cannot cover the `since` window | Accepted |
+| [0023](0023-cooldown-escalation-decays-rather-than-resets.md) | Cooldown escalation should decay, not reset | Accepted |
