@@ -478,7 +478,9 @@ struct FetchFeedArgs {
     /// (always refetch), `cache-first` (serve any cached copy without a network call),
     /// `stale-if-error` (revalidate, but serve the last cached copy when the origin refuses —
     /// a rate-limited feed comes back as `status: "stale"` with a `SERVED_STALE` warning
-    /// instead of failing), or `max-age:<duration>` (serve cache younger than e.g. `15m`).
+    /// instead of failing; a copy older than `since` is NOT served, so you get the origin's
+    /// `RATE_LIMITED` rather than a window it cannot answer), or `max-age:<duration>`
+    /// (serve cache younger than e.g. `15m`).
     /// Ignored on a continuation call (see `cursor`), which is always served cache-first.
     ///
     /// Prefer `stale-if-error` when fetching many feeds from one host (e.g. several Reddit

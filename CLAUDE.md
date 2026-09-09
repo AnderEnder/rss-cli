@@ -123,6 +123,13 @@ One core powers both front-ends, so they cannot diverge
     reason rides in `warnings[]` as `SERVED_STALE`: overloading `error` would make
     `if (feed.error) skip(feed)` discard a usable feed. Age needs no new field —
     `cache_age_seconds` already exists. (ADR-0019)
+
+    **A copy older than a stated `since` is not served at all** — `fetch::covers_window` gates
+    the fallback on `fetched_at >= since`, and the origin's error propagates instead. Don't
+    swap it for a fixed max-age: `cache_age_seconds` is time since last *confirmation*, not
+    body age, so the predicate is *coverage*, not freshness. Pinned by
+    `fetch::tests::stale_if_error_declines_a_copy_that_cannot_cover_the_window`.
+    ([ADR-0022](./docs/adr/0022-stale-copies-that-cannot-cover-the-since-window.md))
 14. **Dedup reports by default; only `drop` removes.** `duplicates[]` groups on `guid` → `url`
     → `content_hash` and leaves `feeds[]`, order, and `item_count` untouched. Grouping runs
     *before* `paginate` (the budget must measure what ships), so on a paged response
@@ -152,6 +159,11 @@ One core powers both front-ends, so they cannot diverge
   `fetch::tests::retries_once_on_403_then_succeeds`.
 - **The MCP server reuses ONE `HttpClient`.** A per-call client reintroduces the concurrent-call
   429 burst (ADR-0016). Pinned by `mcp::tests::concurrent_fetches_share_one_client_and_gate`.
+- **`note_success` decays the escalation depth; it does not clear it.** `store(0)` let
+  interleaved same-host successes discard depth `warm_until_ms` still held, so
+  `cooldown_remaining` understated `retry_after_ms`. Pinned by
+  `ratelimit::tests::a_success_decays_the_escalation_depth_instead_of_clearing_it`
+  ([ADR-0023](./docs/adr/0023-cooldown-escalation-decays-rather-than-resets.md)).
 - **The rate limiter has three separate bounds — don't merge them.** `RETRY_MAX_DELAY` (5 s)
   bounds one *in-flight* retry holding its host permit; `HOST_MAX_COOLDOWN`/`MAX_GATE_WAIT`
   (60 s) bound a *sibling's* gate wait; `FetchParams::deadline` bounds when a fetch may

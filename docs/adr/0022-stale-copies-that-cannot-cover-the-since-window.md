@@ -1,7 +1,6 @@
 # 22. A stale copy that cannot cover the `since` window
 
-- **Status:** Proposed — **not implemented.** Reverses a decision ADR-0019 took deliberately;
-  needs a call on that before code lands.
+- **Status:** Accepted. Narrows a decision ADR-0019 took deliberately — see Consequences.
 - **Date:** 2026-09-09
 
 ## Context
@@ -17,7 +16,7 @@ freshness floor can enforce it client-side on [`cache_age_seconds`]; the server 
 a staleness ceiling on the caller's behalf." That reasoning still holds for a *bare*
 `stale-if-error` fetch. It is weaker when the caller has already stated its window.
 
-### What actually ships today
+### What shipped before this
 
 Pinned by
 `core::tests::a_stale_body_older_than_the_since_window_flags_undated_items_unless_one_is_postdated`:
@@ -61,7 +60,7 @@ window may be missing, and by construction no dated item we hold can fall inside
 predicate is correct on a cleanly-revalidating feed too — a `304` ten minutes ago means full
 coverage of a 24h window, and `item_count: 0` is then a truthful "nothing new."
 
-## Proposal
+## Decision
 
 **When the caller passes `since` and `cache_age_seconds > (now - resolved_since)`, do not paper
 over the refusal.** Propagate the original `RssError` instead of downgrading it to a warning.
@@ -75,7 +74,7 @@ gives.
 No `since`, no window, no rule: a bare `stale-if-error` fetch keeps ADR-0019's behaviour
 exactly, which is its motivating case (a 40-minute-old subreddit beats no subreddit).
 
-## Consequences if accepted
+## Consequences
 
 - **An exit-code flip, reachable only by opt-in.** A fully-stale-and-uncovered batch goes from
   exit `0` to exit `4`. This is ADR-0019's own argument for making `stale-if-error` opt-in, now
@@ -84,6 +83,11 @@ exactly, which is its motivating case (a 40-minute-old subreddit beats no subred
 - **`since` grows a second meaning:** a filter over items *and* a coverage requirement on the
   cache. That is new surface on an existing parameter, and the cheaper-to-explain alternative
   is `max_stale` below.
+- **`SCHEMA_VERSION` stays `"2"`.** No serialized struct changed; a feed that used to come
+  back `stale` now comes back `error`, and both were already members of the closed `status`
+  enum. Which outcome a given request yields is behaviour, not schema — the same
+  classification ADR-0021 §6 used. Only the `FeedStatus::Stale` *description* moved, and a
+  description is not a contract.
 - **A partial regression of ADR-0019's availability win** for exactly the callers who scope by
   time — which is most digest callers. Worth stating plainly: this trades availability for
   honesty, and reasonable people would not all take that trade.

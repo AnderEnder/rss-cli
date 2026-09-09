@@ -38,6 +38,9 @@ pub enum CachePolicy {
     /// [RFC 5861](https://www.rfc-editor.org/rfc/rfc5861#section-4). Opt-in: it is the only
     /// policy that can produce [`crate::model::FeedStatus::Stale`]. See ADR-0019.
     ///
+    /// A copy older than a stated [`FetchParams::since`] is not served — it cannot answer
+    /// that window, so the origin's error stands (ADR-0022).
+    ///
     /// Deliberately *not* `stale-while-revalidate`, which serves stale proactively while
     /// refreshing in the background. This only reaches for the cache after a real refusal.
     StaleIfError,

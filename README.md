@@ -116,7 +116,7 @@ Notable flags:
 | `--no-cache` | — | Bypass the cache entirely (no read, no write). |
 | `--max-age <DUR>` | — | Serve from cache without revalidating if the entry is younger than `DUR`. |
 | `--refresh` | — | Force revalidation, ignoring `--max-age`. |
-| `--stale-if-error` | — | Serve the last cached copy when the origin refuses to revalidate (`429`/`403`/`5xx`), instead of failing the feed. |
+| `--stale-if-error` | — | Serve the last cached copy when the origin refuses to revalidate (`429`/`403`/`5xx`), instead of failing the feed. A copy older than `--since` is not served. |
 | `--user-agent <STRING>` | (tool default) | Override the `User-Agent` header. |
 
 Inputs (positional URLs, `-` for stdin, `--input`, `--opml`) are merged and
@@ -285,6 +285,12 @@ opt-in precisely so that the default `rss fetch` keeps exiting non-zero when it
 could not get fresh data — see
 [ADR-0019](docs/adr/0019-stale-if-error-cache-policy.md).
 
+A cached copy older than `--since` is **not** served this way. A copy written
+before the window opened cannot contain anything inside it, so serving it would
+report a guaranteed-empty answer as success and bury the `429`; the feed fails
+with `RATE_LIMITED` instead — see
+[ADR-0022](docs/adr/0022-stale-copies-that-cannot-cover-the-since-window.md).
+
 The cache exists only for conditional GETs and for resolving `show` lookups — it is
 **not** what makes item ids stable.
 
@@ -411,7 +417,8 @@ serves any cached copy with no network call at all; `max-age:<duration>` does th
 only when the cache is younger than that duration; `stale-if-error` revalidates like the
 default but falls back to the cached body when the origin **refuses** — a throttled feed comes
 back as `status: "stale"` (with a `SERVED_STALE` warning and a non-null `cache_age_seconds`)
-rather than as an error, which is what you want when sweeping many feeds from one host. It
+rather than as an error, which is what you want when sweeping many feeds from one host — but a
+cached copy older than `since` is not served, since it cannot answer that window (ADR-0022). It
 pages normally, since it still writes on the success path. A continuation page (`cursor`) forces
 `cache-first` for the whole page, so a feed already cached comes back
 `not_modified`/`from_cache: true` whether or not it actually changed. Each

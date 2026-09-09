@@ -289,13 +289,18 @@ impl HostGate {
             .fetch_max(now + ms(self.warm_window), Ordering::Relaxed);
     }
 
-    /// Record a non-throttled response from `url`'s host: reset the escalation counter so the
-    /// next throttle starts from the base cooldown again. `warm_until` is left to decay on its
-    /// own, so a host that just recovered keeps light spacing briefly.
+    /// Record a non-throttled response from `url`'s host: step the escalation counter **down
+    /// one rung**. `warm_until` is left to decay on its own.
+    ///
+    /// A decay, not a reset — `store(0)` let interleaved same-host successes discard depth
+    /// the gate still held in `warm_until_ms`, understating `cooldown_remaining`
+    /// ([ADR-0023](../docs/adr/0023-cooldown-escalation-decays-rather-than-resets.md)).
     pub fn note_success(&self, url: &str) {
-        self.slot_for_url(url)
-            .consecutive_throttles
-            .store(0, Ordering::Relaxed);
+        let _ = self.slot_for_url(url).consecutive_throttles.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |n| Some(n.saturating_sub(1)),
+        );
     }
 
     /// The host's remaining *pacing* delay (`next_allowed_ms`), if one is active — the window
@@ -356,12 +361,11 @@ mod tests {
         );
     }
 
-    /// The reported `retry_after_ms` sequence (`16000`, `4000`, `4000`, `60000` on one run
-    /// against one host) is the escalation ladder read at four counter depths — not a per-feed
-    /// estimate and not a decaying remainder. `note_success` hard-resets the depth while
-    /// `warm_until_ms` still has time left, so the ladder sawtooths; see ADR-0023.
+    /// The reported `retry_after_ms` values (`16000`, `4000`, `60000`, one host, one run) are
+    /// ladder rungs — not per-feed, and not decayed remainders. The depths differed because
+    /// `note_success` used to clear the counter. ADR-0023.
     #[test]
-    fn the_hint_is_the_shared_per_host_ladder_and_a_success_resets_its_depth() {
+    fn the_hint_is_the_shared_per_host_ladder_and_a_success_decays_its_depth() {
         let g = gate();
         // One authority for every subreddit: the hint can never be per-feed.
         assert_eq!(
@@ -369,8 +373,8 @@ mod tests {
             authority_of("https://www.reddit.com/r/rust/.rss")
         );
 
-        // Headerless provider (ADR-0016's probe found no `Retry-After`): escalation supplies
-        // the window, so only ladder values are reachable. Every reported number is on it.
+        // Headerless provider (ADR-0016): escalation supplies the window, so only ladder
+        // values are reachable.
         let ladder: Vec<u128> = (1..=8)
             .map(|n| g.cooldown_for(n, None).as_millis())
             .collect();
@@ -380,15 +384,13 @@ mod tests {
                 "{observed} is not a reachable cooldown, so the hint was not freshly computed"
             );
         }
-        // The discriminator: `cooldown_remaining` subtracts a *second* clock read, so a value
-        // that had decayed at all would land between rungs. None did.
+        // The discriminator: anything decayed would land between rungs. None did.
         assert!(
             !ladder.contains(&3_847),
             "a decayed remainder must not be mistakable for a fresh cooldown"
         );
 
-        // The sawtooth: four throttles reach the 16s rung, then one *sibling* success drops
-        // the shared depth back to the 2s rung.
+        // A *sibling* success costs one rung, not the whole learned depth (ADR-0023).
         let a = "https://www.reddit.com/r/AI_Agents/.rss";
         let b = "https://www.reddit.com/r/rust/.rss";
         for _ in 0..4 {
@@ -405,8 +407,8 @@ mod tests {
         g.note_throttled(a, None);
         assert_eq!(
             slot.consecutive_throttles.load(Ordering::Relaxed),
-            1,
-            "a sibling success resets escalation depth for the whole host"
+            4,
+            "a sibling success costs one rung, not the whole learned depth"
         );
         assert!(
             slot.warm_until_ms.load(Ordering::Relaxed) > now_ms(),
@@ -607,8 +609,42 @@ mod tests {
         );
     }
 
+    /// One success steps down one rung, not to the floor — a hard reset is what made a
+    /// `4000` hint reachable toward a host in a 60s-class limit. ADR-0023.
     #[test]
-    fn note_success_resets_escalation_counter() {
+    fn a_success_decays_the_escalation_depth_instead_of_clearing_it() {
+        let g = gate();
+        let url = "https://decay.example.com/x";
+        let depth = || {
+            g.slot_for("decay.example.com:443")
+                .consecutive_throttles
+                .load(Ordering::Relaxed)
+        };
+
+        for _ in 0..4 {
+            g.note_throttled(url, None);
+        }
+        assert_eq!(depth(), 4);
+
+        g.note_success(url);
+        assert_eq!(depth(), 3, "one success steps down one rung, not to zero");
+
+        // The next throttle resumes near the learned depth, not back at 2s.
+        g.note_throttled(url, None);
+        assert_eq!(depth(), 4);
+        assert_eq!(g.cooldown_for(depth(), None), Duration::from_secs(16));
+
+        // A genuinely recovered host still walks all the way back to the base cooldown.
+        for _ in 0..10 {
+            g.note_success(url);
+        }
+        assert_eq!(depth(), 0, "sustained success must fully clear the depth");
+        g.note_throttled(url, None);
+        assert_eq!(g.cooldown_for(depth(), None), g.base_cooldown);
+    }
+
+    #[test]
+    fn success_walks_the_escalation_counter_back_to_base() {
         let g = gate();
         let url = "https://esc.example.com/x";
         g.note_throttled(url, None);
@@ -620,12 +656,13 @@ mod tests {
             2
         );
         g.note_success(url);
+        g.note_success(url);
         assert_eq!(
             g.slot_for("esc.example.com:443")
                 .consecutive_throttles
                 .load(Ordering::Relaxed),
             0,
-            "a success must reset the escalation counter so the next throttle starts from base"
+            "success must walk the counter back down so the next throttle starts from base"
         );
     }
 

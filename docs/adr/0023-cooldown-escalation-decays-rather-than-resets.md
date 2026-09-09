@@ -1,6 +1,6 @@
 # 23. Cooldown escalation should decay, not reset
 
-- **Status:** Proposed — **not implemented.**
+- **Status:** Accepted
 - **Date:** 2026-09-09
 
 ## Context
@@ -30,8 +30,8 @@ within a millisecond of `note_throttled` writing them — so the counter genuine
 
 ### The actual cause
 
-`note_success` **hard-stores `0`** into `consecutive_throttles`, while `warm_until_ms` still
-holds up to `warm_window` (120 s) of "this host was recently throttled." With `per_host = 1`
+`note_success` **hard-stored `0`** into `consecutive_throttles`, while `warm_until_ms` still
+held up to `warm_window` (120 s) of "this host was recently throttled." With `per_host = 1`
 and ~15 same-host feeds, any interleaved non-throttled response wipes the learned depth, so the
 ladder sawtooths: a `16000` is followed by a `4000` toward a host whose real limit has not
 moved. The gate is discarding information it is still separately tracking.
@@ -39,7 +39,7 @@ moved. The gate is discarding information it is still separately tracking.
 The reported conclusion was right and the reported mechanism was not, which matters because it
 changes the fix: nothing is wrong with the escalation curve or with per-host keying.
 
-## Proposal
+## Decision
 
 **Decay the counter instead of resetting it:** `saturating_sub(1)` in place of `store(0)`, so
 one success steps the ladder down one rung rather than to the floor. `warm_until_ms` already
@@ -48,16 +48,18 @@ consistent instead of contradicting each other.
 
 Two smaller points in the same function, worth deciding together:
 
-- `is_retryable` is `403`/`429` only, so `note_success` currently also fires on a `404` or a
-  `500`. Truthful under its own doc comment ("a non-throttled response") but it means an
-  origin *outage* resets throttle learning.
+- `is_retryable` is `403`/`429` only, so `note_success` also fires on a `404` or a `500`.
+  Truthful under its own doc comment ("a non-throttled response"), and the decay largely
+  defuses it: an outage now costs one rung per response instead of the whole depth. Left as
+  is rather than widened, which would need its own reasoning about what a `5xx` means for
+  pacing.
 - `cooldown_remaining` is documented as pacing-only, "not an end-to-end time-to-send"
   ([ADR-0021](0021-origin-429-is-rate-limited.md) §3). That is correct and should stay. The
   gap is that a client cannot tell the shipped number is the *gate's* window rather than an
   estimate of the origin's limit — worth a wording pass on the shipped MCP guidance, not a
   behaviour change.
 
-## Consequences if accepted
+## Consequences
 
 - A host under sustained concurrent pressure holds its learned depth, so `retry_after_ms`
   stops understating. A caller's single bounded retry lands after the window instead of inside
@@ -69,8 +71,9 @@ Two smaller points in the same function, worth deciding together:
 - No serialized struct and no error code changes — runtime only, so `SCHEMA_VERSION` stays
   `"2"`. Same classification as ADR-0021 §6.
 - `ratelimit::tests::note_success_resets_escalation_counter` asserts the current hard reset and
-  would need to change with it — it pins the behaviour this ADR proposes to alter, which is
-  what a pin is for.
+  has to change with it — it pins the behaviour this ADR alters, which is what a pin is for.
+  It is now `success_walks_the_escalation_counter_back_to_base`, and the decay itself is pinned
+  by `a_success_decays_the_escalation_depth_instead_of_clearing_it`.
 
 ## Alternatives considered
 

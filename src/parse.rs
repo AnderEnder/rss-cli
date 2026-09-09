@@ -683,6 +683,24 @@ mod tests {
     }
 
     #[test]
+    fn one_dated_item_suppresses_the_undated_warning_for_every_item_beside_it() {
+        // `collect_warnings` needs *all* survivors undated, so `UNDATED_ITEMS` is not a
+        // per-item flag and must not be read as a freshness signal (ADR-0022).
+        let mixed = r#"<rss version="2.0"><channel><title>t</title>
+            <item><title>Dated</title><guid>d</guid>
+                  <pubDate>Mon, 01 Jun 2026 00:00:00 GMT</pubDate></item>
+            <item><title>Undated</title><guid>u</guid></item>
+            </channel></rss>"#;
+
+        let parsed = parse_feed(mixed.as_bytes(), FEED_URL, &params()).unwrap();
+        assert_eq!(parsed.items.len(), 2);
+        assert!(
+            parsed.warnings.iter().all(|w| w.code != "UNDATED_ITEMS"),
+            "one dated survivor suppresses the flag for the undated item beside it"
+        );
+    }
+
+    #[test]
     fn dated_feed_has_no_undated_warning() {
         // RSS has pubDates, so ordering is reliable and no warning should fire.
         let parsed = parse_feed(RSS.as_bytes(), FEED_URL, &params()).unwrap();

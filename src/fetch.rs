@@ -96,7 +96,7 @@ impl HttpClient {
         cache: &Cache,
         policy: CachePolicy,
     ) -> Result<RawFeed, RssError> {
-        self.fetch_until(url, cache, policy, None).await
+        self.fetch_until(url, cache, policy, None, None).await
     }
 
     /// [`fetch`](Self::fetch) bounded by an absolute batch deadline: a fetch that cannot even
@@ -109,6 +109,7 @@ impl HttpClient {
         cache: &Cache,
         policy: CachePolicy,
         stop_at: Option<tokio::time::Instant>,
+        coverage_floor: Option<DateTime<Utc>>,
     ) -> Result<RawFeed, RssError> {
         match policy {
             // Never touch the cache: a plain GET returning whatever the server sends.
@@ -191,6 +192,11 @@ impl HttpClient {
                     // the fallback simply did not work, and the caller should see the origin's
                     // `429` — not a `CACHE_ERROR` that masks what actually happened.
                     match cache.get(url).ok().flatten() {
+                        // Serving a copy from before the window reports a guaranteed-empty
+                        // answer as success and hides the refusal (ADR-0022).
+                        Some(entry) if !covers_window(&entry.meta.fetched_at, coverage_floor) => {
+                            Err(e)
+                        }
                         Some(entry) => Ok(RawFeed {
                             body: entry.body,
                             final_url: url.to_string(),
@@ -383,6 +389,15 @@ fn retry_after_raw(headers: &HeaderMap) -> Option<String> {
 
 const RETRY_BASE_DELAY: Duration = Duration::from_millis(500);
 const RETRY_MAX_DELAY: Duration = Duration::from_secs(5);
+
+/// Whether a copy written at `fetched_at` can cover a window opening at `floor` (the
+/// caller's *resolved* `since`). `None` floor = no window stated, so anything covers.
+/// An unreadable stamp does not cover — serve only when provably covering
+/// ([ADR-0022](../docs/adr/0022-stale-copies-that-cannot-cover-the-since-window.md)).
+fn covers_window(fetched_at: &str, floor: Option<DateTime<Utc>>) -> bool {
+    let Some(floor) = floor else { return true };
+    DateTime::parse_from_rfc3339(fetched_at).is_ok_and(|dt| dt.with_timezone(&Utc) >= floor)
+}
 
 /// Whether an error means *the origin refused or failed to answer* — the only class
 /// [`CachePolicy::StaleIfError`] may paper over with a cached body (ADR-0019).
@@ -940,6 +955,156 @@ mod tests {
             content_type: Some("application/rss+xml".to_string()),
         };
         cache.put(&meta, body).expect("seed cache");
+    }
+
+    /// Seed with an explicit `fetched_at`, for the coverage tests below.
+    fn seed_at(cache: &Cache, url: &str, body: &[u8], fetched_at: DateTime<Utc>) {
+        let meta = CacheMeta {
+            feed_url: url.to_string(),
+            etag: Some("\"seeded\"".to_string()),
+            last_modified: None,
+            fetched_at: fetched_at.to_rfc3339(),
+            content_type: Some("application/rss+xml".to_string()),
+        };
+        cache.put(&meta, body).expect("seed cache");
+    }
+
+    /// The reported digest run: 8 days cached, 24h asked for. ADR-0022.
+    #[test]
+    fn covers_window_is_a_coverage_test_not_a_freshness_test() {
+        let floor = Utc::now() - chrono::Duration::hours(24);
+        let at = |d: chrono::Duration| (Utc::now() - d).to_rfc3339();
+
+        assert!(
+            covers_window(&at(chrono::Duration::days(3650)), None),
+            "no window, any age"
+        );
+        assert!(
+            covers_window(&at(chrono::Duration::hours(1)), Some(floor)),
+            "inside"
+        );
+        assert!(
+            !covers_window(&at(chrono::Duration::days(8)), Some(floor)),
+            "before it opened"
+        );
+        // An unreadable stamp proves nothing. Defensive: `now_rfc3339()` is the only producer.
+        assert!(!covers_window("not a timestamp", Some(floor)));
+        assert!(
+            covers_window("not a timestamp", None),
+            "with no window there is nothing to prove coverage of"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_if_error_declines_a_copy_that_cannot_cover_the_window() {
+        let mut server = mockito::Server::new_async().await;
+        let dir = temp_cache_dir("stale-uncovered");
+        let cache = Cache::open(Some(dir.clone())).expect("open cache");
+        let url = format!("{}/feed.xml", server.url());
+        // The reported digest run: 8 days cached, 24h asked for.
+        seed_at(
+            &cache,
+            &url,
+            b"<rss>cached</rss>",
+            Utc::now() - chrono::Duration::days(8),
+        );
+
+        let m = server
+            .mock("GET", "/feed.xml")
+            .with_status(429)
+            .expect(2)
+            .create_async()
+            .await;
+
+        let err = client()
+            .fetch_until(
+                &url,
+                &cache,
+                CachePolicy::StaleIfError,
+                None,
+                Some(Utc::now() - chrono::Duration::hours(24)),
+            )
+            .await
+            .expect_err("a copy older than the window must not be served as a stale success");
+
+        // The origin's own error, not a substitute: a 429 is `RATE_LIMITED` (ADR-0021).
+        match err {
+            RssError::Http { status, .. } => assert_eq!(status, 429),
+            other => panic!("expected the origin's Http error, got {other:?}"),
+        }
+        m.assert_async().await;
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The other side: a copy inside the window still covers it, so ADR-0019 holds for a
+    /// caller polling faster than it scopes.
+    #[tokio::test]
+    async fn stale_if_error_still_serves_a_copy_that_covers_the_window() {
+        let mut server = mockito::Server::new_async().await;
+        let dir = temp_cache_dir("stale-covered");
+        let cache = Cache::open(Some(dir.clone())).expect("open cache");
+        let url = format!("{}/feed.xml", server.url());
+        seed_at(
+            &cache,
+            &url,
+            b"<rss>cached</rss>",
+            Utc::now() - chrono::Duration::hours(1),
+        );
+
+        let m = server
+            .mock("GET", "/feed.xml")
+            .with_status(429)
+            .expect(2)
+            .create_async()
+            .await;
+
+        let raw = client()
+            .fetch_until(
+                &url,
+                &cache,
+                CachePolicy::StaleIfError,
+                None,
+                Some(Utc::now() - chrono::Duration::hours(24)),
+            )
+            .await
+            .expect("an hour-old copy covers a 24h window");
+
+        assert!(raw.from_cache);
+        assert!(raw.stale_reason.is_some());
+        m.assert_async().await;
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// No window, no rule — a bare `stale-if-error` fetch keeps ADR-0019 exactly.
+    #[tokio::test]
+    async fn stale_if_error_without_a_window_serves_any_age() {
+        let mut server = mockito::Server::new_async().await;
+        let dir = temp_cache_dir("stale-nowindow");
+        let cache = Cache::open(Some(dir.clone())).expect("open cache");
+        let url = format!("{}/feed.xml", server.url());
+        seed_at(
+            &cache,
+            &url,
+            b"<rss>cached</rss>",
+            Utc::now() - chrono::Duration::days(8),
+        );
+
+        let m = server
+            .mock("GET", "/feed.xml")
+            .with_status(429)
+            .expect(2)
+            .create_async()
+            .await;
+
+        let raw = client()
+            .fetch_until(&url, &cache, CachePolicy::StaleIfError, None, None)
+            .await
+            .expect("with no window stated, any cached copy is still the best available truth");
+
+        assert!(raw.from_cache);
+        assert!(raw.stale_reason.is_some());
+        m.assert_async().await;
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
