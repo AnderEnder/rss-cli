@@ -286,9 +286,9 @@ could not get fresh data — see
 [ADR-0019](docs/adr/0019-stale-if-error-cache-policy.md).
 
 A cached copy older than `--since` is **not** served this way. A copy written
-before the window opened cannot contain anything inside it, so serving it would
-report a guaranteed-empty answer as success and bury the `429`; the feed fails
-with `RATE_LIMITED` instead — see
+before the window opened cannot reliably cover it — anything that survives
+`--since` does so because it is undated, not because it is in-window — so
+serving it would bury the `429`; the feed fails with `RATE_LIMITED` instead — see
 [ADR-0022](docs/adr/0022-stale-copies-that-cannot-cover-the-since-window.md).
 
 The cache exists only for conditional GETs and for resolving `show` lookups — it is

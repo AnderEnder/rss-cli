@@ -102,7 +102,9 @@ Two smaller points in the same function, worth deciding together:
   to the intent, but it makes recovery depend on two pieces of state instead of one, and
   `saturating_sub(1)` already degrades gracefully.
 - **Report an end-to-end time-to-send** (pacing + permit queue). Rejected: ADR-0021 §3 keeps
-  those apart deliberately, and the queue depth is not knowable without holding the slot-map
-  lock across the estimate — which the gate must never do.
+  those apart deliberately, and the number is not available anyway — `tokio::sync::Semaphore`
+  exposes `available_permits()` but not its waiter count, and even if it did, the estimate
+  would be stale on arrival: it depends on how long each in-flight request runs and on
+  siblings that queue after the estimate is taken.
 - **Parse provider-specific rate-limit headers.** Already rejected by ADR-0021; the gate's
   observed number needs no per-provider constant to drift.

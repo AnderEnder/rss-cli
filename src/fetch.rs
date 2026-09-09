@@ -196,8 +196,8 @@ impl HttpClient {
                     // the fallback simply did not work, and the caller should see the origin's
                     // `429` — not a `CACHE_ERROR` that masks what actually happened.
                     match cache.get(url).ok().flatten() {
-                        // Serving a copy from before the window reports a guaranteed-empty
-                        // answer as success and hides the refusal (ADR-0022).
+                        // A copy from before the window cannot cover it — anything that
+                        // survives `since` does so undated, not in-window (ADR-0022).
                         Some(entry) if !covers_window(&entry.meta.fetched_at, coverage_floor) => {
                             Err(e)
                         }

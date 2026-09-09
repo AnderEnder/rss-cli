@@ -55,10 +55,14 @@ explicit, and a feed that `304`s hourly holds `cache_age_seconds ≈ 1h` however
 item is. A ceiling built on "the data is too old" would therefore be wrong in both directions.
 
 The sound predicate is: **is the unconfirmed gap wider than the window the caller asked
-about?** When `cache_age_seconds > since_window`, any item published inside the requested
-window may be missing, and by construction no dated item we hold can fall inside it. That
-predicate is correct on a cleanly-revalidating feed too — a `304` ten minutes ago means full
-coverage of a 24h window, and `item_count: 0` is then a truthful "nothing new."
+about?** When `cache_age_seconds > since_window` the gap spans the whole requested window, so
+any item published inside it may be missing — and anything we *do* hold that survives `since`
+survives because it is undated or postdated, not because it is demonstrably in-window. Per the
+table above, that makes the copy *unable to cover* the window, **not** *guaranteed empty*; the
+rule rests on the former.
+
+The predicate is correct on a cleanly-revalidating feed too — a `304` ten minutes ago means
+full coverage of a 24h window, and `item_count: 0` is then a truthful "nothing new."
 
 ## Decision
 
