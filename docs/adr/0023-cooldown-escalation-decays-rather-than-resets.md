@@ -48,6 +48,16 @@ streak count. `warm_until_ms` already
 encodes "recently throttled" and is left to expire on its own, so the two signals stay
 consistent instead of contradicting each other.
 
+**The transition is serialized, not lock-free.** Testing the warm window, moving the depth,
+and publishing the new window are one compound step: as three separate atomic operations,
+concurrent throttles under `RSS_HOST_CONCURRENCY > 1` all observe the lapsed window and each
+restart the ladder, so eight simultaneous throttles land on depth `1` instead of `8` and the
+next cooldown is understated by five rungs. `escalation_depth` therefore moves from
+`AtomicU32` to a brief `Mutex<u32>`, held across the *whole* step — releasing it before the
+window is published still loses updates (measurably: 6–7 of 8). This is the one place in
+`HostSlot` that is not lock-free, and it is never held across an `.await`. Pinned by
+`concurrent_throttles_after_a_lapse_each_advance_the_ladder_exactly_once`.
+
 Two smaller points in the same function, worth deciding together:
 
 - `is_retryable` is `403`/`429` only, so `note_success` also fires on a `404` or a `500`.

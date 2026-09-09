@@ -180,6 +180,11 @@ One core powers both front-ends, so they cannot diverge
   (`min(MAX_GATE_WAIT, deadline)`), *not* a merge of the three above. Pinned by
   `core::tests::deadline_is_a_real_wall_clock_bound_for_a_throttled_same_host_batch`
   (asserts elapsed wall-clock — omission counts alone pass either way).
+- **`escalation_depth` is the one non-atomic field in `HostSlot`, deliberately.** Its update
+  is compound (test the warm window, move the depth, publish a new window); as separate
+  atomics, concurrent throttles each restart the ladder. The `Mutex` must span the *whole*
+  step — releasing it before publishing the window still loses updates. Pinned by
+  `ratelimit::tests::concurrent_throttles_after_a_lapse_each_advance_the_ladder_exactly_once`.
 - **Never hold the `HostGate` slot-map lock across an `.await`.** `slot_for` locks only to
   insert-and-clone the `Arc<HostSlot>`; all waiting uses the per-slot semaphore.
 - **A `429` is `RATE_LIMITED`; a `403` is not.** `RssError::Http` maps status 429 to the same
