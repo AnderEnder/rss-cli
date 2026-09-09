@@ -30,7 +30,7 @@ within a millisecond of `note_throttled` writing them — so the counter genuine
 
 ### The actual cause
 
-`note_success` **hard-stored `0`** into `consecutive_throttles`, while `warm_until_ms` still
+`note_success` **hard-stored `0`** into the escalation depth, while `warm_until_ms` still
 held up to `warm_window` (120 s) of "this host was recently throttled." With `per_host = 1`
 and ~15 same-host feeds, any interleaved non-throttled response wipes the learned depth, so the
 ladder sawtooths: a `16000` is followed by a `4000` toward a host whose real limit has not
@@ -42,7 +42,9 @@ changes the fix: nothing is wrong with the escalation curve or with per-host key
 ## Decision
 
 **Decay the counter instead of resetting it:** `saturating_sub(1)` in place of `store(0)`, so
-one success steps the ladder down one rung rather than to the floor. `warm_until_ms` already
+one success steps the ladder down one rung rather than to the floor. The field is
+`escalation_depth`, renamed from `consecutive_throttles` — under a decay it is a depth, not a
+streak count. `warm_until_ms` already
 encodes "recently throttled" and is left to expire on its own, so the two signals stay
 consistent instead of contradicting each other.
 
@@ -66,8 +68,13 @@ Two smaller points in the same function, worth deciding together:
   it.
 - **Slower recovery.** A host that genuinely recovers takes `n` successes to walk back to the
   base cooldown rather than one, so the first post-recovery throttle waits longer than it
-  needs to. This is the real cost and it is the mirror of the current bug; `warm_window` bounds
-  how long it can matter.
+  needs to. This is the real cost and it is the mirror of the bug.
+- **`warm_window` bounds that cost, but only because `note_throttled` enforces it.** Depth is
+  touched *only* by a response, so a decay alone would let an elevated depth survive an
+  arbitrarily long idle period — a host quiet for a day would resume mid-ladder. Restarting
+  the climb when `warm_until_ms` has lapsed is what makes "not throttled recently" mean "not
+  on a streak." Pinned by
+  `ratelimit::tests::a_throttle_after_the_warm_window_expires_starts_from_base`.
 - No serialized struct and no error code changes — runtime only, so `SCHEMA_VERSION` stays
   `"2"`. Same classification as ADR-0021 §6.
 - `ratelimit::tests::note_success_resets_escalation_counter` asserts the current hard reset and

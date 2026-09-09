@@ -159,10 +159,12 @@ One core powers both front-ends, so they cannot diverge
   `fetch::tests::retries_once_on_403_then_succeeds`.
 - **The MCP server reuses ONE `HttpClient`.** A per-call client reintroduces the concurrent-call
   429 burst (ADR-0016). Pinned by `mcp::tests::concurrent_fetches_share_one_client_and_gate`.
-- **`note_success` decays the escalation depth; it does not clear it.** `store(0)` let
-  interleaved same-host successes discard depth `warm_until_ms` still held, so
-  `cooldown_remaining` understated `retry_after_ms`. Pinned by
-  `ratelimit::tests::a_success_decays_the_escalation_depth_instead_of_clearing_it`
+- **`note_success` decays the escalation depth; it does not clear it** — and `note_throttled`
+  restarts the climb once `warm_until_ms` lapses. `store(0)` let interleaved same-host
+  successes discard depth the gate still held, understating `retry_after_ms`; without the
+  restart, a decayed depth would outlive any idle period. Both halves are load-bearing —
+  pinned by `a_success_decays_the_escalation_depth_instead_of_clearing_it` and
+  `a_throttle_after_the_warm_window_expires_starts_from_base`
   ([ADR-0023](./docs/adr/0023-cooldown-escalation-decays-rather-than-resets.md)).
 - **The rate limiter has three separate bounds — don't merge them.** `RETRY_MAX_DELAY` (5 s)
   bounds one *in-flight* retry holding its host permit; `HOST_MAX_COOLDOWN`/`MAX_GATE_WAIT`

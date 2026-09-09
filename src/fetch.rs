@@ -99,10 +99,14 @@ impl HttpClient {
         self.fetch_until(url, cache, policy, None, None).await
     }
 
-    /// [`fetch`](Self::fetch) bounded by an absolute batch deadline: a fetch that cannot even
-    /// *start* before `stop_at` yields [`RssError::DeadlineExceeded`] from the per-host gate
-    /// rather than queueing behind a cooldown that outlives the caller's timeout. See
-    /// [`HostGate::acquire_until`]. `None` is the unbounded (CLI) behaviour.
+    /// [`fetch`](Self::fetch) with both bounds made explicit. Two independent `Option`s:
+    ///
+    /// - `stop_at` — a fetch that cannot even *start* by this instant yields
+    ///   [`RssError::DeadlineExceeded`] from the per-host gate rather than queueing behind a
+    ///   cooldown that outlives the caller's timeout (see [`HostGate::acquire_until`]).
+    ///   `None` is unbounded, which is the CLI's behaviour.
+    /// - `coverage_floor` — see [`covers_window`]. `None` means no window was stated, so a
+    ///   cached copy of any age may be served on a refusal.
     pub async fn fetch_until(
         &self,
         url: &str,
