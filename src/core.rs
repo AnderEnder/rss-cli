@@ -1544,6 +1544,109 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// What a `since`-scoped fetch really ships when the cached copy is older than the window
+    /// — the reported digest run (8-day-old entry, `since: "24h"`, `stale-if-error`).
+    ///
+    /// Absent postdating a *dated* survivor is impossible (`published <= fetched_at < now -
+    /// window`), so every survivor is undated and `UNDATED_ITEMS` fires. The hole is the third
+    /// case: `collect_warnings` requires **all** survivors undated, so one postdated item
+    /// suppresses the flag for every week-old undated item beside it. Don't treat
+    /// `UNDATED_ITEMS` as a freshness signal — `cache_age_seconds` is the one that always
+    /// arrives. See ADR-0022.
+    #[tokio::test]
+    async fn a_stale_body_older_than_the_since_window_flags_undated_items_unless_one_is_postdated()
+    {
+        let future = (Utc::now() + chrono::Duration::days(1)).to_rfc2822();
+        let cases: [(&str, String, usize, bool); 3] = [
+            // Dated: `since` empties it. Truthful, but "no news" now looks like "nothing new".
+            (
+                "dated",
+                r#"<item><title>Old</title><guid>t3_a</guid>
+                   <pubDate>Mon, 01 Jun 2026 00:00:00 GMT</pubDate></item>"#
+                    .to_string(),
+                0,
+                false,
+            ),
+            // Reddit's `…/comments/.rss` shape: undated throughout, so the flag fires.
+            (
+                "undated",
+                r#"<item><title>Comment</title><guid>t1_b</guid></item>"#.to_string(),
+                1,
+                true,
+            ),
+            // The suppression: one postdated entry makes `all(key.is_none())` false.
+            (
+                "postdated+undated",
+                format!(
+                    r#"<item><title>Postdated</title><guid>t3_p</guid>
+                       <pubDate>{future}</pubDate></item>
+                       <item><title>Undated</title><guid>t1_1</guid></item>"#
+                ),
+                2,
+                false,
+            ),
+        ];
+
+        for (label, items, expected_count, expect_undated_warning) in cases {
+            let body =
+                format!(r#"<rss version="2.0"><channel><title>t</title>{items}</channel></rss>"#);
+            let mut server = mockito::Server::new_async().await;
+            let dir = std::env::temp_dir().join(format!("rss-sw-{label}-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let cache = Cache::open(Some(dir.clone())).unwrap();
+            let url = format!("{}/feed.xml", server.url());
+
+            let meta = crate::cache::CacheMeta {
+                feed_url: url.clone(),
+                etag: None,
+                last_modified: None,
+                fetched_at: (Utc::now() - chrono::Duration::days(8)).to_rfc3339(),
+                content_type: Some("application/rss+xml".to_string()),
+            };
+            cache.put(&meta, body.as_bytes()).expect("seed");
+
+            let m = server
+                .mock("GET", "/feed.xml")
+                .with_status(429)
+                .expect(2) // original + the single bounded retry
+                .create_async()
+                .await;
+
+            let http =
+                crate::fetch::HttpClient::new("t", std::time::Duration::from_secs(5)).unwrap();
+            let params = FetchParams {
+                cache_policy: CachePolicy::StaleIfError,
+                since: Some(Utc::now() - chrono::Duration::hours(24)),
+                ..Default::default()
+            };
+            let out = fetch_feeds_with(std::slice::from_ref(&url), &params, &cache, &http).await;
+            let feed = &out.feeds[0];
+            let codes: Vec<&str> = out.warnings.iter().map(|w| w.code.as_str()).collect();
+
+            assert_eq!(feed.status, FeedStatus::Stale, "{label}");
+            assert_eq!(feed.item_count, expected_count, "{label}: {codes:?}");
+            assert!(codes.contains(&"SERVED_STALE"), "{label}: {codes:?}");
+            assert_eq!(
+                codes.contains(&"UNDATED_ITEMS"),
+                expect_undated_warning,
+                "{label}: UNDATED_ITEMS is suppressed by any dated survivor, so it is not a \
+                 freshness signal: {codes:?}"
+            );
+            // The age is machine-readable on the feed and always arrives, whatever the mix —
+            // it is what a caller enforces its own freshness floor on (ADR-0019 §3).
+            assert!(
+                feed.cache_age_seconds.is_some_and(|s| s > 24 * 3600),
+                "{label}: age must exceed the window: {:?}",
+                feed.cache_age_seconds
+            );
+            // Still exit 0: a refused revalidation is not a feed error (invariant 5).
+            assert_eq!(exit_code_for(&out), crate::error::exit::OK, "{label}");
+
+            m.assert_async().await;
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
     #[tokio::test]
     async fn no_deadline_fetches_every_feed() {
         // Guards the default path: the CLI passes deadline: None and must be unaffected.

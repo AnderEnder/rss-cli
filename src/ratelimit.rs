@@ -356,6 +356,64 @@ mod tests {
         );
     }
 
+    /// The reported `retry_after_ms` sequence (`16000`, `4000`, `4000`, `60000` on one run
+    /// against one host) is the escalation ladder read at four counter depths — not a per-feed
+    /// estimate and not a decaying remainder. `note_success` hard-resets the depth while
+    /// `warm_until_ms` still has time left, so the ladder sawtooths; see ADR-0023.
+    #[test]
+    fn the_hint_is_the_shared_per_host_ladder_and_a_success_resets_its_depth() {
+        let g = gate();
+        // One authority for every subreddit: the hint can never be per-feed.
+        assert_eq!(
+            authority_of("https://www.reddit.com/r/AI_Agents/.rss"),
+            authority_of("https://www.reddit.com/r/rust/.rss")
+        );
+
+        // Headerless provider (ADR-0016's probe found no `Retry-After`): escalation supplies
+        // the window, so only ladder values are reachable. Every reported number is on it.
+        let ladder: Vec<u128> = (1..=8)
+            .map(|n| g.cooldown_for(n, None).as_millis())
+            .collect();
+        for observed in [16_000u128, 4_000, 60_000] {
+            assert!(
+                ladder.contains(&observed),
+                "{observed} is not a reachable cooldown, so the hint was not freshly computed"
+            );
+        }
+        // The discriminator: `cooldown_remaining` subtracts a *second* clock read, so a value
+        // that had decayed at all would land between rungs. None did.
+        assert!(
+            !ladder.contains(&3_847),
+            "a decayed remainder must not be mistakable for a fresh cooldown"
+        );
+
+        // The sawtooth: four throttles reach the 16s rung, then one *sibling* success drops
+        // the shared depth back to the 2s rung.
+        let a = "https://www.reddit.com/r/AI_Agents/.rss";
+        let b = "https://www.reddit.com/r/rust/.rss";
+        for _ in 0..4 {
+            g.note_throttled(a, None);
+        }
+        let slot = g.slot_for_url(a);
+        assert_eq!(
+            slot.consecutive_throttles.load(Ordering::Relaxed),
+            4,
+            "four consecutive throttles must actually reach depth 4"
+        );
+        assert_eq!(g.cooldown_for(4, None), Duration::from_secs(16));
+        g.note_success(b);
+        g.note_throttled(a, None);
+        assert_eq!(
+            slot.consecutive_throttles.load(Ordering::Relaxed),
+            1,
+            "a sibling success resets escalation depth for the whole host"
+        );
+        assert!(
+            slot.warm_until_ms.load(Ordering::Relaxed) > now_ms(),
+            "yet the host is still warm — the gate knows it was recently throttled"
+        );
+    }
+
     #[test]
     fn authority_normalizes_host_and_port() {
         assert_eq!(
