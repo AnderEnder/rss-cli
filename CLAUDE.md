@@ -154,9 +154,17 @@ One core powers both front-ends, so they cannot diverge
 - **`CachePolicy::CacheFirst` exists for item lookup.** Reverting it to `Revalidate`
   reintroduces the rolled-window `NOT_FOUND` (ADR-0014). Pinned by
   `tests/get_item_window_roll.rs`.
-- **The 403/429 retry is single and bounded.** An unbounded loop is impolite and masks outages
-  ([ADR-0015](./docs/adr/0015-bounded-retry-on-transient-429-403.md)). Pinned by
-  `fetch::tests::retries_once_on_403_then_succeeds`.
+- **The 403/429 retry is single, bounded, and *not spent on a warm host*.** An unbounded loop
+  is impolite and masks outages
+  ([ADR-0015](./docs/adr/0015-bounded-retry-on-transient-429-403.md)); re-asking a host that
+  threw a throttle inside the warm window burns the one retry on a near-certain refusal **and**
+  climbs the escalation ladder twice per feed, inflating every sibling's wait
+  ([ADR-0024](./docs/adr/0024-the-retry-is-for-a-blip-not-a-shedding-host.md)). An explicit
+  `Retry-After` still retries anywhere. Read `gate.is_warm` **before** `note_throttled` — the
+  note itself marks the host warm, so reading after always says "warm" and kills the cold-host
+  retry too. Pinned by `fetch::tests::retries_once_on_403_then_succeeds` (cold path still
+  retries) and `a_second_throttle_on_a_warm_host_does_not_spend_the_retry` (asserts the request
+  *count*; the error is identical either way).
 - **The MCP server reuses ONE `HttpClient`.** A per-call client reintroduces the concurrent-call
   429 burst (ADR-0016). Pinned by `mcp::tests::concurrent_fetches_share_one_client_and_gate`.
 - **`note_success` decays the escalation depth; it does not clear it** — and `note_throttled`

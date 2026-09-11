@@ -89,6 +89,22 @@ impl HttpClient {
         })
     }
 
+    /// Client wired to a caller-supplied gate. Test-only: the gate's pacing constants are what
+    /// a retry test needs to vary, and they are not worth an env var on the shipping path.
+    #[cfg(test)]
+    fn with_gate(user_agent: &str, timeout: Duration, gate: HostGate) -> Result<Self, RssError> {
+        let inner = reqwest::Client::builder()
+            .user_agent(user_agent)
+            .timeout(timeout)
+            .gzip(true)
+            .build()
+            .map_err(|e| RssError::Network(e.to_string()))?;
+        Ok(Self {
+            inner,
+            gate: Arc::new(gate),
+        })
+    }
+
     /// Fetch `url`, applying the cache `policy`. See module docs for the contract.
     pub async fn fetch(
         &self,
@@ -456,10 +472,17 @@ impl HttpClient {
             return Ok(resp);
         }
 
-        // Transient 403/429: extend the sibling cooldown, then spend the single retry.
+        // Transient 403/429: extend the sibling cooldown, then spend the single retry — but
+        // read warmth *first*, since noting this throttle is itself what marks the host warm.
+        let host_was_warm = self.gate.is_warm(url);
         self.gate
             .note_throttled(url, retry_after_duration(resp.headers()));
-        let wait = retry_after(resp.headers(), RETRY_MAX_DELAY).unwrap_or(RETRY_BASE_DELAY);
+        let Some(wait) = retry_delay(resp.headers(), host_was_warm) else {
+            // Not a blip. Hand the refusal back unretried; the caller maps the status to
+            // `RATE_LIMITED`/`FEED_FETCH_FAILED` and the gate's learned cooldown rides along
+            // as the pacing hint (ADR-0024).
+            return Ok(resp);
+        };
         sleep(wait).await;
         let resp = build()
             .send()
@@ -472,6 +495,26 @@ impl HttpClient {
             self.gate.note_success(url);
         }
         Ok(resp)
+    }
+}
+
+/// How long to wait before ADR-0015's single retry — or `None` to not spend it at all.
+///
+/// The retry is for a *transient* blip. A host that was already **warm** (ADR-0016/0023: it
+/// threw a throttle inside the warm window) is not blipping, and re-asking it
+/// `RETRY_BASE_DELAY` later spends the one retry on a near-certain refusal *and* climbs the
+/// escalation ladder a second rung — inflating both the hint we hand the caller and every
+/// sibling's gate wait. Measured against Reddit: three same-host feeds cost five requests, two
+/// of them doomed, and reported `retry_after_seconds` of 4 s and 16 s where one climb each
+/// would have said 2 s and 4 s.
+///
+/// An explicit `Retry-After` still wins on any host: that is the origin stating when to return,
+/// so honor it rather than second-guess it (ADR-0024).
+fn retry_delay(headers: &HeaderMap, host_was_warm: bool) -> Option<Duration> {
+    match retry_after(headers, RETRY_MAX_DELAY) {
+        Some(explicit) => Some(explicit),
+        None if host_was_warm => None,
+        None => Some(RETRY_BASE_DELAY),
     }
 }
 
@@ -545,6 +588,29 @@ mod tests {
             "a value above the cap must clamp to RETRY_MAX_DELAY"
         );
         assert_eq!(retry_after(&HeaderMap::new(), RETRY_MAX_DELAY), None);
+    }
+
+    #[test]
+    fn retry_delay_skips_a_warm_host_but_always_honors_retry_after() {
+        // Cold host, no header: ADR-0015's blip retry, unchanged.
+        assert_eq!(
+            retry_delay(&HeaderMap::new(), false),
+            Some(RETRY_BASE_DELAY)
+        );
+        // Warm host, no header: don't spend it. The gate already learned this host is
+        // shedding load, and 500 ms later it will still be (ADR-0024).
+        assert_eq!(retry_delay(&HeaderMap::new(), true), None);
+        // An explicit `Retry-After` wins on any host — the origin stated when to come back,
+        // so we wait that out rather than give up on a feed it offered to serve.
+        assert_eq!(
+            retry_delay(&headers_with_retry_after("2"), true),
+            Some(Duration::from_secs(2))
+        );
+        assert_eq!(
+            retry_delay(&headers_with_retry_after("30"), true),
+            Some(RETRY_MAX_DELAY),
+            "still clamped to the in-flight ceiling"
+        );
     }
 
     #[test]
@@ -919,6 +985,61 @@ mod tests {
 
         m403.assert_async().await;
         m200.assert_async().await;
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The companion to [`retries_once_on_403_then_succeeds`]: the retry rides out a *blip*,
+    /// so a host already known to be shedding must not get a second request 500 ms later.
+    /// Asserts the request *count* — the error alone looks identical either way.
+    #[tokio::test]
+    async fn a_second_throttle_on_a_warm_host_does_not_spend_the_retry() {
+        let mut server = mockito::Server::new_async().await;
+        let dir = temp_cache_dir("retry-warm");
+        let cache = Cache::open(Some(dir.clone())).expect("open cache");
+        // One client, so both fetches share one gate — that shared warmth is the subject.
+        let http = HttpClient::with_gate(
+            "rss-cli-test",
+            Duration::from_secs(10),
+            HostGate::with_fast_pacing(),
+        )
+        .expect("build client");
+
+        // A cold host still gets its retry: 429, then the second attempt succeeds.
+        let cold = format!("{}/cold.xml", server.url());
+        let m429 = server
+            .mock("GET", "/cold.xml")
+            .with_status(429)
+            .expect(1)
+            .create_async()
+            .await;
+        let m200 = server
+            .mock("GET", "/cold.xml")
+            .with_status(200)
+            .with_body("<rss>ok</rss>")
+            .expect(1)
+            .create_async()
+            .await;
+        http.fetch(&cold, &cache, CachePolicy::NoCache)
+            .await
+            .expect("the blip retry still rides this out");
+        m429.assert_async().await;
+        m200.assert_async().await;
+
+        // Same host, now warm. Exactly one request: `expect(1)` fails if the retry fires.
+        let warm = format!("{}/warm.xml", server.url());
+        let m_warm = server
+            .mock("GET", "/warm.xml")
+            .with_status(429)
+            .expect(1)
+            .create_async()
+            .await;
+        let err = http
+            .fetch(&warm, &cache, CachePolicy::NoCache)
+            .await
+            .expect_err("a throttled host with no cached copy fails");
+        assert_eq!(err.code(), "RATE_LIMITED");
+        m_warm.assert_async().await;
+
         std::fs::remove_dir_all(&dir).ok();
     }
 

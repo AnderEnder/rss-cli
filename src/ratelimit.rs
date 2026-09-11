@@ -321,6 +321,19 @@ impl HostGate {
         *depth = depth.saturating_sub(1);
     }
 
+    /// Gate with sub-second pacing, for tests in other modules that need a *warm* host
+    /// without sleeping out the real 2 s ladder. Private fields put a struct literal out of
+    /// their reach.
+    #[cfg(test)]
+    pub(crate) fn with_fast_pacing() -> Self {
+        Self {
+            base_cooldown: Duration::from_millis(20),
+            max_cooldown: Duration::from_millis(100),
+            sticky_spacing: Duration::from_millis(5),
+            ..Self::default()
+        }
+    }
+
     /// This host's current escalation depth. Test-facing: the transition is compound, so
     /// reading the field directly invites asserting on a torn value.
     #[cfg(test)]
@@ -330,6 +343,17 @@ impl HostGate {
             .escalation_depth
             .lock()
             .expect("host-slot depth poisoned")
+    }
+
+    /// Whether this host threw a throttle inside the current warm window — recent evidence
+    /// that it is shedding load rather than having refused once by accident.
+    ///
+    /// Deliberately **not** [`Self::cooldown_remaining`]: a caller that waited the cooldown out
+    /// has consumed it, so `next_allowed` says nothing about whether the host is still on a
+    /// streak. Warmth is the state ADR-0023 keeps for exactly that question, and it outlives
+    /// any single cooldown.
+    pub fn is_warm(&self, url: &str) -> bool {
+        self.slot_for_url(url).warm_until_ms.load(Ordering::Relaxed) > now_ms()
     }
 
     /// The host's remaining *pacing* delay (`next_allowed_ms`), if one is active — the window
