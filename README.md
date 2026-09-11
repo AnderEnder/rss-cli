@@ -309,14 +309,66 @@ Reddit's feeds have a few quirks worth knowing when consuming them:
 - **`search.rss` is best-effort.** Results from Reddit's search feed are sparse and
   noisy by nature (Reddit-side), so treat a thin or empty result as expected rather
   than an error.
-- **Transient `403`/`429` are retried once automatically.** Reddit intermittently
-  rate-limits mid-batch; `rss` retries a `403`/`429` exactly once (honoring
-  `Retry-After`, capped) before giving up. A persistent `429` then surfaces as
+- **No `ETag`, no `Last-Modified`.** Reddit sends neither on `.rss`, so a conditional
+  GET can never come back `304` — every revalidation is a *full* request, and a full
+  request is what gets rate-limited. On this host `--max-age` (or the MCP
+  `cache_policy`) is the only way to not ask at all.
+- **Transient `403`/`429` are retried once automatically — while the host still looks
+  transient.** Reddit intermittently rate-limits mid-batch; `rss` retries a `403`/`429`
+  exactly once (honoring `Retry-After`, capped) before giving up. A refusal from a host
+  that *already* threw one in the last couple of minutes is returned straight away with
+  the learned wait instead of being re-asked — spending the retry there only costs the
+  host another request it just declined
+  ([ADR-0024](docs/adr/0024-the-retry-is-for-a-blip-not-a-shedding-host.md)). A persistent `429` then surfaces as
   `RATE_LIMITED` — wait and retry — carrying
   `details.retry_after_seconds`/`retry_after_ms` alongside `http_status` and the
   origin's raw `retry_after` (when it sent one). A persistent `403` stays
   `FEED_FETCH_FAILED`: a block is not a window, so do not simply wait it out. See
   [ADR-0015](docs/adr/0015-bounded-retry-on-transient-429-403.md).
+- **A batch of several subreddits will lose feeds, and pacing only improves the odds.**
+  Three subreddit feeds requested together typically return one, the rest `429` with no
+  `Retry-After`; spacing them ~30 s apart returns about two of three. The budget is
+  per-IP and probabilistic, so waiting longer *inside* one call buys odds, not
+  reliability — see [Keeping throttled feeds warm](#keeping-throttled-feeds-warm).
+
+---
+
+## Keeping throttled feeds warm
+
+`rss` has no scheduler and will not grow one — the schedule belongs to your machine, not
+to the tool ([ADR-0002](docs/adr/0002-data-on-request-not-a-subscription-manager.md)).
+For a host that rate-limits, spread cheap attempts over time and read from the cache:
+
+```crontab
+# One feed per tick, staggered. A burst is what gets refused.
+3,23,43  * * * * rss fetch https://www.reddit.com/r/rust/.rss        --limit 25 >/dev/null
+8,28,48  * * * * rss fetch https://www.reddit.com/r/programming/.rss --limit 25 >/dev/null
+13,33,53 * * * * rss fetch https://www.reddit.com/r/LocalLLaMA/.rss  --limit 25 >/dev/null
+```
+
+Then read from the warm cache instead of the origin:
+
+- **CLI:** `rss fetch <urls> --max-age 1h` — answered with no network call, and bounded,
+  so a feed the ticks never landed is still fetched live.
+- **MCP:** `cache_policy: "max-age:1h"`, or `"cache-first"` for the unbounded form — with
+  which your tick interval *is* the staleness floor.
+
+A missed tick costs nothing: the next one retries and the cache still holds the last good
+copy. It also shrinks the burst — only feeds missing from the cache go to the network, and
+one request at a time is what such hosts tolerate. This is why spreading attempts works
+where a longer per-call timeout does not.
+
+Two things to get right:
+
+- **Don't overlap a warm run with an interactive one.** The per-host gate
+  ([ADR-0016](docs/adr/0016-per-host-request-gate.md)) lives *inside a process*, so two
+  `rss` processes hitting one host pace themselves independently — which is exactly the
+  burst the gate exists to prevent. Stagger the ticks, and keep each one shorter than the
+  gap to the next.
+- **`--stale-if-error` complements this, it does not replace it.** It needs a cached copy
+  to fall back to, and with `--since` a copy older than the window is refused outright
+  ([ADR-0022](docs/adr/0022-stale-copies-that-cannot-cover-the-since-window.md)) — so the
+  ticks are what make it useful.
 
 ---
 
