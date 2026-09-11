@@ -165,6 +165,18 @@ One core powers both front-ends, so they cannot diverge
   retry too. Pinned by `fetch::tests::retries_once_on_403_then_succeeds` (cold path still
   retries) and `a_second_throttle_on_a_warm_host_does_not_spend_the_retry` (asserts the request
   *count*; the error is identical either way).
+- **The advertised protocol ceiling is pinned to 2025-11-25, deliberately.** `rmcp`'s default
+  is every revision the SDK knows, and `server/discover` republishes that list as "versions
+  implemented by this server" — so the default invited a 2026-07-28 client onto the stateless
+  core / per-request-capabilities / MRTR path none of `mcp.rs` implements. `initialize` refuses
+  it anyway; the stateless path had no backstop. Raise the ceiling only together with the
+  handlers for that revision. Pinned by
+  `mcp::tests::the_advertised_ceiling_is_the_revision_we_implement`.
+  *Worth having when the ceiling does move:* SEP-2549 cache hints let `tools/list` carry
+  `ttlMs`/`cacheScope`, which is the one lever against the per-session `outputSchema` token
+  cost noted above — our tool list is static. `#[tool_handler]` only emits them at
+  >= 2026-07-28 and hardcodes `ttl_ms: 0` ("immediately stale"), so it needs a hand-written
+  `list_tools`.
 - **The MCP server reuses ONE `HttpClient`.** A per-call client reintroduces the concurrent-call
   429 burst (ADR-0016). Pinned by `mcp::tests::concurrent_fetches_share_one_client_and_gate`.
 - **`note_success` decays the escalation depth; it does not clear it** — and `note_throttled`

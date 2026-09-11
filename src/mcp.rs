@@ -15,9 +15,13 @@
 //! - **All logging/diagnostics must go to stderr** — stdout is the MCP transport.
 //! - Build the [`Cache`](crate::cache::Cache) once and share it across tool calls.
 
+use std::borrow::Cow;
+
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerInfo};
+use rmcp::model::{
+    CallToolResult, ContentBlock, Implementation, ProtocolVersion, ServerCapabilities, ServerInfo,
+};
 use rmcp::{ErrorData, ServerHandler, ServiceExt, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -692,6 +696,18 @@ impl RssServer {
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for RssServer {
+    /// Cap negotiation at the revision this server actually implements.
+    ///
+    /// `rmcp`'s default advertises every revision the SDK knows, now including 2026-07-28 —
+    /// stateless core, per-request capabilities, MRTR `resultType`. None of that is
+    /// implemented here, and `server/discover` hands this list to clients verbatim.
+    /// `initialize` refuses 2026-07-28 on its own (rmcp only agrees to a revision that still
+    /// has a handshake), which is why the ceiling has to be stated: the stateless path has no
+    /// such backstop. Pinned by `the_advertised_ceiling_is_the_revision_we_implement`.
+    fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
+        Cow::Borrowed(ProtocolVersion::known_up_to(&ProtocolVersion::V_2025_11_25))
+    }
+
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new(
@@ -1502,6 +1518,27 @@ mod tests {
     /// A fresh HTTP client for a test (its own per-host gate, so tests never couple).
     fn test_http() -> HttpClient {
         HttpClient::new("rss-cli-test", std::time::Duration::from_secs(10)).expect("build client")
+    }
+
+    /// The ceiling is a decision, not an inherited default -- `server/discover` publishes this
+    /// list as "protocol versions implemented by this server", so the default would claim one
+    /// we never wrote a line against.
+    #[test]
+    fn the_advertised_ceiling_is_the_revision_we_implement() {
+        let (cache, dir) = temp_cache("protocol-ceiling");
+        let versions = RssServer::new(cache, test_http()).supported_protocol_versions();
+
+        assert!(
+            versions.contains(&ProtocolVersion::V_2025_11_25),
+            "the revision the tools are written against must stay on offer"
+        );
+        assert!(
+            !versions.contains(&ProtocolVersion::V_2026_07_28),
+            "2026-07-28 means stateless core, per-request capabilities and MRTR result types; \
+             advertising it would invite a client onto a path this server does not implement"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     fn temp_cache(tag: &str) -> (Cache, std::path::PathBuf) {
