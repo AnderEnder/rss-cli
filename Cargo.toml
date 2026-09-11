@@ -11,6 +11,17 @@ readme = "README.md"
 keywords = ["rss", "atom", "feed", "cli", "mcp"]
 categories = ["command-line-utilities"]
 
+# Ship what a consumer of the crate needs. The design history (`docs/adr/`), the agent
+# handbook and the CI plumbing are repo concerns — `repository` above points at them.
+# `tests/` deliberately stays: distro packagers build and run the suite from this tarball.
+exclude = [
+    ".github/",
+    ".claude/",
+    "docs/",
+    "CLAUDE.md",
+    ".gitignore",
+]
+
 [[bin]]
 name = "rss"
 path = "src/main.rs"

@@ -1,1 +1,4 @@
 /target
+
+# Local agent state: session worktrees and settings, never part of a release.
+.claude/
