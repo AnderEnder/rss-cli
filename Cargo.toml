@@ -38,7 +38,7 @@ clap = { version = "4.6.6", features = ["derive"] }
 clap_complete = "4.6.9"
 clap_mangen = "0.3.3"
 directories = "6.0.0"
-feed-rs = "2.4.0"
+feed-rs = "3.0.0"
 futures = "0.3.34"
 htmd = "0.5.5"
 html2text = "0.17.1"
