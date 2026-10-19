@@ -25,6 +25,9 @@ type Result<T> = std::result::Result<T, RssError>;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CacheMeta {
     pub feed_url: String,
+    /// Resolution base for the cached body after redirects.
+    #[serde(default)]
+    pub final_url: Option<String>,
     pub etag: Option<String>,
     pub last_modified: Option<String>,
     /// RFC-3339 UTC time the entry was written.

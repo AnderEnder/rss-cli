@@ -39,11 +39,20 @@ pub struct ParsedFeed {
     pub items_filtered_out: usize,
 }
 
-/// Parse raw feed bytes into a [`ParsedFeed`]. `feed_url` is the (post-redirect) URL the
-/// bytes came from, used both for relative-link resolution and as the id namespace.
+/// Parse raw feed bytes using `feed_url` for both identity and relative-link resolution.
 pub fn parse_feed(
     body: &[u8],
     feed_url: &str,
+    params: &FetchParams,
+) -> Result<ParsedFeed, RssError> {
+    parse_feed_with_base(body, feed_url, feed_url, params)
+}
+
+/// Keep identity scoped to the requested feed URL while resolving links after redirects.
+pub(crate) fn parse_feed_with_base(
+    body: &[u8],
+    feed_url: &str,
+    resolution_base: &str,
     params: &FetchParams,
 ) -> Result<ParsedFeed, RssError> {
     let feed = feed_rs::parser::parse(body).map_err(|e| RssError::Parse(e.to_string()))?;
@@ -52,9 +61,9 @@ pub fn parse_feed(
     let updated = feed.updated.map(rfc3339);
     let site_url = pick_link_href(&feed.links).map(|s| s.to_string());
 
-    // Base URL for resolving relative item links. If `feed_url` itself is unparseable we
+    // Base URL for resolving relative item links. If the base is unparseable we
     // simply keep raw hrefs rather than failing the whole parse.
-    let base = Url::parse(feed_url).ok();
+    let base = Url::parse(resolution_base).ok();
 
     // Build (item, sort-key, content_fell_back) triples so we can filter/sort by the
     // underlying instant before discarding it. The sort key is `published` falling back to

@@ -2488,6 +2488,7 @@ mod tests {
 
         let meta = crate::cache::CacheMeta {
             feed_url: url.clone(),
+            final_url: None,
             etag: Some("\"v1\"".to_string()),
             last_modified: None,
             fetched_at: "2020-01-01T00:00:00Z".to_string(),
@@ -3289,6 +3290,7 @@ mod tests {
         // Roll the window: the same feed, now two items shorter.
         let meta = crate::cache::CacheMeta {
             feed_url: url.clone(),
+            final_url: None,
             etag: None,
             last_modified: None,
             fetched_at: "2020-01-01T00:00:00Z".to_string(),
@@ -3750,6 +3752,7 @@ mod tests {
         // feed returns.
         let meta = crate::cache::CacheMeta {
             feed_url: urls[0].clone(),
+            final_url: None,
             etag: None,
             last_modified: None,
             fetched_at: "2020-01-01T00:00:00Z".to_string(),
@@ -3916,6 +3919,7 @@ mod tests {
         // this is what the next page sees.
         let meta = crate::cache::CacheMeta {
             feed_url: url.clone(),
+            final_url: None,
             etag: None,
             last_modified: None,
             fetched_at: "2020-01-01T00:00:00Z".to_string(),
@@ -3981,6 +3985,7 @@ mod tests {
         // the feed and this page has nothing left to ship.
         let meta = crate::cache::CacheMeta {
             feed_url: url.clone(),
+            final_url: None,
             etag: None,
             last_modified: None,
             fetched_at: "2020-01-01T00:00:00Z".to_string(),
