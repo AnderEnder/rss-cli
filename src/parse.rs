@@ -14,6 +14,8 @@
 //!   "N matching items" — then sort by `published` (fallback `updated`) descending.
 //! - Populate `title`, `site_url` (the feed's `<link>`/`homepage`), and `updated`.
 
+mod rss_enclosures;
+
 use chrono::{DateTime, SecondsFormat, Utc};
 use feed_rs::model::{Entry, Link};
 use url::Url;
@@ -69,9 +71,26 @@ pub(crate) fn parse_feed_with_base(
     // underlying instant before discarding it. The sort key is `published` falling back to
     // `updated`; `fell_back` records a lower-fidelity content extraction for warnings.
     let mut rows: Vec<(Item, Option<DateTime<Utc>>, bool)> = Vec::with_capacity(feed.entries.len());
-    for entry in feed.entries {
+    // feed-rs merges RSS media into MediaRSS, discarding distinct enclosure content.
+    let recovered = if feed.feed_type == feed_rs::model::FeedType::RSS2 {
+        rss_enclosures::read(body).filter(|items| items.len() == feed.entries.len())
+    } else {
+        None
+    };
+    for (index, entry) in feed.entries.into_iter().enumerate() {
         let sort_key = entry.published.or(entry.updated);
-        let (item, fell_back) = entry_to_item(entry, feed_url, base.as_ref(), params);
+        let (mut item, fell_back) = entry_to_item(entry, feed_url, base.as_ref(), params);
+        if let Some(enclosures) = recovered.as_ref().and_then(|items| items.get(index)) {
+            for enclosure in enclosures {
+                if let Some(existing) = item.enclosures.iter_mut().find(|e| e.url == enclosure.url)
+                {
+                    existing.mime = existing.mime.take().or_else(|| enclosure.mime.clone());
+                    existing.length = existing.length.or(enclosure.length);
+                } else {
+                    item.enclosures.push(enclosure.clone());
+                }
+            }
+        }
         rows.push((item, sort_key, fell_back));
     }
 
@@ -474,6 +493,123 @@ mod tests {
         assert_eq!(enc.url, "https://cdn.example.com/ep1.mp3");
         assert_eq!(enc.mime.as_deref(), Some("audio/mpeg"));
         assert_eq!(enc.length, Some(5000));
+    }
+
+    #[test]
+    fn mixed_rss_and_media_rss_preserves_distinct_attachments() {
+        let body = include_str!("../tests/fixtures/mixed_attachments.rss");
+        let parsed = parse_feed(body.as_bytes(), FEED_URL, &params()).unwrap();
+        let enclosures = &parsed.items[0].enclosures;
+        assert_eq!(
+            enclosures.len(),
+            2,
+            "both distinct attachments must survive"
+        );
+        let audio = enclosures
+            .iter()
+            .find(|e| e.url.ends_with("audio.mp3"))
+            .unwrap();
+        assert_eq!(audio.mime.as_deref(), Some("audio/mpeg"));
+        assert_eq!(audio.length, Some(1234));
+        let media = enclosures
+            .iter()
+            .find(|e| e.url.ends_with("video.mp4"))
+            .unwrap();
+        assert_eq!(media.mime.as_deref(), Some("video/mp4"));
+        assert_eq!(media.length, Some(5000));
+    }
+
+    #[test]
+    fn matching_rss_and_media_rss_url_fills_metadata_without_duplicates() {
+        let body = MEDIA_RSS.replace(
+            "<media:content url=\"https://cdn.example.com/ep1.mp3\" type=\"audio/mpeg\" fileSize=\"5000\"/>",
+            "<enclosure url=\"https://cdn.example.com/ep1.mp3\" type=\"audio/mpeg\" length=\"1234\"/><media:content url=\"https://cdn.example.com/ep1.mp3\"/>",
+        );
+        let parsed = parse_feed(body.as_bytes(), FEED_URL, &params()).unwrap();
+        assert_eq!(parsed.items[0].enclosures.len(), 1);
+        assert_eq!(
+            parsed.items[0].enclosures[0].mime.as_deref(),
+            Some("audio/mpeg")
+        );
+        assert_eq!(parsed.items[0].enclosures[0].length, Some(1234));
+    }
+
+    #[test]
+    fn mixed_attachments_survive_unescaped_ampersands_in_attributes() {
+        let body = include_str!("../tests/fixtures/mixed_attachments.rss");
+        for malformed in [
+            body.replace("</item>", "<description><a href=\"https://example.com/?a=1&b=2\">link</a></description></item>"),
+            body.replace("audio.mp3", "audio.mp3?a=1&b=2"),
+        ] {
+            let parsed = parse_feed(malformed.as_bytes(), FEED_URL, &params()).unwrap();
+            assert_eq!(parsed.items[0].enclosures.len(), 2);
+            assert!(parsed.items[0].enclosures.iter().any(|e| e.mime.as_deref() == Some("audio/mpeg")));
+        }
+    }
+
+    #[test]
+    fn mixed_rss_enclosure_keeps_upstream_mime_validation() {
+        let body = include_str!("../tests/fixtures/mixed_attachments.rss")
+            .replace("audio/mpeg", "invalid mime");
+        let parsed = parse_feed(body.as_bytes(), FEED_URL, &params()).unwrap();
+        let audio = parsed.items[0]
+            .enclosures
+            .iter()
+            .find(|e| e.url.ends_with("audio.mp3"))
+            .unwrap();
+        assert_eq!(audio.mime, None);
+        assert_eq!(audio.length, Some(1234));
+    }
+
+    #[test]
+    fn single_rss_enclosure_keeps_upstream_mime_validation() {
+        let body = RSS.replace("audio/mpeg", "invalid mime");
+        let parsed = parse_feed(body.as_bytes(), FEED_URL, &params()).unwrap();
+        let audio = parsed
+            .items
+            .iter()
+            .find_map(|item| item.enclosures.first())
+            .unwrap();
+        assert_eq!(audio.mime, None);
+        assert_eq!(audio.length, Some(1234));
+    }
+
+    #[test]
+    fn recovered_enclosures_stay_with_their_direct_rss_item() {
+        let body = r#"<rss version="2.0" xmlns:media="http://search.yahoo.com/mrss/" xmlns:other="urn:other"
+            xml:base="https://cdn.example.com/">
+          <channel><title>Attachments</title>
+            <item/>
+            <item xml:base="episodes/">
+              <title>Mixed</title>
+              <media:content url="video.mp4" type="video/mp4"/>
+              <enclosure xml:base="../audio/" url="episode.mp3?a=1&amp;b=2" type="audio/mpeg"/>
+              <other:enclosure url="https://invalid.example.com/foreign"/>
+              <other:item><enclosure url="https://invalid.example.com/nested"/></other:item>
+              <description><![CDATA[<enclosure url="https://invalid.example.com/content"/>]]></description>
+            </item>
+            <item><title>Last</title><enclosure url="last.mp3" length="77"/></item>
+          </channel></rss>"#;
+        let parsed = parse_feed(body.as_bytes(), FEED_URL, &params()).unwrap();
+        assert_eq!(parsed.items.len(), 3);
+        assert!(parsed.items[0].enclosures.is_empty());
+        assert_eq!(parsed.items[1].enclosures.len(), 2);
+        let audio = parsed.items[1]
+            .enclosures
+            .iter()
+            .find(|e| e.mime.as_deref() == Some("audio/mpeg"))
+            .unwrap();
+        assert_eq!(
+            audio.url,
+            "https://cdn.example.com/audio/episode.mp3?a=1&b=2"
+        );
+        assert_eq!(audio.length, None);
+        assert_eq!(parsed.items[2].enclosures.len(), 1);
+        assert_eq!(
+            parsed.items[2].enclosures[0].url,
+            "https://cdn.example.com/last.mp3"
+        );
+        assert_eq!(parsed.items[2].enclosures[0].length, Some(77));
     }
 
     #[test]

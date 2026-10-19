@@ -1,0 +1,12 @@
+<?xml version="1.0"?>
+<rss version="2.0" xmlns:media="http://search.yahoo.com/mrss/">
+  <channel>
+    <title>Mixed Attachments</title>
+    <item>
+      <title>Episode</title>
+      <link>https://example.com/episode</link>
+      <enclosure url="https://cdn.example.com/audio.mp3" type="audio/mpeg" length="1234"/>
+      <media:content url="https://cdn.example.com/video.mp4" type="video/mp4" fileSize="5000"/>
+    </item>
+  </channel>
+</rss>
