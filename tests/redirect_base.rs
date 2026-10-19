@@ -152,3 +152,57 @@ async fn legacy_cache_without_redirect_metadata_uses_requested_url() {
         Some("https://example.test/news/posts/1")
     );
 }
+
+#[tokio::test]
+async fn legacy_cache_learns_redirect_base_from_not_modified_response() {
+    let mut server = mockito::Server::new_async().await;
+    let redirect = server
+        .mock("GET", "/start")
+        .with_status(302)
+        .with_header("location", "/news/feed.xml")
+        .expect(1)
+        .create_async()
+        .await;
+    let not_modified = server
+        .mock("GET", "/news/feed.xml")
+        .match_header("if-none-match", "\"v1\"")
+        .with_status(304)
+        .expect(1)
+        .create_async()
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    let cache = Cache::open(Some(dir.path().into())).unwrap();
+    let url = format!("{}/start", server.url());
+    let base = format!("{}/news/feed.xml", server.url());
+    let expected_url = format!("{}/news/posts/1", server.url());
+    let meta: rss_cli::cache::CacheMeta = serde_json::from_value(serde_json::json!({
+        "feed_url": url, "etag": "\"v1\"", "last_modified": null,
+        "fetched_at": "2026-10-20T00:00:00Z", "content_type": null
+    }))
+    .unwrap();
+    cache.put(&meta, BODY.as_bytes()).unwrap();
+    let params = FetchParams::default();
+    let output = core::fetch_feeds(std::slice::from_ref(&url), &params, &cache).await;
+    assert!(output.errors.is_empty());
+    assert_eq!(
+        output.feeds[0].items[0].url.as_deref(),
+        Some(expected_url.as_str())
+    );
+    assert_eq!(
+        cache.get(&url).unwrap().unwrap().meta.final_url.as_deref(),
+        Some(base.as_str())
+    );
+    let cached_params = FetchParams {
+        cache_policy: CachePolicy::CacheFirst,
+        ..params
+    };
+    let output = core::fetch_feeds(std::slice::from_ref(&url), &cached_params, &cache).await;
+    let item = &output.feeds[0].items[0];
+    assert_eq!(item.url.as_deref(), Some(expected_url.as_str()));
+    assert_eq!(
+        item.id,
+        identity::item_id(&url, Some(&expected_url), None, None, None).0
+    );
+    redirect.assert_async().await;
+    not_modified.assert_async().await;
+}

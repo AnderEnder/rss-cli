@@ -283,14 +283,10 @@ impl HttpClient {
             // entry for the *next* lookup.
             let cached_at = entry.meta.fetched_at.clone();
             // A 304 can be answered at the original URL; retain the body's resolution base.
-            let final_url = entry
-                .meta
-                .final_url
-                .clone()
-                .unwrap_or_else(|| url.to_string());
+            let final_url = entry.meta.final_url.clone().unwrap_or(final_url);
             let meta = CacheMeta {
                 feed_url: url.to_string(),
-                final_url: entry.meta.final_url.clone(),
+                final_url: Some(final_url.clone()),
                 etag: entry.meta.etag.clone(),
                 last_modified: entry.meta.last_modified.clone(),
                 fetched_at: now_rfc3339(),
