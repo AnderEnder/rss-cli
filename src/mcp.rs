@@ -1,7 +1,7 @@
 //! Model Context Protocol server (stdio transport). **Owner: `mcp` agent.**
 //!
 //! Runs `rss mcp`: exposes the same core operations as MCP tools so agents can call the
-//! tool directly. Implemented with `rmcp` 2.x (`#[tool]` / `#[tool_router]` macros,
+//! tool directly. Implemented with `rmcp` (`#[tool]` / `#[tool_router]` macros,
 //! `serve(stdio())`).
 //!
 //! ## Requirements
@@ -20,7 +20,7 @@ use std::borrow::Cow;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    CallToolResult, ContentBlock, Implementation, ProtocolVersion, ServerCapabilities, ServerInfo,
+    CallToolResult, ContentBlock, Implementation, ProtocolVersion, ServerCapabilities, ServerConfig,
 };
 use rmcp::{ErrorData, ServerHandler, ServiceExt, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
@@ -708,8 +708,8 @@ impl ServerHandler for RssServer {
         Cow::Borrowed(ProtocolVersion::known_up_to(&ProtocolVersion::V_2025_11_25))
     }
 
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new(
                 env!("CARGO_PKG_NAME"),
                 env!("CARGO_PKG_VERSION"),
