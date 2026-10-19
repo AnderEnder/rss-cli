@@ -414,7 +414,7 @@ pub async fn fetch_one_until(
     let raw = http
         .fetch_until(url, cache, params.cache_policy, stop_at, params.since)
         .await?;
-    let parsed = parse::parse_feed(&raw.body, url, params)?;
+    let parsed = parse::parse_feed_with_base(&raw.body, url, &raw.final_url, params)?;
     let item_count = parsed.items.len();
     let content_tokens_est_total = parsed
         .items
@@ -880,6 +880,7 @@ mod tests {
     fn seed(cache: &Cache, url: &str, body: &[u8]) {
         let meta = CacheMeta {
             feed_url: url.to_string(),
+            final_url: None,
             etag: None,
             last_modified: None,
             fetched_at: "2020-01-01T00:00:00Z".to_string(),
@@ -968,6 +969,7 @@ mod tests {
         let future = (Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
         let meta = CacheMeta {
             feed_url: FEED.to_string(),
+            final_url: None,
             etag: None,
             last_modified: None,
             fetched_at: future.clone(),
@@ -1442,6 +1444,7 @@ mod tests {
 
         let meta = crate::cache::CacheMeta {
             feed_url: url.clone(),
+            final_url: None,
             etag: None,
             last_modified: None,
             fetched_at: "2020-01-01T00:00:00Z".to_string(),
@@ -1514,6 +1517,7 @@ mod tests {
         // A cached copy IS available — the default policy must decline to use it anyway.
         let meta = crate::cache::CacheMeta {
             feed_url: url.clone(),
+            final_url: None,
             etag: None,
             last_modified: None,
             fetched_at: "2020-01-01T00:00:00Z".to_string(),
@@ -1567,6 +1571,7 @@ mod tests {
 
             let meta = crate::cache::CacheMeta {
                 feed_url: url.clone(),
+                final_url: None,
                 etag: None,
                 last_modified: None,
                 fetched_at: (Utc::now() - chrono::Duration::days(8)).to_rfc3339(),

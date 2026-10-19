@@ -168,7 +168,7 @@ impl HttpClient {
                     let cached_at = entry.meta.fetched_at.clone();
                     return Ok(RawFeed {
                         body: entry.body,
-                        final_url: url.to_string(),
+                        final_url: entry.meta.final_url.unwrap_or_else(|| url.to_string()),
                         content_type: entry.meta.content_type,
                         status: 200,
                         not_modified: true,
@@ -187,7 +187,7 @@ impl HttpClient {
                     let cached_at = entry.meta.fetched_at.clone();
                     return Ok(RawFeed {
                         body: entry.body,
-                        final_url: url.to_string(),
+                        final_url: entry.meta.final_url.unwrap_or_else(|| url.to_string()),
                         content_type: entry.meta.content_type,
                         status: 200,
                         not_modified: true,
@@ -219,7 +219,7 @@ impl HttpClient {
                         }
                         Some(entry) => Ok(RawFeed {
                             body: entry.body,
-                            final_url: url.to_string(),
+                            final_url: entry.meta.final_url.unwrap_or_else(|| url.to_string()),
                             content_type: entry.meta.content_type,
                             status: 200,
                             // Not a `304`: the origin never confirmed this body is current,
@@ -282,8 +282,11 @@ impl HttpClient {
             // that (pre-refresh) time, not the `now()` this call is about to stamp on the
             // entry for the *next* lookup.
             let cached_at = entry.meta.fetched_at.clone();
+            // A 304 can be answered at the original URL; retain the body's resolution base.
+            let final_url = entry.meta.final_url.clone().unwrap_or(final_url);
             let meta = CacheMeta {
                 feed_url: url.to_string(),
+                final_url: Some(final_url.clone()),
                 etag: entry.meta.etag.clone(),
                 last_modified: entry.meta.last_modified.clone(),
                 fetched_at: now_rfc3339(),
@@ -318,6 +321,7 @@ impl HttpClient {
 
         let meta = CacheMeta {
             feed_url: url.to_string(),
+            final_url: Some(final_url.clone()),
             etag,
             last_modified,
             fetched_at: now_rfc3339(),
@@ -693,6 +697,7 @@ mod tests {
         let seeded = "2020-01-01T00:00:00Z".to_string();
         let meta = CacheMeta {
             feed_url: url.clone(),
+            final_url: None,
             etag: Some("\"v1\"".to_string()),
             last_modified: None,
             fetched_at: seeded.clone(),
@@ -747,6 +752,7 @@ mod tests {
         let original_fetch = "2020-01-01T00:00:00Z".to_string();
         let meta = CacheMeta {
             feed_url: url.clone(),
+            final_url: None,
             etag: Some("\"v1\"".to_string()),
             last_modified: None,
             fetched_at: original_fetch.clone(),
@@ -808,6 +814,7 @@ mod tests {
         let seeded = now_rfc3339();
         let meta = CacheMeta {
             feed_url: url.clone(),
+            final_url: None,
             etag: Some("\"v1\"".to_string()),
             last_modified: None,
             fetched_at: seeded.clone(),
@@ -858,6 +865,7 @@ mod tests {
         // Deliberately STALE timestamp: CacheFirst must ignore age entirely.
         let meta = CacheMeta {
             feed_url: url.clone(),
+            final_url: None,
             etag: Some("\"v1\"".to_string()),
             last_modified: None,
             fetched_at: "2020-01-01T00:00:00Z".to_string(),
@@ -1074,6 +1082,7 @@ mod tests {
     fn seed(cache: &Cache, url: &str, body: &[u8]) {
         let meta = CacheMeta {
             feed_url: url.to_string(),
+            final_url: None,
             etag: Some("\"seeded\"".to_string()),
             last_modified: None,
             fetched_at: "2020-01-01T00:00:00Z".to_string(),
@@ -1086,6 +1095,7 @@ mod tests {
     fn seed_at(cache: &Cache, url: &str, body: &[u8], fetched_at: DateTime<Utc>) {
         let meta = CacheMeta {
             feed_url: url.to_string(),
+            final_url: None,
             etag: Some("\"seeded\"".to_string()),
             last_modified: None,
             fetched_at: fetched_at.to_rfc3339(),
