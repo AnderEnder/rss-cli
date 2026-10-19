@@ -285,13 +285,14 @@ fn collect_enclosures(entry: &Entry) -> Vec<Enclosure> {
 }
 
 /// Choose the best href from a set of links: the `rel="alternate"` entry if present,
-/// otherwise the first link. Returns `None` for an empty set.
+/// otherwise the first non-comment link. Comment targets are never permalinks.
 fn pick_link_href(links: &[Link]) -> Option<&str> {
-    links
-        .iter()
-        .find(|l| l.rel.as_deref() == Some("alternate"))
-        .or_else(|| links.first())
-        .map(|l| l.href.as_str())
+    let mut eligible = links.iter().filter(|link| link.target.is_none());
+    eligible
+        .clone()
+        .find(|link| link.rel.as_deref() == Some("alternate"))
+        .or_else(|| eligible.next())
+        .map(|link| link.href.as_str())
 }
 
 /// Resolve `href` to an absolute URL against `base`; keep `href` verbatim on failure
@@ -378,6 +379,47 @@ mod tests {
             let parsed = parse_feed(body.as_bytes(), FEED_URL, &params()).unwrap();
             assert_eq!(parsed.items[0].authors, [expected], "author: {author}");
         }
+    }
+
+    #[test]
+    fn comments_never_replace_the_article_permalink() {
+        let article = "<link>https://example.com/post</link>";
+        let comments = "<comments>https://example.com/comments</comments>";
+        let comment_feed = "<wfw:commentRss>https://example.com/comments.xml</wfw:commentRss>";
+        let expected_id = identity::item_id(
+            FEED_URL,
+            Some("https://example.com/post"),
+            Some("post"),
+            Some("Post"),
+            None,
+        )
+        .0;
+        for links in [
+            format!("{comments}{article}"),
+            format!("{article}{comments}"),
+            format!("{comment_feed}{article}{comments}"),
+        ] {
+            let body = format!(
+                "<rss version=\"2.0\" xmlns:wfw=\"http://wellformedweb.org/CommentAPI/\">\
+                 <channel><title>Comments</title><item><title>Post</title>\
+                 <guid>post</guid>{links}</item></channel></rss>"
+            );
+            let parsed = parse_feed(body.as_bytes(), FEED_URL, &params()).unwrap();
+            assert_eq!(
+                parsed.items[0].url.as_deref(),
+                Some("https://example.com/post")
+            );
+            assert_eq!(parsed.items[0].id, expected_id);
+        }
+    }
+
+    #[test]
+    fn comments_without_an_article_link_are_not_a_permalink() {
+        let body = b"<rss version=\"2.0\"><channel><title>Comments</title><item>\
+                     <title>Post</title><comments>https://example.com/comments</comments>\
+                     </item></channel></rss>";
+        let parsed = parse_feed(body, FEED_URL, &params()).unwrap();
+        assert_eq!(parsed.items[0].url, None);
     }
 
     #[test]
