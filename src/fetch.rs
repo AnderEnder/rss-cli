@@ -134,7 +134,7 @@ impl HttpClient {
         match policy {
             // Never touch the cache: a plain GET returning whatever the server sends.
             CachePolicy::NoCache => {
-                let resp = self
+                let (resp, _permit) = self
                     .gated_send(url, stop_at, || self.inner.get(url))
                     .await?;
                 let status = resp.status();
@@ -267,7 +267,7 @@ impl HttpClient {
             req
         };
 
-        let resp = self.gated_send(url, stop_at, build).await?;
+        let (resp, _permit) = self.gated_send(url, stop_at, build).await?;
         let status = resp.status();
         let final_url = resp.url().to_string();
 
@@ -369,7 +369,7 @@ impl HttpClient {
         url: &str,
         stop_at: Option<tokio::time::Instant>,
     ) -> Result<(Vec<u8>, String), RssError> {
-        let resp = self
+        let (resp, _permit) = self
             .gated_send(url, stop_at, || self.inner.get(url))
             .await?;
         let status = resp.status();
@@ -445,7 +445,8 @@ impl HttpClient {
     /// spacing), then send with the single bounded ADR-0015 retry on a transient `403`/`429`.
     /// `build` is called again for the retry so headers/validators are re-attached cleanly.
     ///
-    /// The permit is held across the retry, so a request never blocks on the cooldown it
+    /// The caller holds the returned permit through body consumption. It is also held
+    /// across the retry, so a request never blocks on the cooldown it
     /// itself just set (the two waits are one budget — ADR-0016). Acquiring may instead return
     /// [`RssError::RateLimited`] when a sibling's cooldown would make this request wait past
     /// the gate ceiling.
@@ -454,14 +455,14 @@ impl HttpClient {
         url: &str,
         stop_at: Option<tokio::time::Instant>,
         build: F,
-    ) -> Result<reqwest::Response, RssError>
+    ) -> Result<(reqwest::Response, tokio::sync::OwnedSemaphorePermit), RssError>
     where
         F: Fn() -> reqwest::RequestBuilder,
     {
         // The gate keys on the *request* URL's host. reqwest follows redirects internally, so
         // a cross-host redirect's throttle is attributed to the origin host, not the final
         // one — acceptable (callers hit one host consistently) and unavoidable pre-send.
-        let _permit = self.gate.acquire_until(url, stop_at).await?;
+        let permit = self.gate.acquire_until(url, stop_at).await?;
 
         let resp = build()
             .send()
@@ -469,7 +470,7 @@ impl HttpClient {
             .map_err(|e| RssError::Network(e.to_string()))?;
         if !is_retryable(resp.status()) {
             self.gate.note_success(url);
-            return Ok(resp);
+            return Ok((resp, permit));
         }
 
         // Transient 403/429: extend the sibling cooldown, then spend the single retry — but
@@ -481,8 +482,9 @@ impl HttpClient {
             // Not a blip. Hand the refusal back unretried; the caller maps the status to
             // `RATE_LIMITED`/`FEED_FETCH_FAILED` and the gate's learned cooldown rides along
             // as the pacing hint (ADR-0024).
-            return Ok(resp);
+            return Ok((resp, permit));
         };
+        drop(resp);
         sleep(wait).await;
         let resp = build()
             .send()
@@ -494,7 +496,7 @@ impl HttpClient {
         } else {
             self.gate.note_success(url);
         }
-        Ok(resp)
+        Ok((resp, permit))
     }
 }
 
@@ -567,6 +569,194 @@ mod tests {
     /// Build a client with a short timeout for tests.
     fn client() -> HttpClient {
         HttpClient::new("rss-cli-test", Duration::from_secs(10)).expect("build client")
+    }
+
+    struct SlowBodyServer {
+        url: String,
+        requests: tokio::sync::mpsc::UnboundedReceiver<tokio::sync::oneshot::Sender<bool>>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl SlowBodyServer {
+        async fn start() -> Self {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}/feed", listener.local_addr().unwrap());
+            let (tx, requests) = tokio::sync::mpsc::unbounded_channel();
+            let task = tokio::spawn(async move {
+                let mut connections = tokio::task::JoinSet::new();
+                loop {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let tx = tx.clone();
+                    connections.spawn(async move {
+                        let mut request = Vec::new();
+                        while !request.ends_with(b"\r\n\r\n") {
+                            request.push(stream.read_u8().await.unwrap());
+                        }
+                        stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\n").await.unwrap();
+                        let (release, body) = tokio::sync::oneshot::channel();
+                        if tx.send(release).is_ok() && body.await == Ok(true) {
+                            let _ = stream.write_all(b"feed").await;
+                        }
+                    });
+                }
+            });
+            Self {
+                url,
+                requests,
+                task,
+            }
+        }
+
+        async fn next_body(&mut self) -> tokio::sync::oneshot::Sender<bool> {
+            tokio::time::timeout(Duration::from_secs(2), self.requests.recv())
+                .await
+                .expect("request reached server")
+                .expect("server still listening")
+        }
+    }
+
+    impl Drop for SlowBodyServer {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    fn slow_body_request(
+        http: &HttpClient,
+        url: &str,
+        cache: &Cache,
+        policy: Option<CachePolicy>,
+    ) -> tokio::task::JoinHandle<Result<Vec<u8>, RssError>> {
+        let http = http.clone();
+        let url = url.to_owned();
+        let cache = cache.clone();
+        tokio::spawn(async move {
+            match policy {
+                Some(policy) => http.fetch(&url, &cache, policy).await.map(|raw| raw.body),
+                None => http.get_bytes(&url).await.map(|(body, _)| body),
+            }
+        })
+    }
+
+    async fn assert_body_holds_host_permit(policy: Option<CachePolicy>, tag: &str) {
+        let mut server = SlowBodyServer::start().await;
+        let http =
+            HttpClient::with_gate("test", Duration::from_secs(5), HostGate::default()).unwrap();
+        let dir = temp_cache_dir(tag);
+        let cache = Cache::open(Some(dir.clone())).unwrap();
+        let first = slow_body_request(&http, &server.url, &cache, policy);
+        let release_first = server.next_body().await;
+        let second = slow_body_request(&http, &server.url, &cache, policy);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), server.requests.recv())
+                .await
+                .is_err(),
+            "second request started while the first response body was pending"
+        );
+        release_first.send(true).unwrap();
+        assert_eq!(first.await.unwrap().unwrap(), b"feed");
+        server.next_body().await.send(true).unwrap();
+        assert_eq!(second.await.unwrap().unwrap(), b"feed");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn no_cache_holds_host_permit_through_body() {
+        assert_body_holds_host_permit(Some(CachePolicy::NoCache), "permit-no-cache").await;
+    }
+
+    #[tokio::test]
+    async fn revalidate_holds_host_permit_through_body() {
+        assert_body_holds_host_permit(Some(CachePolicy::Revalidate), "permit-revalidate").await;
+    }
+
+    #[tokio::test]
+    async fn discovery_holds_host_permit_through_body() {
+        assert_body_holds_host_permit(None, "permit-discovery").await;
+    }
+
+    #[tokio::test]
+    async fn two_host_permits_allow_two_pending_bodies() {
+        let mut server = SlowBodyServer::start().await;
+        let http = HttpClient::with_gate(
+            "test",
+            Duration::from_secs(5),
+            HostGate::with_concurrency(2),
+        )
+        .unwrap();
+        let dir = temp_cache_dir("permit-two");
+        let cache = Cache::open(Some(dir.clone())).unwrap();
+        let first = slow_body_request(&http, &server.url, &cache, None);
+        let release_first = server.next_body().await;
+        let second = slow_body_request(&http, &server.url, &cache, None);
+        let release_second = server.next_body().await;
+        let third = slow_body_request(&http, &server.url, &cache, None);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), server.requests.recv())
+                .await
+                .is_err(),
+            "third request exceeded the two-body host cap"
+        );
+        release_first.send(true).unwrap();
+        assert_eq!(first.await.unwrap().unwrap(), b"feed");
+        server.next_body().await.send(true).unwrap();
+        assert_eq!(third.await.unwrap().unwrap(), b"feed");
+        release_second.send(true).unwrap();
+        assert_eq!(second.await.unwrap().unwrap(), b"feed");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn body_errors_release_the_host_permit() {
+        for (index, policy) in [
+            Some(CachePolicy::NoCache),
+            Some(CachePolicy::Revalidate),
+            None,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut server = SlowBodyServer::start().await;
+            let http =
+                HttpClient::with_gate("test", Duration::from_secs(5), HostGate::default()).unwrap();
+            let dir = temp_cache_dir(&format!("permit-error-{index}"));
+            let cache = Cache::open(Some(dir.clone())).unwrap();
+            let first = slow_body_request(&http, &server.url, &cache, policy);
+            let release_first = server.next_body().await;
+            let second = slow_body_request(&http, &server.url, &cache, policy);
+            release_first.send(false).unwrap();
+            assert!(matches!(first.await.unwrap(), Err(RssError::Network(_))));
+            server.next_body().await.send(true).unwrap();
+            assert_eq!(second.await.unwrap().unwrap(), b"feed");
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_pending_body_releases_the_host_permit() {
+        for (index, policy) in [
+            Some(CachePolicy::NoCache),
+            Some(CachePolicy::Revalidate),
+            None,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut server = SlowBodyServer::start().await;
+            let http =
+                HttpClient::with_gate("test", Duration::from_secs(5), HostGate::default()).unwrap();
+            let dir = temp_cache_dir(&format!("permit-cancel-{index}"));
+            let cache = Cache::open(Some(dir.clone())).unwrap();
+            let first = slow_body_request(&http, &server.url, &cache, policy);
+            let _release_first = server.next_body().await;
+            let second = slow_body_request(&http, &server.url, &cache, policy);
+            first.abort();
+            assert!(first.await.unwrap_err().is_cancelled());
+            server.next_body().await.send(true).unwrap();
+            assert_eq!(second.await.unwrap().unwrap(), b"feed");
+            std::fs::remove_dir_all(dir).unwrap();
+        }
     }
 
     fn headers_with_retry_after(value: &str) -> HeaderMap {

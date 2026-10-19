@@ -334,6 +334,14 @@ impl HostGate {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_concurrency(per_host: usize) -> Self {
+        Self {
+            per_host,
+            ..Self::default()
+        }
+    }
+
     /// This host's current escalation depth. Test-facing: the transition is compound, so
     /// reading the field directly invites asserting on a torn value.
     #[cfg(test)]
