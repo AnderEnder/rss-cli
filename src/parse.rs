@@ -176,7 +176,11 @@ fn entry_to_item(
     let title = entry.title.map(|t| t.content);
     let published = entry.published.map(rfc3339);
     let updated = entry.updated.map(rfc3339);
-    let authors = entry.authors.into_iter().map(|p| p.name).collect();
+    let authors = entry
+        .authors
+        .into_iter()
+        .filter_map(|p| p.name.or(p.email))
+        .collect();
     let categories = entry.categories.into_iter().map(|c| c.term).collect();
     let summary = entry.summary.map(|t| t.content);
 
@@ -358,6 +362,22 @@ mod tests {
         assert_eq!(parsed.title.as_deref(), Some("Example Blog"));
         assert_eq!(parsed.site_url.as_deref(), Some("https://example.com/"));
         assert_eq!(parsed.items.len(), 2);
+    }
+
+    #[test]
+    fn authors_use_names_and_preserve_email_only_contacts() {
+        for (author, expected) in [
+            ("alice@example.com", "alice@example.com"),
+            ("Alice &lt;alice@example.com&gt;", "Alice"),
+            ("Alice", "Alice"),
+        ] {
+            let body = format!(
+                "<rss version=\"2.0\"><channel><title>Authors</title><item>\
+                 <title>Post</title><author>{author}</author></item></channel></rss>"
+            );
+            let parsed = parse_feed(body.as_bytes(), FEED_URL, &params()).unwrap();
+            assert_eq!(parsed.items[0].authors, [expected], "author: {author}");
+        }
     }
 
     #[test]
