@@ -101,12 +101,12 @@ fn extract_feeds(html: &str, base_url: &str) -> Vec<DiscoveredFeed> {
     feeds
 }
 
-/// Read an attribute as an owned `String` (HTML entities decoded by `tl`).
+/// Decode HTML entities once before interpreting attribute values.
 fn attr(attrs: &tl::Attributes<'_>, key: &str) -> Option<String> {
     attrs
         .get(key)
         .flatten()
-        .map(|b| b.as_utf8_str().into_owned())
+        .map(|b| html_escape::decode_html_entities(&b.as_utf8_str()).into_owned())
 }
 
 /// Map a `<link>`'s `type` (and `href` as a fallback) to a feed type, or `None` to reject.
@@ -142,6 +142,28 @@ fn classify(ty: Option<&str>, href: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decodes_attribute_entities_before_resolving_feed_urls() {
+        let html = r#"<link rel="altern&#97;te" type="application/rss&#43;xml"
+            href="/feed?a=1&amp;b=2&#38;c=3&#x26;d=%26amp%3B" title="News &amp; &#x1F4F0;">"#;
+        let feeds = extract_feeds(html, "https://example.com/");
+        assert_eq!(feeds.len(), 1);
+        assert_eq!(
+            feeds[0].url,
+            "https://example.com/feed?a=1&b=2&c=3&d=%26amp%3B"
+        );
+        assert_eq!(feeds[0].title.as_deref(), Some("News & 📰"));
+    }
+
+    #[test]
+    fn attribute_entities_are_decoded_only_once() {
+        let html = r#"<link rel="alternate" type="application/rss+xml"
+            href="/feed?q=&amp;amp;" title="&amp;lt;news&amp;gt;">"#;
+        let feeds = extract_feeds(html, "https://example.com/");
+        assert_eq!(feeds[0].url, "https://example.com/feed?q=&amp;");
+        assert_eq!(feeds[0].title.as_deref(), Some("&lt;news&gt;"));
+    }
 
     #[test]
     fn extracts_rss_and_atom_links() {

@@ -42,6 +42,7 @@ feed-rs = "3.0.0"
 futures = "0.3.34"
 htmd = "0.5.5"
 html2text = "0.17.1"
+html-escape = "0.3.0"
 opml = "1.1.6"
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "gzip", "charset", "http2"] }
 rmcp = { version = "3.5.1", features = ["server", "macros", "transport-io"] }
