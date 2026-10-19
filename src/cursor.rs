@@ -36,6 +36,9 @@ pub struct Cursor {
     /// *same* instant. Without this a relative window like `2h` would slide between pages
     /// and silently skip items.
     pub s: Option<i64>,
+    /// Fractional nanoseconds of `s`; old cursors default to a whole-second cutoff.
+    #[serde(default)]
+    pub ns: u32,
 }
 
 impl Cursor {
@@ -60,6 +63,15 @@ impl Cursor {
                  re-request without a cursor",
                 cursor.v
             )));
+        }
+        let invalid_cutoff = match cursor.s {
+            Some(secs) => chrono::DateTime::from_timestamp(secs, cursor.ns).is_none(),
+            None => cursor.ns != 0,
+        };
+        if invalid_cutoff {
+            return Err(RssError::Usage(
+                "invalid cursor: the recorded `since` cutoff is not a valid instant".into(),
+            ));
         }
         Ok(cursor)
     }
@@ -107,6 +119,29 @@ mod tests {
             i: 7,
             n: 25,
             s: Some(1_780_000_000),
+            ns: 500_000_000,
+        }
+    }
+
+    #[test]
+    fn legacy_cursor_defaults_to_zero_nanoseconds() {
+        let token = URL_SAFE_NO_PAD.encode(br#"{"v":1,"fp":"legacy","f":0,"i":0,"n":1,"s":0}"#);
+        let c = Cursor::decode(&token).unwrap();
+        let json: serde_json::Value =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(c.encode()).unwrap()).unwrap();
+        assert_eq!(json["ns"], 0);
+    }
+
+    #[test]
+    fn cursor_rejects_invalid_subsecond_cutoffs() {
+        for raw in [
+            r#"{"v":1,"fp":"bad","f":0,"i":0,"n":1,"s":0,"ns":1000000000}"#,
+            r#"{"v":1,"fp":"bad","f":0,"i":0,"n":1,"s":null,"ns":1}"#,
+        ] {
+            assert!(
+                Cursor::decode(&URL_SAFE_NO_PAD.encode(raw)).is_err(),
+                "invalid cutoff: {raw}"
+            );
         }
     }
 
@@ -120,6 +155,7 @@ mod tests {
         assert_eq!(decoded.i, c.i);
         assert_eq!(decoded.n, c.n);
         assert_eq!(decoded.s, c.s);
+        assert_eq!(decoded.ns, c.ns);
     }
 
     #[test]

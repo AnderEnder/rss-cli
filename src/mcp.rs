@@ -216,6 +216,7 @@ fn worst_case_marker() -> crate::model::TruncationInfo {
                 i: usize::MAX,
                 n: usize::MAX,
                 s: Some(i64::MIN),
+                ns: u32::MAX,
             }
             .encode(),
         ),
@@ -1162,6 +1163,7 @@ fn continuation(fp: &str, params: &FetchParams, f: usize, i: usize, n: usize) ->
         i,
         n,
         s: params.since.map(|dt| dt.timestamp()),
+        ns: params.since.map_or(0, |dt| dt.timestamp_subsec_nanos()),
     }
     .encode()
 }
@@ -1230,7 +1232,7 @@ fn resume_from_cursor(
     // not a representable instant would otherwise *widen* the window — dropping the cutoff
     // entirely and returning items page 1 filtered out — so reject it instead.
     if let Some(secs) = c.s {
-        match chrono::DateTime::from_timestamp(secs, 0) {
+        match chrono::DateTime::from_timestamp(secs, c.ns) {
             Some(dt) => params.since = Some(dt),
             None => {
                 return Err(tool_error_code(
@@ -4063,6 +4065,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fractional_since_pagination_returns_each_item_exactly_once() {
+        let mut body = String::from(
+            "<feed xmlns=\"http://www.w3.org/2005/Atom\"><title>Boundary</title><id>feed</id>",
+        );
+        for i in 0..8 {
+            let published = match i {
+                0..=2 => "<published>2026-01-02T00:00:00Z</published>",
+                3 => "<published>2026-01-01T00:00:00.100Z</published>",
+                _ => "",
+            };
+            body.push_str(&format!(
+                "<entry><id>entry-{i}</id><title>post{i}</title>{published}\
+                 <content type=\"text\">{}</content></entry>",
+                "filler ".repeat(40)
+            ));
+        }
+        body.push_str("</feed>");
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/feed")
+            .with_body(body)
+            .expect(1)
+            .create_async()
+            .await;
+        let (cache, dir) = temp_cache("fractional-since");
+        let http = test_http();
+        let args_for = |cursor, budget| {
+            let mut args = fetch_args(format!("{}/feed", server.url()));
+            args.since = Some("2026-01-01T00:00:00.500Z".into());
+            args.limit = Some(10);
+            args.cache_policy = Some("cache-first".into());
+            args.max_response_tokens = budget;
+            args.cursor = cursor;
+            args
+        };
+        let full = full_response_tokens(&http, &cache, args_for(None, None)).await;
+        let mut cursor = None;
+        let mut got = Vec::new();
+        let mut pages = 0;
+        loop {
+            let page =
+                output_of(&fetch_feed_inner(&http, &cache, args_for(cursor, Some(full / 2))).await);
+            assert!(
+                page.warnings
+                    .iter()
+                    .all(|w| w.code != "CACHE_WINDOW_ROLLED"),
+                "unchanged cached feed: {:?}",
+                page.warnings
+            );
+            got.extend(titles(&page));
+            pages += 1;
+            cursor = page.truncation.and_then(|t| t.next_cursor);
+            if cursor.is_none() {
+                break;
+            }
+            assert!(pages < 20, "pagination must finish");
+        }
+        assert!(pages > 1, "fixture must exercise continuation");
+        assert_eq!(
+            got,
+            [
+                "post0", "post1", "post2", "post4", "post5", "post6", "post7"
+            ]
+        );
+        mock.assert_async().await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
     async fn continuation_reuses_the_page_one_since_cutoff() {
         // `since: "7d"` resolves to a new instant on every call. The fingerprint covers the
         // RAW string (so the continuation matches at all) and the resolved cutoff rides in the
@@ -4329,6 +4400,7 @@ mod tests {
             i: 1,
             n: 3,
             s: None,
+            ns: 0,
         }
         .encode();
 
