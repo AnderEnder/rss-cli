@@ -48,3 +48,4 @@ where a real fork existed). Statuses: `Proposed`, `Accepted`, `Superseded by NNN
 | [0022](0022-stale-copies-that-cannot-cover-the-since-window.md) | A stale copy that cannot cover the `since` window | Accepted |
 | [0023](0023-cooldown-escalation-decays-rather-than-resets.md) | Cooldown escalation should decay, not reset | Accepted |
 | [0024](0024-the-retry-is-for-a-blip-not-a-shedding-host.md) | The single retry is for a blip, not for a host that is already shedding | Accepted |
+| [0025](0025-preserve-feed-snapshots-and-source-text.md) | Preserve feed snapshots, source text, and bounded input | Accepted |
