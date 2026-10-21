@@ -1,18 +1,14 @@
 //! Atomic, file-based HTTP cache.
 //!
-//! Lightweight by design: no database engine, no C dependency. Each feed is stored as a
-//! pair of files under the cache dir, keyed by `sha256(feed_url)`:
-//!
-//! - `<hash>.json` — [`CacheMeta`] (validators + timestamps + content type).
-//! - `<hash>.body` — the raw response body bytes.
-//!
-//! Both are written atomically (temp file + rename) so a crash can never leave a torn
-//! entry. The cache exists for (a) conditional GET and (b) resolving `show` / `get_item`
-//! lookups — it is **not** responsible for item-ID stability (IDs are deterministic; see
-//! [`crate::identity`]).
+//! Each `<sha256(feed_url)>.entry` stores one compact JSON metadata line followed by the
+//! raw body. One rename publishes both together; legacy `.json`/`.body` pairs remain readable.
+//! The cache supports conditional GET and item lookup, never item identity.
 
+use std::collections::HashSet;
 use std::fs;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -20,6 +16,7 @@ use sha2::{Digest, Sha256};
 use crate::error::RssError;
 
 type Result<T> = std::result::Result<T, RssError>;
+const MAX_META_BYTES: usize = 64 * 1024;
 
 /// Cached HTTP metadata for a feed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -90,96 +87,192 @@ impl Cache {
         self.root.join(format!("{}.body", Self::key(feed_url)))
     }
 
-    /// Read a cache entry for `feed_url`, if present and intact.
+    fn entry_path(&self, feed_url: &str) -> PathBuf {
+        self.root.join(format!("{}.entry", Self::key(feed_url)))
+    }
+
+    /// Read a complete snapshot, falling back to the legacy pair on a miss.
     pub fn get(&self, feed_url: &str) -> Result<Option<CacheEntry>> {
-        let meta_path = self.meta_path(feed_url);
-        let body_path = self.body_path(feed_url);
-        if !meta_path.exists() || !body_path.exists() {
-            return Ok(None);
+        let path = self.entry_path(feed_url);
+        let entry = match read_bounded(&path, crate::config::MAX_BODY_BYTES + MAX_META_BYTES) {
+            Ok(bytes) => decode_entry(&bytes)?,
+            Err(RssError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                let meta = match read_bounded(&self.meta_path(feed_url), MAX_META_BYTES) {
+                    Ok(bytes) => serde_json::from_slice::<CacheMeta>(&bytes)
+                        .map_err(|e| RssError::Cache(format!("corrupt cache metadata: {e}")))?,
+                    Err(RssError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                        return Ok(None);
+                    }
+                    Err(e) => return Err(e),
+                };
+                let body =
+                    match read_bounded(&self.body_path(feed_url), crate::config::MAX_BODY_BYTES) {
+                        Ok(body) => body,
+                        Err(RssError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                            return Ok(None);
+                        }
+                        Err(e) => return Err(e),
+                    };
+                CacheEntry { meta, body }
+            }
+            Err(e) => return Err(e),
+        };
+        if entry.meta.feed_url != feed_url {
+            return Err(RssError::Cache(
+                "cache metadata URL does not match its key".into(),
+            ));
         }
-        let meta_bytes = fs::read(&meta_path)?;
-        let meta: CacheMeta = serde_json::from_slice(&meta_bytes)
-            .map_err(|e| RssError::Cache(format!("corrupt cache metadata: {e}")))?;
-        let body = fs::read(&body_path)?;
-        Ok(Some(CacheEntry { meta, body }))
+        Ok(Some(entry))
     }
 
-    /// Atomically write a cache entry.
+    /// Atomically publish metadata and body in one record.
     pub fn put(&self, meta: &CacheMeta, body: &[u8]) -> Result<()> {
-        atomic_write(&self.body_path(&meta.feed_url), body)?;
-        let meta_bytes = serde_json::to_vec_pretty(meta)
-            .map_err(|e| RssError::Cache(format!("serialize cache metadata: {e}")))?;
-        atomic_write(&self.meta_path(&meta.feed_url), &meta_bytes)?;
-        Ok(())
-    }
-
-    /// Remove all cache entries, returning the number of feeds removed.
-    pub fn clear(&self) -> Result<usize> {
-        let mut removed = 0;
-        for entry in fs::read_dir(&self.root)? {
-            let path = entry?.path();
-            if path.extension().is_some_and(|e| e == "json") {
-                removed += 1;
-            }
-            if path.is_file() {
-                fs::remove_file(&path)?;
-            }
-        }
-        Ok(removed)
-    }
-
-    /// List cached feeds.
-    pub fn list(&self) -> Result<Vec<CacheListItem>> {
-        let mut out = Vec::new();
-        for entry in fs::read_dir(&self.root)? {
-            let path = entry?.path();
-            if path.extension().is_none_or(|e| e != "json") {
-                continue;
-            }
-            let meta_bytes = match fs::read(&path) {
-                Ok(b) => b,
-                Err(_) => continue,
-            };
-            let Ok(meta) = serde_json::from_slice::<CacheMeta>(&meta_bytes) else {
-                continue;
-            };
-            let size = path
-                .with_extension("body")
-                .metadata()
-                .map(|m| m.len())
-                .unwrap_or(0);
-            out.push(CacheListItem {
-                feed_url: meta.feed_url,
-                fetched_at: meta.fetched_at,
-                size_bytes: size,
-                etag: meta.etag,
+        if body.len() > crate::config::MAX_BODY_BYTES {
+            return Err(RssError::BodyTooLarge {
+                limit_bytes: crate::config::MAX_BODY_BYTES,
             });
         }
+        let mut bytes = serde_json::to_vec(meta)
+            .map_err(|e| RssError::Cache(format!("serialize cache metadata: {e}")))?;
+        if bytes.len() >= MAX_META_BYTES {
+            return Err(RssError::Cache("cache metadata exceeds 64 KiB".into()));
+        }
+        bytes.push(b'\n');
+        bytes.extend_from_slice(body);
+        atomic_write(&self.entry_path(&meta.feed_url), &bytes)
+    }
+
+    /// Remove only recognized cache records, returning the number of feed keys removed.
+    pub fn clear(&self) -> Result<usize> {
+        let mut removed = HashSet::new();
+        for entry in fs::read_dir(&self.root)? {
+            let entry = entry?;
+            let path = entry.path();
+            if owned_path(&path) && entry.file_type()?.is_file() {
+                match fs::remove_file(&path) {
+                    Ok(()) => {
+                        removed.insert(path.file_stem().unwrap().to_owned());
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        }
+        Ok(removed.len())
+    }
+
+    /// List each feed once, preferring the atomic record over legacy metadata.
+    pub fn list(&self) -> Result<Vec<CacheListItem>> {
+        let mut urls = HashSet::new();
+        for entry in fs::read_dir(&self.root)? {
+            let path = entry?.path();
+            if !owned_path(&path) {
+                continue;
+            }
+            let metadata = match path.extension().and_then(|e| e.to_str()) {
+                Some("entry") => {
+                    read_bounded(&path, crate::config::MAX_BODY_BYTES + MAX_META_BYTES)
+                        .ok()
+                        .and_then(|bytes| decode_entry(&bytes).ok())
+                        .map(|entry| entry.meta)
+                }
+                Some("json") => read_bounded(&path, MAX_META_BYTES)
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<CacheMeta>(&bytes).ok()),
+                _ => None,
+            };
+            if let Some(meta) = metadata
+                && path.file_stem().and_then(|s| s.to_str())
+                    == Some(Self::key(&meta.feed_url).as_str())
+            {
+                urls.insert(meta.feed_url);
+            }
+        }
+        let mut out = Vec::new();
+        for url in urls {
+            if let Ok(Some(entry)) = self.get(&url) {
+                out.push(CacheListItem {
+                    feed_url: entry.meta.feed_url,
+                    fetched_at: entry.meta.fetched_at,
+                    size_bytes: entry.body.len() as u64,
+                    etag: entry.meta.etag,
+                });
+            }
+        }
+        out.sort_by(|a, b| a.feed_url.cmp(&b.feed_url));
         Ok(out)
     }
 }
 
-/// Write `bytes` to `path` atomically (temp file in the same dir, then rename).
-fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let tmp = path.with_extension(format!("tmp.{}", std::process::id() as u64 ^ rand_suffix()));
-    fs::write(&tmp, bytes)?;
-    // Rename is atomic within the same filesystem; temp lives in the same dir.
-    match fs::rename(&tmp, path) {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            let _ = fs::remove_file(&tmp);
-            let _ = dir; // keep `dir` referenced for clarity even if rename is enough.
-            Err(RssError::Io(e))
-        }
-    }
+fn owned_path(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|e| e.to_str()),
+        Some("entry" | "json" | "body")
+    ) && path.file_stem().and_then(|s| s.to_str()).is_some_and(|s| {
+        s.len() == 64
+            && s.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
 }
 
-/// Cheap, dependency-free per-call suffix to avoid temp-file collisions.
-fn rand_suffix() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
+fn read_bounded(path: &Path, limit: usize) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    fs::File::open(path)?
+        .take(limit as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > limit {
+        return Err(RssError::BodyTooLarge {
+            limit_bytes: crate::config::MAX_BODY_BYTES,
+        });
+    }
+    Ok(bytes)
+}
+
+fn decode_entry(bytes: &[u8]) -> Result<CacheEntry> {
+    let split = bytes
+        .iter()
+        .position(|b| *b == b'\n')
+        .ok_or_else(|| RssError::Cache("incomplete cache record".into()))?;
+    let body = &bytes[split + 1..];
+    if split >= MAX_META_BYTES || body.len() > crate::config::MAX_BODY_BYTES {
+        return Err(RssError::BodyTooLarge {
+            limit_bytes: crate::config::MAX_BODY_BYTES,
+        });
+    }
+    let meta = serde_json::from_slice(&bytes[..split])
+        .map_err(|e| RssError::Cache(format!("corrupt cache metadata: {e}")))?;
+    Ok(CacheEntry {
+        meta,
+        body: body.to_vec(),
+    })
+}
+
+fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let (tmp, mut file) = loop {
+        let tmp = path.with_extension(format!(
+            "entry.tmp.{}.{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+        {
+            Ok(file) => break (tmp, file),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.into()),
+        }
+    };
+    let result = (|| {
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result.map_err(RssError::Io)
 }

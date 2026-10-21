@@ -143,11 +143,7 @@ impl HttpClient {
                     return Err(self.http_error(url, &resp));
                 }
                 let content_type = header_string(resp.headers(), &CONTENT_TYPE);
-                let body = resp
-                    .bytes()
-                    .await
-                    .map_err(|e| RssError::Network(e.to_string()))?
-                    .to_vec();
+                let body = read_body(resp).await?;
                 Ok(RawFeed {
                     body,
                     final_url,
@@ -313,11 +309,7 @@ impl HttpClient {
         let content_type = header_string(resp.headers(), &CONTENT_TYPE);
         let etag = header_string(resp.headers(), &ETAG);
         let last_modified = header_string(resp.headers(), &LAST_MODIFIED);
-        let body = resp
-            .bytes()
-            .await
-            .map_err(|e| RssError::Network(e.to_string()))?
-            .to_vec();
+        let body = read_body(resp).await?;
 
         let meta = CacheMeta {
             feed_url: url.to_string(),
@@ -327,7 +319,10 @@ impl HttpClient {
             fetched_at: now_rfc3339(),
             content_type: content_type.clone(),
         };
-        cache.put(&meta, &body)?;
+        // Parsing still fails in core, but an invalid 200 must not evict a usable snapshot.
+        if feed_rs::parser::parse(body.as_slice()).is_ok() {
+            cache.put(&meta, &body)?;
+        }
 
         Ok(RawFeed {
             body,
@@ -381,13 +376,31 @@ impl HttpClient {
         if !status.is_success() {
             return Err(self.http_error(url, &resp));
         }
-        let body = resp
-            .bytes()
-            .await
-            .map_err(|e| RssError::Network(e.to_string()))?
-            .to_vec();
+        let body = read_body(resp).await?;
         Ok((body, final_url))
     }
+}
+
+async fn read_body(mut response: reqwest::Response) -> Result<Vec<u8>, RssError> {
+    let limit = crate::config::MAX_BODY_BYTES;
+    if response
+        .content_length()
+        .is_some_and(|len| len > limit as u64)
+    {
+        return Err(RssError::BodyTooLarge { limit_bytes: limit });
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| RssError::Network(e.to_string()))?
+    {
+        if chunk.len() > limit - body.len() {
+            return Err(RssError::BodyTooLarge { limit_bytes: limit });
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 /// Statuses we retry exactly once — transient provider rate-limiting.
@@ -847,7 +860,7 @@ mod tests {
             .with_status(200)
             .with_header("etag", "\"v1\"")
             .with_header("content-type", "application/rss+xml")
-            .with_body("<rss>fresh</rss>")
+            .with_body("<rss version=\"2.0\"><channel><title>fresh</title></channel></rss>")
             .create_async()
             .await;
 
@@ -863,12 +876,18 @@ mod tests {
         assert_eq!(raw.status, 200);
         assert!(!raw.from_cache);
         assert!(!raw.not_modified);
-        assert_eq!(raw.body, b"<rss>fresh</rss>".to_vec());
+        assert_eq!(
+            raw.body,
+            b"<rss version=\"2.0\"><channel><title>fresh</title></channel></rss>".to_vec()
+        );
         assert_eq!(raw.content_type.as_deref(), Some("application/rss+xml"));
 
         // The body and validators must have landed in the cache.
         let entry = cache.get(&url).expect("cache get").expect("entry present");
-        assert_eq!(entry.body, b"<rss>fresh</rss>".to_vec());
+        assert_eq!(
+            entry.body,
+            b"<rss version=\"2.0\"><channel><title>fresh</title></channel></rss>".to_vec()
+        );
         assert_eq!(entry.meta.etag.as_deref(), Some("\"v1\""));
 
         mock.assert_async().await;
