@@ -82,8 +82,41 @@ pub(crate) fn parse_feed_with_base(
     } else {
         None
     };
+    let query = params
+        .query
+        .as_deref()
+        .map(crate::query::Query::parse)
+        .filter(|q| !q.is_empty());
+    let mut items_filtered_out = 0;
     for (index, entry) in feed.entries.into_iter().enumerate() {
         let sort_key = entry.published.or(entry.updated);
+        if params
+            .since
+            .zip(sort_key)
+            .is_some_and(|(since, when)| when < since)
+        {
+            items_filtered_out += 1;
+            continue;
+        }
+        if let Some(q) = &query {
+            let title = entry.title.as_ref().map(|t| {
+                searchable_text(
+                    &t.content,
+                    t.content_type.essence() == mediatype::media_type!(TEXT / PLAIN),
+                )
+            });
+            let summary = entry.summary.as_ref().map(|t| {
+                searchable_text(
+                    &t.content,
+                    t.content_type.essence() == mediatype::media_type!(TEXT / PLAIN),
+                )
+            });
+            let body = content_source(&entry).map(|(text, plain)| searchable_text(text, plain));
+            if !q.matches_fields([title.as_deref(), summary.as_deref(), body.as_deref()]) {
+                items_filtered_out += 1;
+                continue;
+            }
+        }
         let (mut item, fell_back) = entry_to_item(entry, feed_url, base.as_ref(), params);
         if let Some(enclosures) = recovered.as_ref().and_then(|items| items.get(index)) {
             for enclosure in enclosures {
@@ -97,31 +130,6 @@ pub(crate) fn parse_feed_with_base(
             }
         }
         rows.push((item, sort_key, fell_back));
-    }
-
-    // `--since`: drop items whose known instant is older than the cutoff. Items with no
-    // date are retained (we cannot prove they are older). Counted into
-    // `items_filtered_out` alongside the keyword filter below — see that field's docs for
-    // why the two are not split out.
-    let before_since = rows.len();
-    if let Some(since) = params.since {
-        rows.retain(|(_, key, _)| match key {
-            Some(dt) => *dt >= since,
-            None => true,
-        });
-    }
-    let mut items_filtered_out = before_since - rows.len();
-
-    // `--query`: keyword filter over title/summary/content (see `crate::query`). Applied
-    // before the sort and before `--limit`, so `limit` means "N matching items" rather than
-    // "N items, some of which match".
-    if let Some(raw) = params.query.as_deref() {
-        let q = crate::query::Query::parse(raw);
-        if !q.is_empty() {
-            let before = rows.len();
-            rows.retain(|(item, _, _)| q.matches_item(item));
-            items_filtered_out += before - rows.len();
-        }
     }
 
     // Sort newest-first. Reversing the key sorts dated items descending and places undated
@@ -182,6 +190,46 @@ fn collect_warnings(feed_url: &str, rows: &[(Item, Option<DateTime<Utc>>, bool)]
     warnings
 }
 
+fn content_source(entry: &Entry) -> Option<(&str, bool)> {
+    entry
+        .content
+        .as_ref()
+        .and_then(|c| {
+            c.body
+                .as_deref()
+                .filter(|text| !text.trim().is_empty())
+                .map(|text| {
+                    (
+                        text,
+                        c.content_type.essence() == mediatype::media_type!(TEXT / PLAIN),
+                    )
+                })
+        })
+        .or_else(|| {
+            entry
+                .summary
+                .as_ref()
+                .filter(|s| !s.content.trim().is_empty())
+                .map(|s| {
+                    (
+                        s.content.as_str(),
+                        s.content_type.essence() == mediatype::media_type!(TEXT / PLAIN),
+                    )
+                })
+        })
+}
+
+fn searchable_text(text: &str, plain: bool) -> String {
+    let text = if plain {
+        text.to_string()
+    } else {
+        html2text::config::plain_no_decorate()
+            .string_from_read(text.as_bytes(), 4096)
+            .unwrap_or_else(|_| content::extract(text, ContentFormat::Text).0)
+    };
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// Convert a single `feed-rs` [`Entry`] into our serialized [`Item`], returning
 /// `(item, content_fell_back)` — the flag is `true` when content extraction degraded to a
 /// tag strip (see [`content::extract`]) so the caller can warn.
@@ -191,6 +239,7 @@ fn entry_to_item(
     base: Option<&Url>,
     params: &FetchParams,
 ) -> (Item, bool) {
+    let source = content_source(&entry).map(|(text, plain)| (text.to_string(), plain));
     // Collect attachments while `entry` is still fully owned (borrows `media`/`links`).
     let enclosures = collect_enclosures(&entry);
 
@@ -228,13 +277,8 @@ fn entry_to_item(
     let content = if format == ContentFormat::None {
         None
     } else {
-        let content_html = entry.content.and_then(|c| c.body);
-        let source = content_html
-            .as_deref()
-            .filter(|h| !h.trim().is_empty())
-            .or_else(|| summary.as_deref().filter(|s| !s.trim().is_empty()));
-        source.map(|html| {
-            let (extracted, fell_back) = content::extract(html, format);
+        source.map(|(text, plain)| {
+            let (extracted, fell_back) = content::extract_source(&text, plain, format);
             content_fell_back = fell_back;
             content_hash = Some(content::content_hash(&extracted));
             // Apply the per-item character cap to the *extracted* body (not source HTML).
@@ -389,6 +433,106 @@ mod tests {
     <content type="html">&lt;p&gt;Atom body&lt;/p&gt;</content>
   </entry>
 </feed>"#;
+
+    #[test]
+    fn plain_text_is_preserved_and_html_output_is_escaped() {
+        let text = "Use Vec<T> and Option<String>. Keep <b>literal</b> & entities &copy; &#60;.";
+        let json = serde_json::json!({"version":"https://jsonfeed.org/version/1.1", "title":"Text", "items":[{"id":"1", "content_text":text}]}).to_string();
+        let atom = format!(
+            r#"<feed xmlns="http://www.w3.org/2005/Atom"><title>Text</title><id>urn:feed</id><entry><id>urn:1</id><content type="text">{}</content></entry></feed>"#,
+            html_escape::encode_text(text)
+        );
+        let summary_json = serde_json::json!({"version":"https://jsonfeed.org/version/1.1", "title":"Text", "items":[{"id":"1", "summary":text}]}).to_string();
+        let summary_atom = atom
+            .replace("<content type=", "<summary type=")
+            .replace("</content>", "</summary>");
+        for body in [&json, &atom, &summary_json, &summary_atom] {
+            let parsed = parse_feed(
+                body.as_bytes(),
+                FEED_URL,
+                &FetchParams {
+                    content_format: ContentFormat::Text,
+                    ..params()
+                },
+            )
+            .unwrap();
+            assert_eq!(parsed.items[0].content.as_deref(), Some(text));
+            let parsed = parse_feed(
+                body.as_bytes(),
+                FEED_URL,
+                &FetchParams {
+                    content_format: ContentFormat::Html,
+                    ..params()
+                },
+            )
+            .unwrap();
+            let content = parsed.items[0].content.as_deref().unwrap();
+            assert!(content.contains("Vec&lt;T&gt;"), "{content}");
+            assert!(!content.contains("<b>literal</b>"), "{content}");
+            let parsed = parse_feed(
+                body.as_bytes(),
+                FEED_URL,
+                &FetchParams {
+                    content_format: ContentFormat::Markdown,
+                    ..params()
+                },
+            )
+            .unwrap();
+            assert!(
+                parsed.items[0]
+                    .content
+                    .as_deref()
+                    .unwrap()
+                    .contains("Vec\\<T\\>")
+            );
+            assert!(
+                parsed.items[0]
+                    .content
+                    .as_deref()
+                    .unwrap()
+                    .contains("\\&copy;")
+            );
+            assert!(
+                parsed.items[0]
+                    .content
+                    .as_deref()
+                    .unwrap()
+                    .contains("\\&\\#60;")
+            );
+        }
+    }
+
+    #[test]
+    fn query_selection_does_not_depend_on_presentation() {
+        let body = r#"<feed xmlns="http://www.w3.org/2005/Atom"><title>Text</title><id>urn:feed</id><entry><id>urn:1</id><content type="html">&lt;p&gt;prefix needle &lt;b&gt;important&lt;/b&gt; phrase&lt;/p&gt;</content></entry></feed>"#;
+        for format in [
+            ContentFormat::None,
+            ContentFormat::Text,
+            ContentFormat::Markdown,
+            ContentFormat::Html,
+        ] {
+            for cap in [None, Some(2)] {
+                let p = FetchParams {
+                    query: Some("needle \"important phrase\"".into()),
+                    content_format: format,
+                    max_content_chars: cap,
+                    ..params()
+                };
+                let parsed = parse_feed(body.as_bytes(), FEED_URL, &p).unwrap();
+                assert_eq!(parsed.items.len(), 1, "{format:?} {cap:?}");
+                let p = FetchParams {
+                    query: Some("-needle".into()),
+                    ..p
+                };
+                assert!(
+                    parse_feed(body.as_bytes(), FEED_URL, &p)
+                        .unwrap()
+                        .items
+                        .is_empty()
+                );
+            }
+        }
+    }
 
     #[test]
     fn parses_rss_metadata_and_items() {

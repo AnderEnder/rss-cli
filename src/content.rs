@@ -39,6 +39,29 @@ pub fn extract(html: &str, format: ContentFormat) -> (String, bool) {
     }
 }
 
+/// Render plain source text without interpreting literal tags as HTML.
+pub(crate) fn extract_source(text: &str, plain: bool, format: ContentFormat) -> (String, bool) {
+    if !plain {
+        return extract(text, format);
+    }
+    let rendered = match format {
+        ContentFormat::Text => text.to_string(),
+        ContentFormat::Html => html_escape::encode_text(text).into_owned(),
+        ContentFormat::Markdown => {
+            let mut escaped = String::new();
+            for ch in text.chars() {
+                if "\\`*_{}[]()#+-.!|><&".contains(ch) {
+                    escaped.push('\\');
+                }
+                escaped.push(ch);
+            }
+            escaped
+        }
+        ContentFormat::None => String::new(),
+    };
+    (rendered, false)
+}
+
 /// Stable 16-hex (64-bit) SHA-256 prefix of already-extracted content, for cheap
 /// change-detection across runs. Mirrors the item-id construction (lowercase hex, first 8
 /// bytes); 64 bits is ample to flag "this body changed".

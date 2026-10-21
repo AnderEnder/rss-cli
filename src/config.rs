@@ -99,8 +99,8 @@ pub struct FetchParams {
     pub since: Option<DateTime<Utc>>,
     /// Keyword filter over each item's title, summary, and content ([`crate::query::Query`]).
     /// Applied in [`crate::parse::parse_feed`] after `since` and before `limit`, so `limit`
-    /// means "N matching items". It matches the item as it will be *returned*, so
-    /// `content_format` and `max_content_chars` narrow what is searchable.
+    /// means "N matching items". Searches full plain source text before output formatting
+    /// and truncation, including when `content_format` is `None`.
     pub query: Option<String>,
     /// Maximum number of feeds fetched concurrently.
     pub concurrency: usize,
