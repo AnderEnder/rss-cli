@@ -18,9 +18,9 @@ use crate::model::Item;
 /// - **All-exclusions is not empty.** `-spam` leaves `required` empty (vacuously satisfied)
 ///   and `excluded` non-empty, so [`Query::is_empty`] is `false`. Only a query with no terms
 ///   at all is empty.
-/// - **[`Query::matches_item`] searches `title`, `summary`, `content`** — not `authors`,
-///   `url`, `categories`, `guid`. It sees the item as it will be *returned*, so
-///   `--content none` and `--max-content-chars` shrink what is searchable.
+/// - **Search fields are `title`, `summary`, `content`**, not `authors`, `url`,
+///   `categories`, `guid`. The parser searches full plain source text before rendering;
+///   [`Query::matches_item`] searches the supplied item verbatim.
 /// - **Fields are matched separately, never concatenated**, so a phrase cannot span a field
 ///   boundary — no separator exists for a term to straddle, even one containing a newline.
 ///   Within a field the text is matched verbatim, so a phrase can't span a line break in
@@ -116,18 +116,22 @@ impl Query {
     /// term to match across. Cost is O(total item text) regardless of how many terms the
     /// query has; call this once per item, never once per term.
     pub fn matches_item(&self, item: &Item) -> bool {
-        if self.is_empty() {
-            return true;
-        }
-        let fields: Vec<String> = [
+        self.matches_fields([
             item.title.as_deref(),
             item.summary.as_deref(),
             item.content.as_deref(),
-        ]
-        .into_iter()
-        .flatten()
-        .map(str::to_lowercase)
-        .collect();
+        ])
+    }
+
+    pub(crate) fn matches_fields(&self, fields: [Option<&str>; 3]) -> bool {
+        if self.is_empty() {
+            return true;
+        }
+        let fields: Vec<String> = fields
+            .into_iter()
+            .flatten()
+            .map(str::to_lowercase)
+            .collect();
         let in_some_field = |term: &str| fields.iter().any(|f| f.contains(term));
         self.required.iter().all(|t| in_some_field(t))
             && !self.excluded.iter().any(|t| in_some_field(t))
