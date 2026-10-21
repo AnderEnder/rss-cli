@@ -184,6 +184,46 @@ fn render_fetch_text(out: &FetchOutput, color: bool) -> String {
     lines.join("\n")
 }
 
+/// Render a single item using the same format choices as fetch.
+pub fn render_item(item: &crate::model::Item, format: OutputFormat, color: bool) -> String {
+    match format {
+        OutputFormat::Json => serde_json::to_string_pretty(item).unwrap_or_default(),
+        OutputFormat::Ndjson => serde_json::to_string(item).unwrap_or_default(),
+        OutputFormat::Text => {
+            let mut text = bold(item.title.as_deref().unwrap_or(&item.id), color);
+            if let Some(url) = &item.url {
+                text.push_str(&format!("\n{url}"));
+            }
+            if let Some(body) = item.content.as_deref().or(item.summary.as_deref()) {
+                text.push_str(&format!("\n\n{body}"));
+            }
+            text
+        }
+    }
+}
+
+/// Render cached feed metadata in the selected format.
+pub fn render_cache_list(items: &[crate::cache::CacheListItem], format: OutputFormat) -> String {
+    match format {
+        OutputFormat::Json => serde_json::to_string_pretty(items).unwrap_or_default(),
+        OutputFormat::Ndjson => items
+            .iter()
+            .map(|item| serde_json::to_string(item).unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        OutputFormat::Text => items
+            .iter()
+            .map(|item| {
+                format!(
+                    "{}  {} bytes  {}",
+                    item.feed_url, item.size_bytes, item.fetched_at
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    }
+}
+
 /// Render a [`DiscoverOutput`] in the given format. **Owner: `cli` agent.**
 pub fn render_discover(out: &DiscoverOutput, format: OutputFormat, color: bool) -> String {
     match format {

@@ -95,10 +95,7 @@ async fn run() -> i32 {
             };
             match core::show_item(&args.feed_url, &args.id, &params, &cache).await {
                 Ok(Some(item)) => {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&item).unwrap_or_default()
-                    );
+                    println!("{}", output::render_item(&item, args.format.into(), color));
                     exit::OK
                 }
                 Ok(None) => fail(&RssError::NotFound(format!(
@@ -130,11 +127,7 @@ async fn run() -> i32 {
                 }
                 CacheAction::List { format } => match cache.list() {
                     Ok(items) => {
-                        let _ = format; // text rendering can be added by the cli agent
-                        println!(
-                            "{}",
-                            serde_json::to_string_pretty(&items).unwrap_or_default()
-                        );
+                        println!("{}", output::render_cache_list(&items, (*format).into()));
                         exit::OK
                     }
                     Err(e) => fail(&e),
