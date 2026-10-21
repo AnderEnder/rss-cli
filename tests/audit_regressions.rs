@@ -32,6 +32,43 @@ fn cache_clear_preserves_unrelated_files_and_directories() {
     }
 }
 
+#[test]
+fn show_and_cache_list_honor_output_formats() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = Cache::open(Some(dir.path().into())).unwrap();
+    let url = "https://example.com/feed";
+    cache.put(&meta(url), br#"<rss version="2.0"><channel><title>Feed</title><item><guid>one</guid><title>Post</title><description>Body</description></item></channel></rss>"#).unwrap();
+    for command in [vec!["show", url, "--id", "one"], vec!["cache", "list"]] {
+        for format in ["text", "ndjson", "json"] {
+            let out = std::process::Command::new(env!("CARGO_BIN_EXE_rss"))
+                .args(["--cache-dir", dir.path().to_str().unwrap(), "--no-color"])
+                .args(&command)
+                .args(["--format", format])
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let text = String::from_utf8(out.stdout).unwrap();
+            if format == "text" {
+                assert!(
+                    !text.starts_with('{') && !text.starts_with('['),
+                    "{command:?}: {text}"
+                );
+                assert!(text.contains(if command[0] == "show" { "Post" } else { url }));
+            } else if format == "ndjson" {
+                assert_eq!(text.lines().count(), 1, "{command:?}: {text}");
+                let record: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
+                assert!(record.is_object());
+            } else {
+                serde_json::from_str::<serde_json::Value>(&text).unwrap();
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn malformed_success_preserves_last_valid_cached_feed() {
     let mut server = mockito::Server::new_async().await;

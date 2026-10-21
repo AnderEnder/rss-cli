@@ -49,7 +49,15 @@ fn extract_feeds(html: &str, base_url: &str) -> Vec<DiscoveredFeed> {
         // A malformed homepage should not error the whole command; treat it as no feeds.
         Err(_) => return Vec::new(),
     };
-    let base = Url::parse(base_url).ok();
+    let document_base = Url::parse(base_url).ok();
+    let base = dom
+        .nodes()
+        .iter()
+        .filter_map(|n| n.as_tag())
+        .filter(|t| t.name().as_bytes().eq_ignore_ascii_case(b"base"))
+        .find_map(|t| attr(t.attributes(), "href"))
+        .and_then(|href| document_base.as_ref()?.join(href.trim()).ok())
+        .or(document_base);
 
     let mut feeds: Vec<DiscoveredFeed> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
@@ -62,10 +70,10 @@ fn extract_feeds(html: &str, base_url: &str) -> Vec<DiscoveredFeed> {
         let attrs = tag.attributes();
         let rel = attr(attrs, "rel");
         // Only consider `<link rel="alternate">` (rel may carry multiple space-separated tokens).
-        if !rel
-            .as_deref()
-            .is_some_and(|r| r.to_ascii_lowercase().contains("alternate"))
-        {
+        if !rel.as_deref().is_some_and(|r| {
+            r.split_ascii_whitespace()
+                .any(|token| token.eq_ignore_ascii_case("alternate"))
+        }) {
             continue;
         }
 
@@ -227,5 +235,22 @@ mod tests {
         assert_eq!(feeds.len(), 2);
         assert_eq!(feeds[0].url, "https://example.com/feed.rss");
         assert_eq!(feeds[1].url, "https://example.com/feed.atom");
+    }
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+    #[test]
+    fn discovery_honors_first_base_and_exact_rel_tokens() {
+        let html = r#"<base href="../blog/"><base href="https://wrong.example/"><link rel="notalternate" type="application/rss+xml" href="wrong.xml"><link rel="ALTERNATE stylesheet" type="application/rss+xml" href="feed.xml">"#;
+        let feeds = extract_feeds(html, "https://example.com/path/page");
+        assert_eq!(feeds.len(), 1);
+        assert_eq!(feeds[0].url, "https://example.com/blog/feed.xml");
+        let feeds = extract_feeds(
+            r#"<base href="https://cdn.example/blog/"><link rel="alternate" type="application/rss+xml" href="feed.xml">"#,
+            "https://example.com/",
+        );
+        assert_eq!(feeds[0].url, "https://cdn.example/blog/feed.xml");
     }
 }
