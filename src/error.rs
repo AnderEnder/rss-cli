@@ -58,6 +58,9 @@ pub enum RssError {
     #[error("batch deadline passed before {url} was attempted")]
     DeadlineExceeded { url: String },
 
+    #[error("response body exceeds the {limit_bytes}-byte decoded limit")]
+    BodyTooLarge { limit_bytes: usize },
+
     #[error("feed parse error: {0}")]
     Parse(String),
 
@@ -100,6 +103,7 @@ impl RssError {
             RssError::Http { .. } => "FEED_FETCH_FAILED",
             RssError::RateLimited { .. } => "RATE_LIMITED",
             RssError::DeadlineExceeded { .. } => "BATCH_DEADLINE_EXCEEDED",
+            RssError::BodyTooLarge { .. } => "RESPONSE_BODY_TOO_LARGE",
             RssError::Parse(_) => "FEED_PARSE_FAILED",
             RssError::NotFound(_) => "NOT_FOUND",
             RssError::Cache(_) => "CACHE_ERROR",
@@ -139,6 +143,9 @@ impl RssError {
                     "retry_after_seconds": retry_after.as_secs(),
                     "retry_after_ms": u64::try_from(retry_after.as_millis()).unwrap_or(u64::MAX),
                 });
+            }
+            RssError::BodyTooLarge { limit_bytes } => {
+                obj.details = serde_json::json!({ "limit_bytes": limit_bytes });
             }
             RssError::ResponseTooLarge {
                 estimated_tokens,

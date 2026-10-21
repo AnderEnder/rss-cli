@@ -7,6 +7,9 @@ use chrono::{DateTime, Utc};
 use crate::error::RssError;
 use crate::model::ContentFormat;
 
+/// Maximum decoded response body accepted for feeds and discovery (16 MiB).
+pub const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
+
 /// Default User-Agent. Polite, identifies the tool, points at the project.
 pub const DEFAULT_USER_AGENT: &str = concat!(
     "rss-cli/",
@@ -147,7 +150,9 @@ pub fn parse_since(s: &str) -> Result<DateTime<Utc>, RssError> {
     if let Ok(d) = parse_duration(s) {
         let d = chrono::Duration::from_std(d)
             .map_err(|e| RssError::Usage(format!("duration too large: {e}")))?;
-        return Ok(Utc::now() - d);
+        return Utc::now()
+            .checked_sub_signed(d)
+            .ok_or_else(|| RssError::Usage("duration too large for a since cutoff".into()));
     }
     // Full RFC-3339 datetime.
     if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
@@ -174,14 +179,17 @@ pub fn parse_duration(s: &str) -> Result<Duration, RssError> {
     let n: u64 = num
         .parse()
         .map_err(|_| RssError::Usage(format!("invalid duration '{s}'")))?;
-    let secs = match unit {
-        "s" => n,
-        "m" => n * 60,
-        "h" => n * 3600,
-        "d" => n * 86400,
-        "w" => n * 604800,
+    let multiplier = match unit {
+        "s" => 1,
+        "m" => 60,
+        "h" => 3600,
+        "d" => 86400,
+        "w" => 604800,
         other => return Err(RssError::Usage(format!("unknown duration unit '{other}'"))),
     };
+    let secs = n
+        .checked_mul(multiplier)
+        .ok_or_else(|| RssError::Usage(format!("duration too large: '{s}'")))?;
     Ok(Duration::from_secs(secs))
 }
 
@@ -238,6 +246,21 @@ mod tests {
         assert_eq!(parse_duration("1w").unwrap(), Duration::from_secs(604_800));
         assert!(parse_duration("2y").is_err(), "unknown unit must error");
         assert!(parse_duration("abc").is_err());
+    }
+
+    #[test]
+    fn oversized_durations_are_usage_errors() {
+        for unit in ["m", "h", "d", "w"] {
+            assert!(matches!(
+                parse_duration(&format!("{}{unit}", u64::MAX)),
+                Err(RssError::Usage(_))
+            ));
+        }
+        assert!(matches!(
+            parse_since("9223372036854775s"),
+            Err(RssError::Usage(_))
+        ));
+        assert_eq!(parse_duration("0s").unwrap(), Duration::ZERO);
     }
 
     #[test]

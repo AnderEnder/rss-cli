@@ -57,6 +57,11 @@ pub(crate) fn parse_feed_with_base(
     resolution_base: &str,
     params: &FetchParams,
 ) -> Result<ParsedFeed, RssError> {
+    if body.len() > crate::config::MAX_BODY_BYTES {
+        return Err(RssError::BodyTooLarge {
+            limit_bytes: crate::config::MAX_BODY_BYTES,
+        });
+    }
     let feed = feed_rs::parser::parse(body).map_err(|e| RssError::Parse(e.to_string()))?;
 
     let title = feed.title.map(|t| t.content);
