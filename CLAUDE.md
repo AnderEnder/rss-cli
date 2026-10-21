@@ -54,7 +54,7 @@ One core powers both front-ends, so they cannot diverge
 | `src/core.rs` | Orchestration: `fetch_feeds*`, `fetch_one`, `discover_feeds*`, `show_item*`, `exit_code_for`, `paginate`/`PageStop`, `find_duplicates`/`drop_duplicates`/`apply_dedupe`. **CLI and MCP both call in here.** |
 | `src/fetch.rs` | `HttpClient`: reqwest + conditional GET, the `CachePolicy` state machine ([ADR-0005](./docs/adr/0005-conditional-get-always-revalidate-default.md)); every send goes through the per-host gate. |
 | `src/ratelimit.rs` | `HostGate`: per-authority concurrency cap + adaptive cooldown ([ADR-0016](./docs/adr/0016-per-host-request-gate.md)). Lives inside a *reused* `HttpClient`. |
-| `src/cache.rs` | Atomic file cache, `<hash>.json` + `<hash>.body` ([ADR-0004](./docs/adr/0004-file-based-atomic-cache.md)). |
+| `src/cache.rs` | Atomic `<hash>.entry` records; legacy pair reads ([ADR-0025](./docs/adr/0025-preserve-feed-snapshots-and-source-text.md)). |
 | `src/parse.rs` | `feed-rs` → `model`; dates to UTC; relative→absolute URLs; filter order `since` → `query` → sort → `limit`. |
 | `src/query.rs` | Keyword matching: AND-ed substring terms, `"quoted phrases"`, `-negation` ([ADR-0018](./docs/adr/0018-duplicate-reporting-and-keyword-filtering.md)). |
 | `src/identity.rs` | **The keystone:** deterministic item ids ([ADR-0003](./docs/adr/0003-deterministic-content-hash-item-ids.md)). Known-answer test. |
@@ -246,6 +246,11 @@ One core powers both front-ends, so they cannot diverge
   duplicate — with every count refreshed afterwards, so nothing catches it. `drop_duplicates`
   therefore re-derives each item's key. Pinned by
   `core::tests::drop_duplicates_removes_by_key_not_by_id_when_ids_collide`.
+
+- **Cache writes publish one snapshot.** Never split body and validator updates; old pairs are
+  read-only compatibility. New cursor digests reject mid-feed snapshot replacement with
+  `CURSOR_EXPIRED`. Query selection uses full plain source text before presentation. The 16 MiB
+  decoded input limit also applies to cached and directly parsed feeds. See [ADR-0025](./docs/adr/0025-preserve-feed-snapshots-and-source-text.md).
 
 ## Non-goals (v1)
 

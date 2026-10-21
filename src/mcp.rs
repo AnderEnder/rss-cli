@@ -89,7 +89,9 @@ them across pages) with truncation.next_cursor. Pass that token back as `cursor`
 THE SAME ARGUMENTS for the next page: a feed already fetched costs nothing, but one the \
 batch deadline never reached still needs a live fetch. A single item too large on its \
 own still returns RESPONSE_TOO_LARGE with suggested_limit / \
-suggested_max_content_chars.";
+suggested_max_content_chars. CURSOR_EXPIRED means the partially delivered feed changed: \
+restart without a cursor and reconcile prior ids. Decoded bodies above 16 MiB fail with \
+RESPONSE_BODY_TOO_LARGE (details.limit_bytes).";
 
 /// Default item cap `fetch_feed` applies when the caller passes no `limit`. Bounds the common
 /// "too many items" blow-up (e.g. a hot post's comment feed) without the caller opting in.
@@ -217,6 +219,7 @@ fn worst_case_marker() -> crate::model::TruncationInfo {
                 n: usize::MAX,
                 s: Some(i64::MIN),
                 ns: u32::MAX,
+                h: Some("f".repeat(16)),
             }
             .encode(),
         ),
@@ -877,6 +880,32 @@ async fn fetch_feed_with_deadline(
     };
     let may_mint_cursor = positions_line_up && no_cursor_reason.is_none();
 
+    // Capture before draining/pagination; cache timestamps may change without changing items.
+    let snapshots: Vec<Option<String>> = out
+        .feeds
+        .iter()
+        .map(|feed| {
+            if feed.error.is_some() {
+                return None;
+            }
+            serde_json::to_string(&feed.items)
+                .ok()
+                .map(|items| crate::content::content_hash(&items))
+        })
+        .collect();
+    if let Some(c) = &resume
+        && c.i > 0
+        && let Some(expected) = &c.h
+        && let Some(Some(actual)) = snapshots.first()
+        && expected != actual
+    {
+        return tool_error_code(
+            "CURSOR_EXPIRED",
+            "the cached feed snapshot changed between pages; restart without a cursor and deduplicate previously received items by id",
+            Some(&urls[start_feed]),
+        );
+    }
+
     // Skip the items already delivered from the resumed feed, warning if the window rolled.
     // `skipped` is what we *actually* dropped (a rolled window can hold fewer items than the
     // cursor's `i`), and it is the offset that makes the next cursor absolute again.
@@ -951,6 +980,7 @@ async fn fetch_feed_with_deadline(
                 start_feed + out.feeds.len(),
                 0,
                 0,
+                None,
             ));
         }
         // Stamped here too: every other page that ships a marker reports its size, and a caller
@@ -1049,6 +1079,7 @@ async fn fetch_feed_with_deadline(
                 absolute_feed,
                 already + stop.item_idx,
                 already + stop.feed_item_count,
+                snapshots.get(stop.feed_idx).cloned().flatten(),
             ));
             // Combine, never replace: a page can be both content-truncated and paginated, and
             // dropping the get_item hint would lose the only route to the full body.
@@ -1084,6 +1115,7 @@ async fn fetch_feed_with_deadline(
             start_feed + out.feeds.len(),
             0,
             0,
+            None,
         ));
     }
 
@@ -1155,7 +1187,14 @@ fn first_position_mismatch(
 ///
 /// Shared by both mint sites — the response budget's and the batch deadline's — so a cursor
 /// always carries the same fingerprint and the same resolved `since` cutoff.
-fn continuation(fp: &str, params: &FetchParams, f: usize, i: usize, n: usize) -> String {
+fn continuation(
+    fp: &str,
+    params: &FetchParams,
+    f: usize,
+    i: usize,
+    n: usize,
+    snapshot: Option<String>,
+) -> String {
     crate::cursor::Cursor {
         v: crate::cursor::CURSOR_VERSION,
         fp: fp.to_string(),
@@ -1164,6 +1203,7 @@ fn continuation(fp: &str, params: &FetchParams, f: usize, i: usize, n: usize) ->
         n,
         s: params.since.map(|dt| dt.timestamp()),
         ns: params.since.map_or(0, |dt| dt.timestamp_subsec_nanos()),
+        h: snapshot,
     }
     .encode()
 }
@@ -3261,6 +3301,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn same_count_snapshot_replacement_expires_a_cursor() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/feed.xml")
+            .with_status(200)
+            .with_body(feed_with_items(10))
+            .create_async()
+            .await;
+        let (cache, dir) = temp_cache("same-count-snapshot");
+        let http = test_http();
+        let url = format!("{}/feed.xml", server.url());
+        let full = full_response_tokens(&http, &cache, fetch_args(url.clone())).await;
+        let mut args = fetch_args(url.clone());
+        args.max_response_tokens = Some(full / 2);
+        let cursor = cursor_of(&fetch_feed_inner(&http, &cache, args).await).unwrap();
+        let c = crate::cursor::Cursor::decode(&cursor).unwrap();
+        assert!(c.i > 0);
+        let entry = cache.get(&url).unwrap().unwrap();
+        let changed =
+            feed_with_items(10).replace("https://example.com/0", "https://example.com/new");
+        cache.put(&entry.meta, changed.as_bytes()).unwrap();
+        let mut args = fetch_args(url);
+        args.cursor = Some(cursor);
+        let (is_error, payload) = decode(&fetch_feed_inner(&http, &cache, args).await);
+        assert!(
+            is_error,
+            "must not resume against a different snapshot: {payload}"
+        );
+        assert_eq!(payload["code"], "CURSOR_EXPIRED");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
     async fn continuation_warns_when_the_cached_window_rolled() {
         // Another caller can overwrite the cached body between pages (a `revalidate` fetch).
         // The item count then no longer matches what the cursor recorded: we resume anyway and
@@ -3306,7 +3379,9 @@ mod tests {
         // fingerprint), so everything the rolled window still holds ships in one go and the
         // resumed count is exact.
         let mut args = fetch_args(url);
-        args.cursor = Some(cursor);
+        let mut legacy = crate::cursor::Cursor::decode(&cursor).unwrap();
+        legacy.h = None;
+        args.cursor = Some(legacy.encode());
         let page2 = output_of(&fetch_feed_inner(&http, &cache, args).await);
 
         assert!(
@@ -3998,7 +4073,9 @@ mod tests {
             .expect("shrink the cached body");
 
         let mut args = fetch_args(url);
-        args.cursor = Some(cursor);
+        let mut legacy = crate::cursor::Cursor::decode(&cursor).unwrap();
+        legacy.h = None;
+        args.cursor = Some(legacy.encode());
         // The knob that used to force the error: with zero items left, `paginate` takes its
         // `original_items == 0` branch for any budget the bare envelope exceeds. The empty page
         // deliberately ignores the budget — there is nothing left to trim.
@@ -4225,6 +4302,7 @@ mod tests {
         // from any fresh resolution — the fingerprint does not cover `s` — and watch the
         // year-old items reappear. A re-resolving implementation would still filter them out.
         let mut forged = c1;
+        forged.h = None; // Exercise legacy cutoff restoration without a snapshot guard.
         forged.s = Some((chrono::Utc::now() - chrono::Duration::days(500)).timestamp());
         let widened = output_of(
             &fetch_feed_inner(&http, &cache, args_for(Some(forged.encode()), None)).await,
@@ -4406,6 +4484,7 @@ mod tests {
             n: 3,
             s: None,
             ns: 0,
+            h: None,
         }
         .encode();
 

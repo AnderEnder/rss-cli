@@ -5,8 +5,8 @@
 //! request it was minted for; the already-cached feed bodies act as the pagination store,
 //! because a continuation call fetches with [`crate::config::CachePolicy::CacheFirst`].
 //!
-//! Item positions are stable across pages because item ids are deterministic by
-//! construction (ADR-0003) and a cache hit returns byte-identical bytes.
+//! A snapshot digest rejects mid-feed continuations after the cached item list changes
+//! (ADR-0025). Legacy cursors retain the count-based warning fallback.
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -39,6 +39,9 @@ pub struct Cursor {
     /// Fractional nanoseconds of `s`; old cursors default to a whole-second cutoff.
     #[serde(default)]
     pub ns: u32,
+    /// Digest of the resumed feed's filtered item snapshot; absent on legacy cursors.
+    #[serde(default)]
+    pub h: Option<String>,
 }
 
 impl Cursor {
@@ -120,6 +123,7 @@ mod tests {
             n: 25,
             s: Some(1_780_000_000),
             ns: 500_000_000,
+            h: None,
         }
     }
 

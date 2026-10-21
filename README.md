@@ -119,12 +119,21 @@ Notable flags:
 | `--stale-if-error` | — | Serve the last cached copy when the origin refuses to revalidate (`429`/`403`/`5xx`), instead of failing the feed. A copy older than `--since` is not served. |
 | `--user-agent <STRING>` | (tool default) | Override the `User-Agent` header. |
 
+Keyword matching searches full plain source text with whitespace normalized, before output
+formatting or truncation. Changing `--content` or `--max-content-chars` does not change which
+items match. Plain feed text is preserved literally and escaped when rendered as Markdown/HTML.
+
+Decoded HTTP bodies are limited to **16 MiB**, including gzip and chunked responses. Larger
+bodies fail with `RESPONSE_BODY_TOO_LARGE` and `details.limit_bytes`; this limit also applies
+to cached feeds and discovery pages. An invalid feed returned with HTTP 200 fails parsing
+without replacing the last valid cache entry.
+
 Inputs (positional URLs, `-` for stdin, `--input`, `--opml`) are merged and
 de-duplicated while preserving order.
 
 ### `rss discover` — find feeds on a website
 
-Scans a homepage's `<link rel="alternate">` tags for advertised feeds.
+Scans a homepage's `<link rel="alternate">` tags for advertised feeds, honoring HTML `<base href>`.
 
 ```sh
 rss discover https://example.com
@@ -142,6 +151,8 @@ an id captured from an earlier `fetch` resolves to the same item later. The `id`
 namespaced by feed URL, so if you fetch the same post from two different feed URLs
 (e.g. Reddit `?t=day` vs `?t=week`) the ids differ — use the **guid** (e.g. Reddit
 `t3_…`) as the portable key across feed URLs.
+
+`show --format json|ndjson|text` selects pretty JSON, one compact JSON record, or readable text.
 
 Retrieval is **cache-first**: `show` serves the matching item from the cached feed
 body without revalidating, so an item from a prior `fetch` survives a rolled feed
@@ -164,13 +175,15 @@ accurate description of what the commands emit.
 
 ```sh
 rss cache path     # print the cache directory
-rss cache list     # list cached feeds (JSON)
+rss cache list     # list cached feeds (JSON; also --format ndjson|text)
 rss cache clear    # remove all cache entries
 ```
 
 By default the cache lives in the OS cache directory (e.g.
 `~/Library/Caches/...` on macOS, `$XDG_CACHE_HOME/...` on Linux); override it with
-`--cache-dir`.
+`--cache-dir`. New cache records publish metadata and body together atomically; existing
+metadata/body pairs remain readable. Clearing removes recognized cache files and preserves
+unrelated files in the directory.
 
 ### `rss mcp` — run as an MCP server
 
@@ -477,6 +490,11 @@ pages normally, since it still writes on the success path. A continuation page (
 `FeedResult` carries `cached_at` and `cache_age_seconds` (both `null` when not served from
 cache) so a caller can judge staleness (a feed that revalidates cleanly on every call holds
 `cache_age_seconds` near its polling interval, not the body's true age).
+
+**Snapshot changes between pages.** New cursors guard the partially delivered feed's item
+list. If another fetch replaces that list, continuation returns `CURSOR_EXPIRED`, even when
+the item count stays the same. Restart without a cursor and reconcile previously received
+items by `id`. Legacy cursors retain their count-based `CACHE_WINDOW_ROLLED` warning.
 
 **Responses are size-bounded, and paged rather than rejected.** AI clients reject oversized
 tool results, so `fetch_feed` caps items per feed (default 25) and checks an estimated-token
